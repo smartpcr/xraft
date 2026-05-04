@@ -88,7 +88,7 @@ implementation of the Raft protocol as described in the reference material.
 
 | Capability | Detail | Reference |
 |------------|--------|-----------|
-| **RPC framework** | Async message passing between nodes. Five RPC types: `Vote` (election), `Fetch` (log replication), `FetchSnapshot` (snapshot transfer), `AddVoter`/`RemoveVoter` (membership changes). | Red Hat article "Core RPCs" and "Dynamic quorum" |
+| **RPC framework** | Async message passing between nodes. Six RPC types: `Vote` (election), `Fetch` (log replication), `FetchSnapshot` (snapshot transfer), `AddVoter` / `RemoveVoter` / `UpdateVoter` (membership changes). Analogous to KRaft's `Vote`, `Fetch`, `FetchSnapshot`, `AddRaftVoter`, `RemoveRaftVoter`, and `UpdateRaftVoter`. | Red Hat article "Core RPCs" and "Dynamic quorum" |
 | **Identity & fencing** | Every RPC includes `clusterId` and `currentLeaderEpoch` for identity verification and fencing of stale messages. | Red Hat article "Core RPCs" — "All KRaft RPC schemas include `clusterId` and `currentLeaderEpoch`" |
 | **Divergence detection** | `Fetch` responses include a `DivergingEpoch` tagged field when log inconsistency is detected. The follower truncates its log back to the diverging point. Multiple fetch rounds may be required in worst-case scenarios. | Red Hat article "Core RPCs" — DivergingEpoch |
 | **Leader-epoch checkpoint** | The leader validates fetch requests against its log using a leader-epoch checkpoint (cached in memory for efficiency). This enables fast divergence detection. | Red Hat article "Core RPCs" — `leader-epoch-checkpoint` |
@@ -99,8 +99,8 @@ implementation of the Raft protocol as described in the reference material.
 > The only leader-to-follower data is carried in `Fetch` *responses*.
 > Candidates initiate `Vote` RPCs during elections (this is push, but election
 > is a distinct phase from steady-state replication). `FetchSnapshot` is also
-> follower-initiated. Membership-change RPCs (`AddVoter`/`RemoveVoter`) are
-> client-to-leader requests, not leader-to-follower pushes.
+> follower-initiated. Membership-change RPCs (`AddVoter` / `RemoveVoter` /
+> `UpdateVoter`) are client-to-leader requests, not leader-to-follower pushes.
 
 #### 2.1.5 Library API
 
@@ -117,7 +117,7 @@ service endpoint.
 
 > **Scope boundary:** xraft provides the consensus library and test harness.
 > Building a key-value store, message queue, or any application-layer service
-> on top of the library is a separate concern and a separate story.
+> on top of the library is out of scope for this work.
 
 #### 2.1.6 Observability & Testing
 
@@ -125,7 +125,7 @@ service endpoint.
 |------------|--------|-----------|
 | **Metrics** | Expose key metrics mirroring KRaft's `raft-metrics` group: `current-leader`, `current-epoch`, `election-latency-avg`, `append-records-rate`, `commit-latency-avg`. Exposed as Rust structs; integration with Prometheus/OpenTelemetry is an extension concern. | Red Hat article "KRaft protocol" — metrics list |
 | **Deterministic simulation** | Support deterministic testing with injectable clocks, network, and storage to verify correctness under adversarial conditions. | — |
-| **Integration test harness** | Multi-node in-process cluster for scenario-based testing. Scenarios cover leader failure, network partition, log divergence, snapshot transfer, and membership changes. Detailed scenario specifications are defined separately in the e2e-scenarios planning document. | — |
+| **Integration test harness** | Multi-node in-process cluster for scenario-based testing. Scenarios cover leader failure, network partition, log divergence, snapshot transfer, and membership changes. | — |
 
 ### 2.2 Out of Scope
 
@@ -200,7 +200,7 @@ cannot be relaxed without changing the project's mandate.
 | **Durable persistence before ack** | Log entries and voting state must be `fsync`-ed to disk before any acknowledgement is sent to peers or clients. | Raft paper §5; Red Hat article "Safety rules" — persistence requirements. |
 | **Pull-based replication** | Log replication uses the pull-based (fetch) model where followers request entries from the leader. Push-based `AppendEntries` is not implemented. | Story description reference to KRaft; §3 Non-Goals item 2. |
 | **Timing invariant** | `broadcastTime << electionTimeout << avgTimeBetweenFailures`. | Raft paper §5.6. |
-| **Full production quality** | This is a complete, production-quality implementation — not a time-boxed spike or prototype. | Story scope clarification. |
+| **Full production quality** | This is a complete, production-quality implementation — not a time-boxed spike or prototype. | Story description: "implement raft using rust" implies a complete implementation, not a spike. |
 
 ### 4.3 Timing Parameters
 
@@ -261,20 +261,20 @@ warrants a different choice, but changing them requires explicit justification.
 
 | ID | Risk | Likelihood | Impact | Mitigation |
 |----|------|-----------|--------|------------|
-| P1 | **Scope creep into application layer** — Pressure to build a "useful" system (KV store, message queue) on top of the Raft library before the consensus layer is solid. | Medium | High | Hard scope boundary: this story delivers the consensus library and test harness only. Application layers are separate stories. |
-| P2 | **Story points = 0** — Zero story points belied the actual scope. This story targets a **full production-quality delivery**, not a time-boxed spike or prototype. No scope ambiguity remains. | Resolved | — | — |
-| P3 | **Sibling doc alignment** — Architecture, implementation plan, and e2e scenarios are authored by different architects. Inconsistencies between docs may emerge as each iterates. | Medium | Low | Cross-reference shared concepts by name. Flag inconsistencies in the iteration summary for alignment in subsequent iterations. |
+| P1 | **Scope creep into application layer** — Pressure to build a "useful" system (KV store, message queue) on top of the Raft library before the consensus layer is solid. | Medium | High | Hard scope boundary: this work delivers the consensus library and test harness only (§2.2). Application layers are out of scope. |
+| P2 | **Underestimated effort** — A full production-quality Raft implementation (leader election, pull-based replication, snapshotting, dynamic quorum, deterministic simulation) is substantial engineering work. Underestimation could lead to quality shortcuts. | Medium | High | Prioritise correctness over velocity. Ship the consensus core first (election + replication + persistence), then layer on compaction, dynamic quorum, and simulation testing incrementally. |
+| P3 | **Cross-document alignment** — The tech spec, architecture, implementation plan, and e2e scenarios are authored in parallel. Inconsistencies between documents may emerge across iterations. | Medium | Low | Cross-reference shared concepts by name. Flag inconsistencies in iteration summaries so subsequent iterations can reconcile. |
 
 ### 5.3 Risk Heat Map
 
 ```
            Low Impact    Medium Impact    High Impact    Critical Impact
           ┌─────────────┬───────────────┬──────────────┬────────────────┐
-High      │             │               │ P1           │ R1             │
+High      │             │               │              │ R1             │
 Likelihood│             │               │              │                │
           ├─────────────┼───────────────┼──────────────┼────────────────┤
-Medium    │ P3          │ R4            │ R2, R3       │ R5             │
-Likelihood│             │               │              │                │
+Medium    │ P3          │ R4            │ R2, R3, P1,  │ R5             │
+Likelihood│             │               │ P2           │                │
           ├─────────────┼───────────────┼──────────────┼────────────────┤
 Low       │             │ R6            │              │                │
 Likelihood│             │               │              │                │
@@ -286,8 +286,9 @@ Likelihood│             │               │              │                
 ## 6. Key Design Decisions
 
 These decisions affect the overall design and are recorded here as the
-authoritative source. Structural details belong in the architecture document;
-sequencing details belong in the implementation plan.
+authoritative source. Structural details (crate boundaries, module layouts)
+and sequencing details (implementation phases, milestones) are out of scope
+for this tech spec.
 
 | Decision | Options | Recommendation | Status |
 |----------|---------|----------------|--------|
