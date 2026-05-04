@@ -197,7 +197,7 @@ These are non-negotiable requirements that shape every design decision.
 
 | Constraint | Detail |
 |------------|--------|
-| **Workspace layout** | Cargo workspace with separate crates for consensus core, transport, storage, and test harness. See `architecture.md` for crate boundaries. |
+| **Workspace layout** | Cargo workspace with separate crates for consensus core, transport, storage, and test harness. Crate boundaries are defined in `architecture.md` (sibling doc, produced in parallel — may not exist yet). |
 | **Repository** | `smartpcr/xraft` — all code lands in this repo. |
 | **Branch strategy** | Feature branches off `main`, PR-based review. |
 
@@ -226,9 +226,9 @@ broadcastTime  <<  electionTimeout  <<  avgTimeBetweenFailures
 |----|------|-----------|--------|------------|
 | R1 | **Subtle consensus bugs** — Raft has many edge cases (e.g., log divergence after leader failure, pre-vote interactions with config changes). Bugs may not manifest until adversarial conditions. | High | Critical | Deterministic simulation testing with fault injection (network partitions, message reordering, crashes at every `fsync` point). Property-based testing for log consistency invariants. |
 | R2 | **`fsync` performance on different OSes** — Durable persistence is a hard constraint, but `fsync` latency varies dramatically across platforms and file systems. | Medium | High | Abstract the storage layer behind a trait. Benchmark on Linux ext4/xfs and document minimum requirements. Allow batched `fsync` (group commit) for throughput. |
-| R3 | **Pull-based replication complexity** — KRaft's pull-based model (followers fetch from leader) is less common than the push-based model in the original Raft paper. It introduces subtlety around fetch timing, backpressure, and high-watermark advancement. | Medium | High | Implement push-based first as a simpler baseline, then migrate to pull-based. Alternatively, commit to pull-based from the start but invest heavily in integration tests that validate HW advancement under varying fetch rates. |
+| R3 | **Pull-based replication complexity** — KRaft's pull-based model (followers fetch from leader) is less common than the push-based model in the original Raft paper. It introduces subtlety around fetch timing, backpressure, and high-watermark advancement. | Medium | High | Commit to pull-based from the start (see §3 Non-Goals — push-based is explicitly excluded). Invest heavily in integration tests that validate HW advancement under varying fetch rates. Build a deterministic simulation harness early so fetch-timing edge cases are reproducible. Cross-reference `etcd/raft` and `openraft` for replication state-machine patterns, adapted to pull semantics. |
 | R4 | **Snapshot transfer for large state** — Chunked snapshot transfer over the network can be slow and may block normal replication. | Low | Medium | Stream snapshots in chunks with progress tracking. Allow follower to continue fetching log entries that arrive after the snapshot offset while the transfer is in progress. |
-| R5 | **Dynamic quorum correctness** — Adding/removing nodes while elections and replication are in flight is the most error-prone part of Raft. | Medium | Critical | Enforce single-node changes only. Extensive scenario testing (see `e2e-scenarios.md`). Consider formal verification of the membership-change state machine (TLA+ spec or Kani model checker for Rust). |
+| R5 | **Dynamic quorum correctness** — Adding/removing nodes while elections and replication are in flight is the most error-prone part of Raft. | Medium | Critical | Enforce single-node changes only. Extensive scenario testing (scenarios defined in `e2e-scenarios.md`, sibling doc produced in parallel). Consider formal verification of the membership-change state machine (TLA+ spec or Kani model checker for Rust). |
 | R6 | **Incomplete reference material** — The third reference URL (`dragotin/kraft`) is an unrelated invoicing application, reducing the available reference implementations to two articles (descriptive, not source code). No Rust reference implementation of KRaft-style Raft exists. | Low | Medium | Supplement with the original Raft paper (Ongaro & Ousterhout, 2014), the `etcd/raft` Go implementation, and the `openraft` Rust crate as cross-references. |
 
 ### 5.2 Project Risks
@@ -260,16 +260,17 @@ Likelihood│             │               │              │                
 ## 6. Key Design Decisions (Pending)
 
 These decisions affect multiple sibling documents and should be resolved early.
-See `architecture.md` for structural decisions and `implementation-plan.md` for
-sequencing.
+Structural decisions will be detailed in `architecture.md` and sequencing in
+`implementation-plan.md` (both sibling docs, produced in parallel — may not
+exist yet on iteration 1).
 
 | Decision | Options | Recommendation | Status |
 |----------|---------|----------------|--------|
-| **Push vs. pull replication** | (A) Push-based as in original Raft, (B) Pull-based as in KRaft | Pull-based (B) — aligns with the KRaft reference material and scales better with observers. | Pending — see `architecture.md` |
+| **Push vs. pull replication** | (A) Push-based as in original Raft, (B) Pull-based as in KRaft | Pull-based (B) — aligns with the KRaft reference material and scales better with observers. | **Decided** — see §3 Non-Goals item 2. |
 | **Async runtime** | (A) tokio, (B) async-std, (C) smol | tokio (A) — ecosystem maturity and library support. | Decided |
-| **Serialisation format** | (A) protobuf, (B) flatbuffers, (C) custom binary, (D) serde + bincode | serde + bincode (D) — simplest for Rust-native use; protobuf if cross-language support is needed later. | Pending |
+| **Serialisation format** | (A) protobuf, (B) flatbuffers, (C) custom binary, (D) serde + bincode | serde + bincode (D) — simplest for Rust-native use; protobuf if cross-language support is needed later. | Pending — to be finalised in `architecture.md` (sibling doc, produced in parallel). |
 | **State machine interface** | (A) Trait object (`dyn StateMachine`), (B) Generic (`impl StateMachine`) | Generic (B) — zero-cost abstraction, monomorphised at compile time. | Decided |
-| **Log storage** | (A) Segment files (Kafka-style), (B) Single append-only file, (C) Embedded DB (sled/rocksdb) | Segment files (A) — natural fit for truncation and compaction. | Pending — see `architecture.md` |
+| **Log storage** | (A) Segment files (Kafka-style), (B) Single append-only file, (C) Embedded DB (sled/rocksdb) | Segment files (A) — natural fit for truncation and compaction. | Pending — to be finalised in `architecture.md` (sibling doc, produced in parallel). |
 
 ---
 
