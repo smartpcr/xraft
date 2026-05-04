@@ -64,7 +64,7 @@ implementation of the Raft protocol as described in the reference material.
 | **High watermark (HW)** | The leader tracks follower progress (the last offset each follower has fetched). When a majority of voters have replicated up to offset N, the HW advances to N and entries ≤ N are committed. | Red Hat article "Raft replication" step 3 |
 | **Safety invariants** | Five invariants enforced at all times: (1) Leader election safety — at most one leader per term. (2) Append-only leader — leader never overwrites/deletes its own entries. (3) Leader completeness — elected leader has all committed entries from prior terms. (4) Log matching — if two logs have an entry with the same index and term, they are identical up to that index. (5) State machine safety — no two nodes apply different entries at the same index. | Red Hat article "Safety rules"; Raft paper §5.4 |
 | **Persistence** | `currentTerm`, `votedFor`, and the log are durably persisted to stable storage (`fsync`) before any acknowledgement. Voting state is stored separately from the log for performance and bootstrapping reasons (as in KRaft's `quorum-state` file). | Red Hat article "Safety rules" — persistence requirements |
-| **Heartbeats** | Leader sends periodic heartbeats to suppress follower election timeouts. In pull-based mode, heartbeats are implicit: the leader responds to follower `Fetch` RPCs even when there are no new entries. If a follower's fetch interval is long, the leader may also send lightweight ping responses. | Red Hat article "Log replication" — heartbeats |
+| **Heartbeats (implicit)** | In the pull-based model, there are no explicit heartbeat messages from leader to follower. Instead, followers send periodic `Fetch` RPCs to the leader; the leader's response — even when there are no new entries — resets the follower's election timeout, serving as an implicit heartbeat. The leader tracks the recency of each follower's `Fetch` requests to detect liveness (this information feeds Check Quorum). If a follower's `Fetch` interval exceeds the election timeout, that follower starts a new election — the leader does not proactively contact it. | Red Hat article "Log replication"; KRaft pull-based model |
 | **No-op commit on leader start** | A new leader commits a blank entry (`LeaderChangeMessage` in KRaft) to establish commit state for the new term. This commits any uncommitted entries from the previous epoch and prevents indefinite delays when no client writes occur. | Red Hat article "Log replication"; "Core RPCs" — LeaderChangeMessage |
 
 #### 2.1.2 Log Compaction
@@ -93,6 +93,15 @@ implementation of the Raft protocol as described in the reference material.
 | **Divergence detection** | `Fetch` responses include a `DivergingEpoch` tagged field when log inconsistency is detected. The follower truncates its log back to the diverging point. Multiple fetch rounds may be required in worst-case scenarios. | Red Hat article "Core RPCs" — DivergingEpoch |
 | **Leader-epoch checkpoint** | The leader validates fetch requests against its log using a leader-epoch checkpoint (cached in memory for efficiency). This enables fast divergence detection. | Red Hat article "Core RPCs" — `leader-epoch-checkpoint` |
 
+> **RPC direction summary (pull-based model):** In xraft, the leader never
+> initiates outbound RPCs to followers for log replication or heartbeats.
+> All data flow for replication is follower-initiated via `Fetch` RPCs.
+> The only leader-to-follower data is carried in `Fetch` *responses*.
+> Candidates initiate `Vote` RPCs during elections (this is push, but election
+> is a distinct phase from steady-state replication). `FetchSnapshot` is also
+> follower-initiated. Membership-change RPCs (`AddVoter`/`RemoveVoter`) are
+> client-to-leader requests, not leader-to-follower pushes.
+
 #### 2.1.5 Library API
 
 xraft exposes a **Rust library API** for embedding into applications. This is
@@ -116,7 +125,7 @@ service endpoint.
 |------------|--------|-----------|
 | **Metrics** | Expose key metrics mirroring KRaft's `raft-metrics` group: `current-leader`, `current-epoch`, `election-latency-avg`, `append-records-rate`, `commit-latency-avg`. Exposed as Rust structs; integration with Prometheus/OpenTelemetry is an extension concern. | Red Hat article "KRaft protocol" — metrics list |
 | **Deterministic simulation** | Support deterministic testing with injectable clocks, network, and storage to verify correctness under adversarial conditions. | — |
-| **Integration test harness** | Multi-node in-process cluster for scenario-based testing. See `e2e-scenarios.md` (sibling doc, produced in parallel) for scenario definitions. | — |
+| **Integration test harness** | Multi-node in-process cluster for scenario-based testing. See `e2e-scenarios.md` for scenario definitions. | — |
 
 ### 2.2 Out of Scope
 
@@ -195,9 +204,12 @@ These are non-negotiable requirements that shape every design decision.
 
 ### 4.3 Project Structure
 
+The `smartpcr/xraft` repository is currently greenfield — it contains only a
+`README.md` and this `docs/` directory. All structures below are to be created.
+
 | Constraint | Detail |
 |------------|--------|
-| **Workspace layout** | Cargo workspace with separate crates for consensus core, transport, storage, and test harness. Crate boundaries are defined in `architecture.md` (sibling doc, produced in parallel — may not exist yet). |
+| **Workspace layout** | Cargo workspace with separate crates for consensus core, transport, storage, and test harness. Crate boundaries are defined in `architecture.md`. |
 | **Repository** | `smartpcr/xraft` — all code lands in this repo. |
 | **Branch strategy** | Feature branches off `main`, PR-based review. |
 
@@ -228,7 +240,7 @@ broadcastTime  <<  electionTimeout  <<  avgTimeBetweenFailures
 | R2 | **`fsync` performance on different OSes** — Durable persistence is a hard constraint, but `fsync` latency varies dramatically across platforms and file systems. | Medium | High | Abstract the storage layer behind a trait. Benchmark on Linux ext4/xfs and document minimum requirements. Allow batched `fsync` (group commit) for throughput. |
 | R3 | **Pull-based replication complexity** — KRaft's pull-based model (followers fetch from leader) is less common than the push-based model in the original Raft paper. It introduces subtlety around fetch timing, backpressure, and high-watermark advancement. | Medium | High | Commit to pull-based from the start (see §3 Non-Goals — push-based is explicitly excluded). Invest heavily in integration tests that validate HW advancement under varying fetch rates. Build a deterministic simulation harness early so fetch-timing edge cases are reproducible. Cross-reference `etcd/raft` and `openraft` for replication state-machine patterns, adapted to pull semantics. |
 | R4 | **Snapshot transfer for large state** — Chunked snapshot transfer over the network can be slow and may block normal replication. | Low | Medium | Stream snapshots in chunks with progress tracking. Allow follower to continue fetching log entries that arrive after the snapshot offset while the transfer is in progress. |
-| R5 | **Dynamic quorum correctness** — Adding/removing nodes while elections and replication are in flight is the most error-prone part of Raft. | Medium | Critical | Enforce single-node changes only. Extensive scenario testing (scenarios defined in `e2e-scenarios.md`, sibling doc produced in parallel). Consider formal verification of the membership-change state machine (TLA+ spec or Kani model checker for Rust). |
+| R5 | **Dynamic quorum correctness** — Adding/removing nodes while elections and replication are in flight is the most error-prone part of Raft. | Medium | Critical | Enforce single-node changes only. Extensive scenario testing (scenarios defined in `e2e-scenarios.md`). Consider formal verification of the membership-change state machine (TLA+ spec or Kani model checker for Rust). |
 | R6 | **Incomplete reference material** — The third reference URL (`dragotin/kraft`) is an unrelated invoicing application, reducing the available reference implementations to two articles (descriptive, not source code). No Rust reference implementation of KRaft-style Raft exists. | Low | Medium | Supplement with the original Raft paper (Ongaro & Ousterhout, 2014), the `etcd/raft` Go implementation, and the `openraft` Rust crate as cross-references. |
 
 ### 5.2 Project Risks
@@ -237,7 +249,7 @@ broadcastTime  <<  electionTimeout  <<  avgTimeBetweenFailures
 |----|------|-----------|--------|------------|
 | P1 | **Scope creep into application layer** — Pressure to build a "useful" system (KV store, message queue) on top of the Raft library before the consensus layer is solid. | Medium | High | Hard scope boundary: this story delivers the consensus library and test harness only. Application layers are separate stories. |
 | P2 | **Story points = 0** — Zero story points suggests this may be treated as a spike or exploratory work, but the scope described is a full implementation. | High | Medium | Clarify with the operator whether this is a spike (prototype, time-boxed) or a full delivery. Plan assumes full delivery unless told otherwise. |
-| P3 | **Parallel sibling doc drift** — Architecture, implementation plan, and e2e scenarios are written in parallel by sibling architects. Inconsistencies between docs are likely on iteration 1. | High | Low | Cross-reference shared concepts by name. Flag inconsistencies in the iteration summary for alignment in subsequent iterations. |
+| P3 | **Sibling doc alignment** — Architecture, implementation plan, and e2e scenarios are authored by different architects. Inconsistencies between docs may emerge as each iterates. | Medium | Low | Cross-reference shared concepts by name. Flag inconsistencies in the iteration summary for alignment in subsequent iterations. |
 
 ### 5.3 Risk Heat Map
 
@@ -247,7 +259,7 @@ broadcastTime  <<  electionTimeout  <<  avgTimeBetweenFailures
 High      │             │ P2            │ P1           │ R1             │
 Likelihood│             │               │              │                │
           ├─────────────┼───────────────┼──────────────┼────────────────┤
-Medium    │             │ R4            │ R2, R3       │ R5             │
+Medium    │ P3          │ R4            │ R2, R3       │ R5             │
 Likelihood│             │               │              │                │
           ├─────────────┼───────────────┼──────────────┼────────────────┤
 Low       │             │ R6            │              │                │
@@ -261,16 +273,15 @@ Likelihood│             │               │              │                
 
 These decisions affect multiple sibling documents and should be resolved early.
 Structural decisions will be detailed in `architecture.md` and sequencing in
-`implementation-plan.md` (both sibling docs, produced in parallel — may not
-exist yet on iteration 1).
+`implementation-plan.md`.
 
 | Decision | Options | Recommendation | Status |
 |----------|---------|----------------|--------|
 | **Push vs. pull replication** | (A) Push-based as in original Raft, (B) Pull-based as in KRaft | Pull-based (B) — aligns with the KRaft reference material and scales better with observers. | **Decided** — see §3 Non-Goals item 2. |
 | **Async runtime** | (A) tokio, (B) async-std, (C) smol | tokio (A) — ecosystem maturity and library support. | Decided |
-| **Serialisation format** | (A) protobuf, (B) flatbuffers, (C) custom binary, (D) serde + bincode | serde + bincode (D) — simplest for Rust-native use; protobuf if cross-language support is needed later. | Pending — to be finalised in `architecture.md` (sibling doc, produced in parallel). |
+| **Serialisation format** | (A) protobuf, (B) flatbuffers, (C) custom binary, (D) serde + bincode | serde + bincode (D) — simplest for Rust-native use; protobuf if cross-language support is needed later. | Pending — to be finalised in `architecture.md`. |
 | **State machine interface** | (A) Trait object (`dyn StateMachine`), (B) Generic (`impl StateMachine`) | Generic (B) — zero-cost abstraction, monomorphised at compile time. | Decided |
-| **Log storage** | (A) Segment files (Kafka-style), (B) Single append-only file, (C) Embedded DB (sled/rocksdb) | Segment files (A) — natural fit for truncation and compaction. | Pending — to be finalised in `architecture.md` (sibling doc, produced in parallel). |
+| **Log storage** | (A) Segment files (Kafka-style), (B) Single append-only file, (C) Embedded DB (sled/rocksdb) | Segment files (A) — natural fit for truncation and compaction. | Pending — to be finalised in `architecture.md`. |
 
 ---
 
