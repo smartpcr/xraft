@@ -31,7 +31,7 @@ Each URL in the story description was reviewed for relevance and content:
 |---|-----|-----------|---------------|
 | 1 | [Red Hat — Deep dive into Apache Kafka's KRaft protocol](https://developers.redhat.com/articles/2025/09/17/deep-dive-apache-kafkas-kraft-protocol) | **Primary** — provides the authoritative protocol walkthrough. | Covers leader election, pull-based log replication via `Fetch` RPCs, safety rules, Pre-Vote, Check Quorum, snapshotting, dynamic quorum (`AddRaftVoter`/`RemoveRaftVoter`/`UpdateRaftVoter`), `DivergingEpoch` for log truncation, high-watermark advancement, single-threaded event loop (`KafkaRaftClient`), `VotersRecord` control records, and the three-layer architecture (`QuorumController` → `KafkaRaftClient` → `MetadataLoader`). |
 | 2 | [Confluent — Learn KRaft](https://developer.confluent.io/learn/kraft/) | **Secondary** — gives architectural context. | Explains why KRaft replaced ZooKeeper (operational complexity, scalability, state consistency), the event-sourced storage model, near-instantaneous failover because new leaders already hold committed records in memory, and combined-mode for single-node testing. |
-| 3 | [github.com/dragotin/kraft](https://github.com/dragotin/kraft) | **Not relevant** — this repository is a Qt6/KDE invoicing desktop application ("Kraft") for small businesses. It has no connection to the Raft or KRaft consensus protocol. Confirmed by inspecting the repo README and source. Confirmed by the operator as included by mistake due to name collision. | None. |
+| 3 | [github.com/dragotin/kraft](https://github.com/dragotin/kraft) | **Not relevant** — this repository is a Qt6/KDE invoicing desktop application ("Kraft") for small businesses. It has no connection to the Raft or KRaft consensus protocol. Included in the story description by mistake; ignored. | None. |
 
 > **Note on supplementary references:** Because the story's three URLs yield
 > only two relevant sources (both descriptive articles, no reference source
@@ -125,7 +125,7 @@ service endpoint.
 |------------|--------|-----------|
 | **Metrics** | Expose key metrics mirroring KRaft's `raft-metrics` group: `current-leader`, `current-epoch`, `election-latency-avg`, `append-records-rate`, `commit-latency-avg`. Exposed as Rust structs; integration with Prometheus/OpenTelemetry is an extension concern. | Red Hat article "KRaft protocol" — metrics list |
 | **Deterministic simulation** | Support deterministic testing with injectable clocks, network, and storage to verify correctness under adversarial conditions. | — |
-| **Integration test harness** | Multi-node in-process cluster for scenario-based testing. Scenarios cover leader failure, network partition, log divergence, snapshot transfer, and membership changes. A planned companion document (`e2e-scenarios.md`) will define detailed scenario specifications once authored. | — |
+| **Integration test harness** | Multi-node in-process cluster for scenario-based testing. Scenarios cover leader failure, network partition, log divergence, snapshot transfer, and membership changes. Detailed scenario specifications are defined separately in the e2e-scenarios planning document. | — |
 
 ### 2.2 Out of Scope
 
@@ -181,39 +181,28 @@ improve the system:
 
 ## 4. Hard Constraints
 
-These are non-negotiable requirements that shape every design decision.
+These are non-negotiable requirements imposed by the story description, the
+Raft protocol specification, or fundamental correctness requirements. They
+cannot be relaxed without changing the project's mandate.
 
-### 4.1 Language & Toolchain
+### 4.1 Language
 
-| Constraint | Detail |
-|------------|--------|
-| **Language** | Rust (stable toolchain, latest edition). The story description mandates Rust. |
-| **Async runtime** | `tokio` — the de facto standard for async Rust. All I/O (network, disk) is async. |
-| **No `unsafe`** | Avoid `unsafe` blocks except where absolutely required for FFI or performance-critical paths, with documented justification and `// SAFETY:` comments. |
-| **`#![deny(clippy::all)]`** | All code must pass clippy with no warnings. |
-| **`#[must_use]`** | Applied to all Result-returning public functions. |
+| Constraint | Detail | Source |
+|------------|--------|--------|
+| **Rust** | The implementation language is Rust (stable toolchain, latest edition). | Story description: "implement raft using rust". |
+| **Repository** | All code lands in `smartpcr/xraft`. | Story description and repository context. |
 
-### 4.2 Correctness
+### 4.2 Protocol Correctness
 
-| Constraint | Detail |
-|------------|--------|
-| **Raft safety invariants** | The five safety properties from the Raft paper (listed in §2.1.1) must hold under all conditions, including crash-recovery and network partition scenarios. |
-| **Durable persistence before ack** | Log entries and voting state must be `fsync`-ed to disk before any acknowledgement is sent to peers or clients. |
-| **Deterministic testing** | All time-dependent and I/O-dependent behaviour must be injectable for deterministic simulation (see §2.1.6). |
-| **Single-threaded event loop** | The core consensus state machine runs on a single-threaded event loop (as in KRaft's `KafkaRaftClient`), avoiding concurrency bugs. External I/O is dispatched to async tasks. |
+| Constraint | Detail | Source |
+|------------|--------|--------|
+| **Raft safety invariants** | The five safety properties from the Raft paper (listed in §2.1.1) must hold under all conditions, including crash-recovery and network partition scenarios. | Raft paper §5.2–5.4; Red Hat article "Safety rules". |
+| **Durable persistence before ack** | Log entries and voting state must be `fsync`-ed to disk before any acknowledgement is sent to peers or clients. | Raft paper §5; Red Hat article "Safety rules" — persistence requirements. |
+| **Pull-based replication** | Log replication uses the pull-based (fetch) model where followers request entries from the leader. Push-based `AppendEntries` is not implemented. | Story description reference to KRaft; §3 Non-Goals item 2. |
+| **Timing invariant** | `broadcastTime << electionTimeout << avgTimeBetweenFailures`. | Raft paper §5.6. |
+| **Full production quality** | This is a complete, production-quality implementation — not a time-boxed spike or prototype. | Story scope clarification. |
 
-### 4.3 Project Structure
-
-The `smartpcr/xraft` repository is currently greenfield — it contains only a
-`README.md` and this `docs/` directory. All structures below are to be created.
-
-| Constraint | Detail |
-|------------|--------|
-| **Workspace layout** | Cargo workspace with separate crates: `xraft-core` (consensus state machine), `xraft-transport` (async RPC), `xraft-storage` (durable log and snapshots), and `xraft-test` (deterministic simulation harness). A planned companion document (`architecture.md`) will elaborate crate internals once authored. |
-| **Repository** | `smartpcr/xraft` — all code lands in this repo. |
-| **Branch strategy** | Feature branches off `main`, PR-based review. |
-
-### 4.4 Timing Requirements (from Raft specification)
+### 4.3 Timing Parameters
 
 The system must satisfy the Raft timing invariant:
 
@@ -235,6 +224,24 @@ broadcastTime  <<  electionTimeout  <<  avgTimeBetweenFailures
 > serving as an implicit heartbeat. The Raft timing invariant still applies:
 > `fetchInterval << electionTimeout << avgTimeBetweenFailures`.
 
+### 4.4 Design Recommendations
+
+The following are strong design recommendations that shape the implementation.
+They are not externally mandated but are adopted based on engineering judgment
+and alignment with the reference material. They may be revisited if evidence
+warrants a different choice, but changing them requires explicit justification.
+
+| Recommendation | Detail | Rationale |
+|----------------|--------|-----------|
+| **Async runtime: `tokio`** | All I/O (network, disk) is async, using the `tokio` runtime. | De facto standard for async Rust; broadest ecosystem support. |
+| **No `unsafe`** | Avoid `unsafe` blocks except where absolutely required for FFI or performance-critical paths, with documented justification and `// SAFETY:` comments. | Reduces the surface area for memory-safety bugs in a correctness-critical system. |
+| **`#![deny(clippy::all)]`** | All code must pass clippy with no warnings. | Catches common Rust pitfalls early. |
+| **`#[must_use]`** | Applied to all Result-returning public functions. | Prevents silent error swallowing. |
+| **Single-threaded event loop** | The core consensus state machine runs on a single-threaded event loop (as in KRaft's `KafkaRaftClient`). External I/O is dispatched to async tasks. | Eliminates concurrency bugs in the consensus core; matches KRaft's architecture. |
+| **Deterministic testing** | All time-dependent and I/O-dependent behaviour must be injectable for deterministic simulation (see §2.1.6). | Enables reproducible testing of edge cases that are impossible to trigger reliably with wall-clock time and real I/O. |
+| **Workspace layout** | Cargo workspace with separate crates: `xraft-core` (consensus state machine), `xraft-transport` (async RPC), `xraft-storage` (durable log and snapshots), and `xraft-test` (deterministic simulation harness). | Separation of concerns; enables independent testing and versioning of each layer. |
+| **Branch strategy** | Feature branches off `main`, PR-based review. | Standard collaborative development workflow. |
+
 ---
 
 ## 5. Identified Risks
@@ -255,7 +262,7 @@ broadcastTime  <<  electionTimeout  <<  avgTimeBetweenFailures
 | ID | Risk | Likelihood | Impact | Mitigation |
 |----|------|-----------|--------|------------|
 | P1 | **Scope creep into application layer** — Pressure to build a "useful" system (KV store, message queue) on top of the Raft library before the consensus layer is solid. | Medium | High | Hard scope boundary: this story delivers the consensus library and test harness only. Application layers are separate stories. |
-| P2 | **Story points = 0 (resolved)** — Zero story points initially suggested spike scope, but the operator confirmed this is a **full production-quality delivery**. No scope ambiguity remains. | Resolved | — | — |
+| P2 | **Story points = 0** — Zero story points belied the actual scope. This story targets a **full production-quality delivery**, not a time-boxed spike or prototype. No scope ambiguity remains. | Resolved | — | — |
 | P3 | **Sibling doc alignment** — Architecture, implementation plan, and e2e scenarios are authored by different architects. Inconsistencies between docs may emerge as each iterates. | Medium | Low | Cross-reference shared concepts by name. Flag inconsistencies in the iteration summary for alignment in subsequent iterations. |
 
 ### 5.3 Risk Heat Map
@@ -279,9 +286,8 @@ Likelihood│             │               │              │                
 ## 6. Key Design Decisions
 
 These decisions affect the overall design and are recorded here as the
-authoritative source. Planned companion documents (`architecture.md` and
-`implementation-plan.md`) will elaborate on structural and sequencing details
-respectively once authored.
+authoritative source. Structural details belong in the architecture document;
+sequencing details belong in the implementation plan.
 
 | Decision | Options | Recommendation | Status |
 |----------|---------|----------------|--------|
