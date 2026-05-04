@@ -5,15 +5,16 @@
 Distributed systems require a consensus mechanism to coordinate state across
 multiple nodes that may fail independently. The **xraft** project implements
 the Raft consensus protocol in Rust, drawing design guidance from Apache
-Kafka's KRaft protocol (KIP-500) as described in the Red Hat deep-dive article
-and Confluent's KRaft documentation.
+Kafka's KRaft protocol (KIP-500).
 
 The goal is a standalone, library-quality Raft implementation that provides:
 
 - **Leader election** with term-based voting and Pre-Vote protocol.
-- **Log replication** with pull-based (fetch) follower synchronisation.
-- **Safety guarantees** matching the Raft invariants (leader election safety,
-  log matching, state machine safety, leader completeness, append-only leader).
+- **Log replication** using a pull-based (fetch) model where followers request
+  entries from the leader, as described in the KRaft protocol.
+- **Safety guarantees** matching the five Raft invariants (leader election
+  safety, log matching, state machine safety, leader completeness,
+  append-only leader).
 - **Log compaction** via periodic snapshotting.
 - **Dynamic quorum changes** (single-node add/remove at a time).
 
@@ -22,13 +23,25 @@ Kafka clone — it extracts and adapts the consensus layer described in the
 reference material into an independent Rust library and accompanying test
 harness.
 
-### Reference Material Assessment
+### 1.1 Reference Material Assessment
 
-| # | URL | Relevance |
-|---|-----|-----------|
-| 1 | [Red Hat — Deep dive into Apache Kafka's KRaft protocol](https://developers.redhat.com/articles/2025/09/17/deep-dive-apache-kafkas-kraft-protocol) | **Primary** — provides the authoritative protocol walkthrough covering leader election, log replication, safety rules, Pre-Vote, Check Quorum, snapshotting, dynamic quorum, and implementation architecture. |
-| 2 | [Confluent — Learn KRaft](https://developer.confluent.io/learn/kraft/) | **Secondary** — gives architectural context on why KRaft replaced ZooKeeper, the event-sourced storage model, and the pull-based replication design. |
-| 3 | [github.com/dragotin/kraft](https://github.com/dragotin/kraft) | **Not relevant** — this repository is a Qt6/KDE invoicing desktop application ("Kraft"), unrelated to the Raft or KRaft consensus protocol. Likely included in the story description by mistake. |
+Each URL in the story description was reviewed for relevance and content:
+
+| # | URL | Relevance | Key Takeaways |
+|---|-----|-----------|---------------|
+| 1 | [Red Hat — Deep dive into Apache Kafka's KRaft protocol](https://developers.redhat.com/articles/2025/09/17/deep-dive-apache-kafkas-kraft-protocol) | **Primary** — provides the authoritative protocol walkthrough. | Covers leader election, pull-based log replication via `Fetch` RPCs, safety rules, Pre-Vote, Check Quorum, snapshotting, dynamic quorum (`AddRaftVoter`/`RemoveRaftVoter`/`UpdateRaftVoter`), `DivergingEpoch` for log truncation, high-watermark advancement, single-threaded event loop (`KafkaRaftClient`), `VotersRecord` control records, and the three-layer architecture (`QuorumController` → `KafkaRaftClient` → `MetadataLoader`). |
+| 2 | [Confluent — Learn KRaft](https://developer.confluent.io/learn/kraft/) | **Secondary** — gives architectural context. | Explains why KRaft replaced ZooKeeper (operational complexity, scalability, state consistency), the event-sourced storage model, near-instantaneous failover because new leaders already hold committed records in memory, and combined-mode for single-node testing. |
+| 3 | [github.com/dragotin/kraft](https://github.com/dragotin/kraft) | **Not relevant** — this repository is a Qt6/KDE invoicing desktop application ("Kraft") for small businesses. It has no connection to the Raft or KRaft consensus protocol. Confirmed by inspecting the repo README and source. Likely included in the story description by mistake due to name collision. | None. |
+
+> **Note on supplementary references:** Because the story's three URLs yield
+> only two relevant sources (both descriptive articles, no reference source
+> code), the implementation will also cross-reference:
+> - The original Raft paper (Ongaro & Ousterhout, 2014) for formal invariants.
+> - The [`etcd/raft`](https://github.com/etcd-io/raft) Go implementation for
+>   battle-tested patterns.
+> - The [`openraft`](https://github.com/datafuselabs/openraft) Rust crate for
+>   idiomatic Rust Raft API design.
+> These are used for cross-validation only; xraft is not a port of any of them.
 
 ---
 
@@ -41,50 +54,69 @@ implementation of the Raft protocol as described in the reference material.
 
 #### 2.1.1 Core Consensus (Raft)
 
-| Capability | Detail |
-|------------|--------|
-| **Node roles** | Three states: Follower, Candidate, Leader. Clean state machine transitions driven by timeouts and RPCs. |
-| **Leader election** | Term-based election with `RequestVote` (called `Vote` in KRaft). Randomised election timeouts to prevent split votes. |
-| **Pre-Vote protocol** | Two-phase election: candidates check viability before incrementing the term, preventing disruptive elections by isolated nodes. |
-| **Check Quorum** | Leader periodically verifies it can reach a majority of voters; steps down if quorum is lost. Prevents split-brain during network partitions. |
-| **Log replication** | Pull-based model (followers fetch from the leader, as in KRaft), not push-based. Leader tracks follower progress and advances the high watermark when a majority has replicated. |
-| **Safety invariants** | Leader election safety, append-only leader, leader completeness, log matching, state machine safety — enforced as described in the Raft paper and the Red Hat article. |
-| **Persistence** | `currentTerm`, `votedFor`, and the log are durably persisted to stable storage (file-backed). Voting state stored separately from the log for performance and bootstrapping reasons. |
-| **Heartbeats** | Leader sends periodic heartbeats (empty fetch responses or explicit pings) to suppress follower election timeouts. |
-| **No-op commit on leader start** | New leader commits a blank entry to establish commit state for the new term before serving reads. |
+| Capability | Detail | Reference |
+|------------|--------|-----------|
+| **Node roles** | Three states: Follower, Candidate, Leader. Clean state machine transitions driven by timeouts and RPCs. | Raft paper §5; Red Hat article "Introducing Raft" |
+| **Leader election** | Term-based election with `Vote` RPC (KRaft terminology for `RequestVote`). Randomised election timeouts (150–300 ms) to prevent split votes. A candidate votes for itself, then requests votes from all other nodes. First candidate to receive a majority wins. | Red Hat article "Leader election" |
+| **Pre-Vote protocol** | Two-phase election: candidates send a pre-vote request to check viability before incrementing the term. Followers that have recently heard from a leader reject pre-vote requests, preventing disruptive elections by isolated or partitioned nodes. | Red Hat article "Network partition" — Pre-Vote |
+| **Check Quorum** | Leader periodically verifies it can communicate with a majority of voters; steps down if quorum is lost. Prevents split-brain during network partitions. | Red Hat article "Network partition" — Check Quorum |
+| **Log replication (pull-based)** | Followers and observers periodically send `Fetch` RPCs to the leader to pull new log entries. The leader responds with entries and the current high watermark (HW). This is the KRaft model — not the push-based `AppendEntries` model from the original Raft paper. Pull-based scales better because followers control their own fetch rate and the leader avoids managing outbound connections. Two fetch rounds are needed for a follower to see a commit: one to fetch new records, and a second to receive the updated HW. | Red Hat article "Core RPCs" — Fetch RPC; Confluent article "How it works" |
+| **High watermark (HW)** | The leader tracks follower progress (the last offset each follower has fetched). When a majority of voters have replicated up to offset N, the HW advances to N and entries ≤ N are committed. | Red Hat article "Raft replication" step 3 |
+| **Safety invariants** | Five invariants enforced at all times: (1) Leader election safety — at most one leader per term. (2) Append-only leader — leader never overwrites/deletes its own entries. (3) Leader completeness — elected leader has all committed entries from prior terms. (4) Log matching — if two logs have an entry with the same index and term, they are identical up to that index. (5) State machine safety — no two nodes apply different entries at the same index. | Red Hat article "Safety rules"; Raft paper §5.4 |
+| **Persistence** | `currentTerm`, `votedFor`, and the log are durably persisted to stable storage (`fsync`) before any acknowledgement. Voting state is stored separately from the log for performance and bootstrapping reasons (as in KRaft's `quorum-state` file). | Red Hat article "Safety rules" — persistence requirements |
+| **Heartbeats** | Leader sends periodic heartbeats to suppress follower election timeouts. In pull-based mode, heartbeats are implicit: the leader responds to follower `Fetch` RPCs even when there are no new entries. If a follower's fetch interval is long, the leader may also send lightweight ping responses. | Red Hat article "Log replication" — heartbeats |
+| **No-op commit on leader start** | A new leader commits a blank entry (`LeaderChangeMessage` in KRaft) to establish commit state for the new term. This commits any uncommitted entries from the previous epoch and prevents indefinite delays when no client writes occur. | Red Hat article "Log replication"; "Core RPCs" — LeaderChangeMessage |
 
 #### 2.1.2 Log Compaction
 
-| Capability | Detail |
-|------------|--------|
-| **Snapshotting** | Periodic snapshot of the state machine written to stable storage. Snapshot includes last-applied index, term, and voter set. |
-| **Snapshot transfer** | If a leader has discarded log entries a follower needs, it sends the snapshot (chunked transfer). |
-| **Log truncation** | After snapshot is taken, log entries before the snapshot index may be discarded. |
+| Capability | Detail | Reference |
+|------------|--------|-----------|
+| **Snapshotting** | Periodic snapshot of the state machine written to stable storage. Snapshot includes last-applied index, term, and voter set. Nodes take snapshots independently (logs are consistent, so snapshots are consistent). | Red Hat article "Log compaction" |
+| **Snapshot transfer** | If the leader has discarded log entries a follower needs (offset < log start offset), the `Fetch` response includes a `SnapshotId` field. The follower then uses `FetchSnapshot` RPCs to download the snapshot in chunks. | Red Hat article "Core RPCs" — SnapshotId; FetchSnapshot |
+| **Log truncation** | After a snapshot is taken, log entries before the snapshot index may be discarded. The log start offset (LSO) advances accordingly. | Red Hat article "Log compaction" |
 
 #### 2.1.3 Dynamic Quorum (Membership Changes)
 
-| Capability | Detail |
-|------------|--------|
-| **Single-node changes** | Add or remove one voter at a time to prevent disjoint majorities. |
-| **Voter records** | Membership changes committed via a control record in the log (analogous to KRaft's `VotersRecord`). |
-| **Non-voting members** | New nodes join as observers (non-voting) until caught up, then promoted to voter. |
-| **Leader step-down** | If the leader is removed from the new configuration, it continues to manage until the config change commits, then steps down. |
+| Capability | Detail | Reference |
+|------------|--------|-----------|
+| **Single-node changes** | Add or remove one voter at a time to prevent disjoint majorities. Enforced by the leader. Analogous to KRaft's `AddRaftVoter` / `RemoveRaftVoter` / `UpdateRaftVoter` RPCs. | Red Hat article "Dynamic quorum" |
+| **Voter records** | Membership changes committed via a control record in the log (analogous to KRaft's `VotersRecord`). The voter set is part of the snapshot for recovery. | Red Hat article "Dynamic quorum" — VotersRecord |
+| **Non-voting members (observers)** | New nodes join as observers (non-voting) until caught up with the leader, then promoted to voter. Observers replicate the log via `Fetch` but do not contribute to quorum. This avoids availability gaps when a new node has an empty log. | Red Hat article "Cluster scaling" |
+| **Leader step-down** | If the leader is removed from the new configuration, it continues managing the cluster until the voters-record commits or the epoch advances, then steps down. | Red Hat article "Dynamic quorum" |
 
 #### 2.1.4 Transport & RPC
 
+| Capability | Detail | Reference |
+|------------|--------|-----------|
+| **RPC framework** | Async message passing between nodes. Five RPC types: `Vote` (election), `Fetch` (log replication), `FetchSnapshot` (snapshot transfer), `AddVoter`/`RemoveVoter` (membership changes). | Red Hat article "Core RPCs" and "Dynamic quorum" |
+| **Identity & fencing** | Every RPC includes `clusterId` and `currentLeaderEpoch` for identity verification and fencing of stale messages. | Red Hat article "Core RPCs" — "All KRaft RPC schemas include `clusterId` and `currentLeaderEpoch`" |
+| **Divergence detection** | `Fetch` responses include a `DivergingEpoch` tagged field when log inconsistency is detected. The follower truncates its log back to the diverging point. Multiple fetch rounds may be required in worst-case scenarios. | Red Hat article "Core RPCs" — DivergingEpoch |
+| **Leader-epoch checkpoint** | The leader validates fetch requests against its log using a leader-epoch checkpoint (cached in memory for efficiency). This enables fast divergence detection. | Red Hat article "Core RPCs" — `leader-epoch-checkpoint` |
+
+#### 2.1.5 Library API
+
+xraft exposes a **Rust library API** for embedding into applications. This is
+the programmatic interface that application code links against — not a network
+service endpoint.
+
 | Capability | Detail |
 |------------|--------|
-| **RPC framework** | Async message passing between nodes. Four RPC types: `Vote`, `Fetch`, `FetchSnapshot`, and membership-change RPCs. |
-| **Identity verification** | Every RPC includes `clusterId` and `currentLeaderEpoch` for fencing stale messages. |
-| **Divergence detection** | `Fetch` responses include `DivergingEpoch` when log inconsistency is detected, triggering follower log truncation. |
+| **`propose(command) → Future<Result>`** | Submit a command to the replicated log. Returns a future that resolves when the entry is committed (HW has advanced past it). |
+| **`read() → Result<State>`** | Read the current committed state. Initial implementation routes reads through the log for safety. |
+| **`RaftClient::Listener` equivalent** | A trait that applications implement to receive callbacks: `handle_commit(batch)`, `handle_load_snapshot(reader)`, `handle_leader_change(leader_id, term)`, `begin_shutdown()`. Modelled on KRaft's `RaftClient.Listener` interface. |
+| **State machine trait** | `trait StateMachine { fn apply(&mut self, entry: &Entry) -> Result<()>; fn snapshot(&self) -> Result<Snapshot>; fn restore(&mut self, snapshot: Snapshot) -> Result<()>; }` — applications provide their own state machine. Generic (monomorphised at compile time) for zero-cost abstraction. |
 
-#### 2.1.5 Observability & Testing
+> **Scope boundary:** xraft provides the consensus library and test harness.
+> Building a key-value store, message queue, or any application-layer service
+> on top of the library is a separate concern and a separate story.
 
-| Capability | Detail |
-|------------|--------|
-| **Metrics** | Expose key metrics: current leader, current epoch, election latency, append rate, commit latency (mirrors KRaft's raft-metrics). |
-| **Deterministic simulation** | Support deterministic testing with injectable clocks, network, and storage to verify correctness under adversarial conditions. |
-| **Integration test harness** | Multi-node in-process cluster for scenario-based testing (see `e2e-scenarios.md`). |
+#### 2.1.6 Observability & Testing
+
+| Capability | Detail | Reference |
+|------------|--------|-----------|
+| **Metrics** | Expose key metrics mirroring KRaft's `raft-metrics` group: `current-leader`, `current-epoch`, `election-latency-avg`, `append-records-rate`, `commit-latency-avg`. Exposed as Rust structs; integration with Prometheus/OpenTelemetry is an extension concern. | Red Hat article "KRaft protocol" — metrics list |
+| **Deterministic simulation** | Support deterministic testing with injectable clocks, network, and storage to verify correctness under adversarial conditions. | — |
+| **Integration test harness** | Multi-node in-process cluster for scenario-based testing. See `e2e-scenarios.md` (sibling doc, produced in parallel) for scenario definitions. | — |
 
 ### 2.2 Out of Scope
 
@@ -92,14 +124,16 @@ These items are explicitly excluded from the xraft implementation:
 
 | Item | Rationale |
 |------|-----------|
-| **Kafka-specific metadata** | xraft is a general-purpose Raft library. Topics, partitions, broker registration, and Kafka's `__cluster_metadata` topic are Kafka concerns, not consensus concerns. |
+| **Kafka-specific metadata** | xraft is a general-purpose Raft library. Topics, partitions, broker registration, `__cluster_metadata` topic, and Kafka metadata versioning (`metadata.version`) are Kafka concerns. |
 | **Kafka wire protocol** | No compatibility with Kafka's binary protocol. xraft defines its own RPC serialisation. |
 | **ZooKeeper migration** | xraft is greenfield; there is no ZooKeeper to migrate from. |
 | **Multi-Raft / sharding** | Running multiple independent Raft groups within one process. May be a future extension but is not part of this story. |
-| **Client-facing API** | The library exposes a `propose(command)` / `read()` interface. Building a key-value store, database, or any application-layer service on top is out of scope. |
+| **Network service endpoint** | xraft does not expose an HTTP, gRPC, or other network-accessible service API. It is an embedded library. Applications that need a network-facing consensus service build that layer on top of the library API (§2.1.5). |
 | **Production deployment tooling** | Docker images, Kubernetes operators, Helm charts. |
-| **Web UI / dashboard** | Observability is via metrics and structured logs, not a graphical interface. |
-| **Linearisable reads** | Read-index or lease-based reads. Initial implementation routes all reads through the log (safe but slower). May be added as a follow-up. |
+| **Web UI / dashboard** | Observability is via metrics structs and structured logs, not a graphical interface. |
+| **Linearisable reads** | Read-index or lease-based reads. Initial implementation routes all reads through the log. May be added as a follow-up. |
+| **TLS / authentication** | Transport security is not part of the consensus protocol. The transport layer is designed for TLS to be added later without protocol changes. |
+| **Language bindings** | No C FFI, Python, or other language wrappers. The library is Rust-native. |
 
 ---
 
@@ -109,22 +143,27 @@ These are things the project will intentionally not pursue, even if they could
 improve the system:
 
 1. **Kafka compatibility** — xraft is not a Kafka replacement or a KRaft
-   reimplementation. It uses KRaft as a design reference, not a compatibility
-   target.
+   reimplementation. It uses KRaft as a design reference for pull-based
+   replication and dynamic quorum, not a compatibility target. It does not
+   implement Kafka's metadata topic, broker registration, or metadata versioning.
 
-2. **Maximum throughput** — correctness and clarity take precedence over raw
+2. **Push-based replication** — The original Raft paper uses push-based
+   `AppendEntries` RPCs. xraft commits exclusively to the pull-based (fetch)
+   model from KRaft. This is a deliberate design choice, not a deferral.
+   The pull-based model is more complex to implement but scales better with
+   observers and simplifies leader connection management (the leader does not
+   need outbound connections to every follower). Hybrid push-pull or fallback
+   to push-based is not planned.
+
+3. **Maximum throughput** — correctness and clarity take precedence over raw
    performance. The implementation should be efficient (batching, async I/O),
    but micro-optimisations (lock-free data structures, zero-copy networking)
    are deferred until profiling justifies them.
 
-3. **Pluggable storage engines** — the initial implementation uses a single
+4. **Pluggable storage engines** — the initial implementation uses a single
    file-backed storage backend. A trait-based storage abstraction exists for
    testability, but supporting multiple production backends (RocksDB, sled) is
    not a goal.
-
-4. **TLS / authentication** — transport security is important for production
-   but is not part of the core consensus protocol. The transport layer should
-   be designed to allow TLS to be added later without protocol changes.
 
 5. **Language bindings** — no C FFI, Python, or other language wrappers. The
    library is Rust-native.
