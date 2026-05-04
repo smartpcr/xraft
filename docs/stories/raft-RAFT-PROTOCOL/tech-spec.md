@@ -125,7 +125,7 @@ service endpoint.
 |------------|--------|-----------|
 | **Metrics** | Expose key metrics mirroring KRaft's `raft-metrics` group: `current-leader`, `current-epoch`, `election-latency-avg`, `append-records-rate`, `commit-latency-avg`. Exposed as Rust structs; integration with Prometheus/OpenTelemetry is an extension concern. | Red Hat article "KRaft protocol" — metrics list |
 | **Deterministic simulation** | Support deterministic testing with injectable clocks, network, and storage to verify correctness under adversarial conditions. | — |
-| **Integration test harness** | Multi-node in-process cluster for scenario-based testing. Scenarios cover leader failure, network partition, log divergence, snapshot transfer, and membership changes. Companion document `e2e-scenarios.md` (authored in parallel) defines detailed scenario specifications. | — |
+| **Integration test harness** | Multi-node in-process cluster for scenario-based testing. Scenarios cover leader failure, network partition, log divergence, snapshot transfer, and membership changes. A planned companion document (`e2e-scenarios.md`) will define detailed scenario specifications once authored. | — |
 
 ### 2.2 Out of Scope
 
@@ -170,9 +170,9 @@ improve the system:
    are deferred until profiling justifies them.
 
 4. **Pluggable storage engines** — the initial implementation uses a single
-   file-backed storage backend. A trait-based storage abstraction exists for
-   testability, but supporting multiple production backends (RocksDB, sled) is
-   not a goal.
+   segment-file-based storage backend (see §6, Log storage decision). A
+   trait-based storage abstraction exists for testability, but supporting
+   multiple production backends (RocksDB, sled) is not a goal.
 
 5. **Language bindings** — no C FFI, Python, or other language wrappers. The
    library is Rust-native.
@@ -209,7 +209,7 @@ The `smartpcr/xraft` repository is currently greenfield — it contains only a
 
 | Constraint | Detail |
 |------------|--------|
-| **Workspace layout** | Cargo workspace with separate crates: `xraft-core` (consensus state machine), `xraft-transport` (async RPC), `xraft-storage` (durable log and snapshots), and `xraft-test` (deterministic simulation harness). Companion document `architecture.md` (authored in parallel) elaborates crate internals. |
+| **Workspace layout** | Cargo workspace with separate crates: `xraft-core` (consensus state machine), `xraft-transport` (async RPC), `xraft-storage` (durable log and snapshots), and `xraft-test` (deterministic simulation harness). A planned companion document (`architecture.md`) will elaborate crate internals once authored. |
 | **Repository** | `smartpcr/xraft` — all code lands in this repo. |
 | **Branch strategy** | Feature branches off `main`, PR-based review. |
 
@@ -279,9 +279,9 @@ Likelihood│             │               │              │                
 ## 6. Key Design Decisions
 
 These decisions affect the overall design and are recorded here as the
-authoritative source. Companion documents `architecture.md` and
-`implementation-plan.md` (authored in parallel) elaborate on structural and
-sequencing details respectively.
+authoritative source. Planned companion documents (`architecture.md` and
+`implementation-plan.md`) will elaborate on structural and sequencing details
+respectively once authored.
 
 | Decision | Options | Recommendation | Status |
 |----------|---------|----------------|--------|
