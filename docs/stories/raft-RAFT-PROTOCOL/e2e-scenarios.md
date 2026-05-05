@@ -921,24 +921,22 @@ Feature: Client Interaction
     When a client calls propose("set x=1") on N1
     Then N1 returns an error indicating no leader is available
 
-  Scenario: Read returns current committed state machine state
+  Scenario: Read returns current committed state machine state (leader-only)
     Given N1 is Leader for term 1 with high watermark 11 (offsets 0–10 committed)
     And the StateMachine has applied all committed command entries (control records filtered)
     When a client calls read() on N1
-    Then read() returns the StateMachine's current state (the result of all apply() calls through HW − 1 = offset 10)
+    Then read() routes through the committed log for safety (per tech spec §2.1.5)
+    And read() returns the StateMachine's current state (the result of all apply() calls through HW − 1 = offset 10)
     And reads are NOT linearisable (per tech spec §2.2 — linearisable reads are out of scope)
-    And the initial implementation routes reads through the committed log for safety
-    And consensus metadata (term, role, HW, voter_set) is accessible separately via metrics
+    And consensus metadata (term, role, HW, voter_set) is accessible separately via RaftMetrics
 
-  Scenario: Read on a follower returns state based on local HW
-    Given N2 is a Follower with currentTerm 1 and local HW 9
-    And the leader's HW is 11 (N2 has not yet received the latest HW via Fetch)
-    And N2's StateMachine has applied all committed command entries through offset 8 (HW − 1 = 8)
+  Scenario: Read rejected on follower (leader-only API)
+    Given N2 is a Follower with currentTerm 1
+    And N1 is the current Leader
     When a client calls read() on N2
-    Then read() returns N2's StateMachine state reflecting entries applied through offset 8
-    And the result may lag behind the leader because N2's local HW (9) is behind the leader's HW (11)
-    And this is expected: linearisable reads are out of scope (per tech spec §2.2)
-    And N2 will catch up on the next Fetch cycle
+    Then N2 returns Err(NotLeader { leader_id: N1 })
+    And the client must redirect to the leader (N1) to perform the read
+    And this matches propose() semantics — both read() and propose() are leader-only
 
   Scenario: At-least-once semantics — duplicate proposal after leader failover
     Given a client proposes command "set x=1" to N1 (Leader)
@@ -1063,40 +1061,40 @@ Feature: Observability and Metrics
     And N1 is Leader for term 2
 
   Scenario: Current leader metric is accurate
-    When querying metrics on any node
-    Then the "current-leader" metric returns N1's node ID
-    And the "current-epoch" metric returns 2
+    When querying RaftMetrics on any node
+    Then the "current_leader" field returns Some(N1's node ID)
+    And the "current_epoch" field returns 2
 
   Scenario: Leader metric updates after election
     Given N1 crashes
     And N2 wins election for term 3
-    When querying metrics on N2
-    Then "current-leader" returns N2's node ID
-    And "current-epoch" returns 3
-    When querying metrics on N3
-    Then "current-leader" returns N2's node ID
-    And "current-epoch" returns 3
+    When querying RaftMetrics on N2
+    Then "current_leader" returns Some(N2's node ID)
+    And "current_epoch" returns 3
+    When querying RaftMetrics on N3
+    Then "current_leader" returns Some(N2's node ID)
+    And "current_epoch" returns 3
 
   Scenario: Unknown leader metric during election
     Given no leader exists (election in progress)
-    When querying metrics on any node
-    Then "current-leader" returns -1 (unknown)
+    When querying RaftMetrics on any node
+    Then "current_leader" returns None (per architecture doc §6.4: current_leader is Option<NodeId>)
 
   Scenario: Election latency metric is recorded
     Given a leader election completes in 45ms
-    When querying metrics on the new leader
-    Then "election-latency-avg" reflects the 45ms election duration
+    When querying RaftMetrics on the new leader
+    Then "election_latency_avg_ms" reflects the 45ms election duration
 
   Scenario: Append rate metric tracks leader throughput
     Given the leader N1 appends 500 entries over 10 seconds
-    When querying metrics on N1
-    Then "append-records-rate" is approximately 50 records/second
+    When querying RaftMetrics on N1
+    Then "append_records_rate" is approximately 50 records/second
 
   Scenario: Commit latency metric tracks end-to-end commit time
     Given a client proposes a command
     And the command is committed after 12ms (propose to HW advancement)
-    When querying metrics on the leader
-    Then "commit-latency-avg" reflects the 12ms latency
+    When querying RaftMetrics on the leader
+    Then "commit_latency_avg_ms" reflects the 12ms latency
 ```
 
 ---

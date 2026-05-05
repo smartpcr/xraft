@@ -27,12 +27,12 @@
     "status": "planning"
   },
   {
-    "title": "Trait Definitions (Storage, Transport, Clock)",
-    "description": "Trait Definitions (Storage, Transport, Clock) (8 steps)",
-    "anchor": "phase-project-scaffolding-and-core-types/stage-trait-definitions-storage-transport-clock",
-    "contentHash": "7087bcfada8103a041b55ae48f246735f8c4e09dbcf6e900a9a4257fa081b02e",
-    "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-clock",
-    "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-clock",
+    "title": "Trait Definitions (Storage, Transport, Runtime)",
+    "description": "Trait Definitions (Storage, Transport, Runtime) (8 steps)",
+    "anchor": "phase-project-scaffolding-and-core-types/stage-trait-definitions-storage-transport-runtime",
+    "contentHash": "a5e5bfd290b2609e6d898969e07009c7dcde84da08742baf13a84f1a2e8c694b",
+    "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-runtime",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-runtime",
     "status": "planning"
   },
   {
@@ -57,7 +57,7 @@
     "title": "\u0060RaftNode\u0060 Public API Skeleton",
     "description": "\u0060RaftNode\u0060 Public API Skeleton (7 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-raftnode-public-api-skeleton",
-    "contentHash": "b8ed467314cce680a4be60f473c9b9627485917b0f92d24bec83752aa4f9d226",
+    "contentHash": "40cf08b9504acd9625c0c19ea877c911c092ce67dbd8d42e4e37663aa5706255",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
     "status": "planning"
@@ -66,7 +66,7 @@
     "title": "In-Memory Storage Backends and Simulated Clock (\u0060xraft-test\u0060)",
     "description": "In-Memory Storage Backends and Simulated Clock (\u0060xraft-test\u0060) (5 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-in-memory-storage-backends-and-simulated-clock-xraft-test",
-    "contentHash": "e64b6b08865fdbcc4a7625ca29db76d94cb0e92fc02353c8ed0cdc30ef2769e0",
+    "contentHash": "d271d1e5f3c27a121ee6a9cf747c22d59aca529973b4d1cedc33a350de3ae6de",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-in-memory-storage-backends-and-simulated-clock-xraft-test",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-in-memory-storage-backends-and-simulated-clock-xraft-test",
     "status": "planning"
@@ -93,7 +93,7 @@
     "title": "Quorum State File and Leader-Epoch Checkpoint",
     "description": "Quorum State File and Leader-Epoch Checkpoint (4 steps)",
     "anchor": "phase-storage-layer-xraft-storage/stage-quorum-state-file-and-leader-epoch-checkpoint",
-    "contentHash": "a0d0b3105c560c31531ee62cf5c81302e4b411933c19c8cdfef5d82439f45009",
+    "contentHash": "7508e29f4a6e246f350a1e7563b0eb4dfab8e13a32092811273cf0b79fd0bdf3",
     "workstreamId": "ws-raft-raft-protocol-phase-storage-layer-xraft-storage-stage-quorum-state-file-and-leader-epoch-checkpoint",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-storage-layer-xraft-storage-stage-quorum-state-file-and-leader-epoch-checkpoint",
     "status": "planning"
@@ -147,7 +147,7 @@
     "title": "Event Loop Skeleton and Timer Infrastructure",
     "description": "Event Loop Skeleton and Timer Infrastructure (5 steps)",
     "anchor": "phase-election-and-leader-lifecycle-xraft-core/stage-event-loop-skeleton-and-timer-infrastructure",
-    "contentHash": "0bcde8989d23b27730a0ed6c79e7f1b9b06bdbf3bc1667bd492416999629d6a0",
+    "contentHash": "59c928ce5ea729312d7e7e815033041d2b7996e1bb9df2a378461605c0ac402c",
     "workstreamId": "ws-raft-raft-protocol-phase-election-and-leader-lifecycle-xraft-core-stage-event-loop-skeleton-and-timer-infrastructure",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-election-and-leader-lifecycle-xraft-core-stage-event-loop-skeleton-and-timer-infrastructure",
     "status": "planning"
@@ -219,7 +219,7 @@
     "title": "Cluster Bootstrap",
     "description": "Cluster Bootstrap (4 steps)",
     "anchor": "phase-persistence-crash-recovery-and-bootstrap-xraft-core/stage-cluster-bootstrap",
-    "contentHash": "41c60558ab8f2ce2cb8d5b08db28587cd2f10f13edb857080f832f9ab697e4b2",
+    "contentHash": "19b5c547d678a140febf061f1bc8cdea34ed74f7e0a97ea29a2af0b814061b0f",
     "workstreamId": "ws-raft-raft-protocol-phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-cluster-bootstrap",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-cluster-bootstrap",
     "status": "planning"
