@@ -261,13 +261,12 @@ voter set is discarded.
 
 #### `NodeState` (internal consensus state)
 
-> **Naming disambiguation.** In the Rust implementation, the full internal
-> state struct is `NodeState` (`pub(crate)` visibility inside `xraft-core`).
-> The **public** type named `ConsensusState` returned by `read()` (§5.11) is
-> a **separate, smaller struct** containing only a projected subset of these
-> fields. Earlier component descriptions (§2.1) refer to "ConsensusState"
-> when describing the internal state — those references mean this `NodeState`
-> struct. The two types are distinct in code.
+> **Naming disambiguation.** The full internal state struct is `NodeState`
+> (`pub(crate)` visibility inside `xraft-core`). The **public** type named
+> `ConsensusState` returned by `read()` (§5.11) is a **separate, smaller
+> struct** containing only a projected subset of these fields. Throughout
+> this document, `NodeState` always refers to the internal state; `ConsensusState`
+> always refers to the public projected type. The two types are distinct in code.
 
 ```
 NodeState {
@@ -2044,22 +2043,15 @@ log end offset, voter set, node ID). This is a **local, non-linearizable**
 read of the node's in-memory state. It does NOT read application state and
 does NOT contact other nodes.
 
-> **Cross-document alignment note.**
->
-> All four documents agree on the semantics: `read() → Result<ConsensusState>`
-> is a local, non-linearizable snapshot of protocol metadata. The tech spec
-> lists "Linearisable reads — Read-index or lease-based reads" as out of scope.
-> Sibling docs enumerate five core fields (term, role, leader_id, HW, voter set);
-> this architecture's public `ConsensusState` (below) adds two supplementary
-> fields (`log_end_offset`, `node_id`) that are trivially available from the
-> same internal `NodeState` — the 5-field lists are abbreviated, not contradictory.
-> The impl-plan's phrasing "routes reads through the log for safety" describes
-> the semantic guarantee that the returned state reflects the latest
-> HW-committed position; the implementation maintains this invariant via a
-> synchronisation primitive (`tokio::sync::watch` or `Arc<RwLock<...>>`)
-> updated by the event loop after each state mutation. Both descriptions
-> produce identical observable behaviour — the phrasing differs in level
-> of abstraction. See §7.3 for full reconciliation.
+> **Cross-document alignment.** All four documents agree: `read() → Result<ConsensusState>`
+> is a local, non-linearizable snapshot of protocol metadata; linearisable
+> reads are out of scope (tech spec §2.2). Sibling docs list five core fields;
+> this architecture adds `log_end_offset` and `node_id` as supplementary fields
+> (see §7.3 R4). The impl plan's "routes reads through the log" describes the
+> semantic guarantee (returned state reflects HW-committed position); this
+> architecture specifies the mechanism (a `tokio::sync::watch` channel updated
+> by the event loop after each state mutation). Same observable behaviour —
+> see §7.3 R5.
 
 ```
     Client            RaftNode         ConsensusState
@@ -2076,12 +2068,9 @@ does NOT contact other nodes.
 1. **Entry point.** `RaftNode::read()` returns the current `ConsensusState`
    immediately. It does NOT enter the event loop's message queue. The
    `ConsensusState` is maintained by the event loop (updated after each
-   state mutation) and exposed to callers via a synchronisation primitive
-   (e.g., `tokio::sync::watch` or `Arc<RwLock<...>>`). The returned state
-   always reflects the latest HW-committed protocol position — consistent
-   with the impl plan's description of "routing reads through the log for
-   safety," which describes this same semantic guarantee at a higher level
-   of abstraction.
+   state mutation) and exposed to callers via a `tokio::sync::watch`
+   channel. The returned state always reflects the latest HW-committed
+   protocol position.
 
 2. **Callable on any node.** Unlike `propose()` (which requires the
    leader), `read()` is callable on any node — leader, follower,
@@ -2270,8 +2259,8 @@ any of the four documents without encountering contradictory requirements.
 | **R2** | **Recovery "replay" wording** | No `StateMachine::apply` during recovery. Log entries between snapshot and LEO are scanned for control-record metadata only (§5.10 rules 2–4). HW is learned from the leader via Fetch. | Tech spec §2.1.7 step (3) says "replaying log entries after the snapshot offset." | **Precision difference.** The tech spec uses "replaying" at a high level to describe the recovery phase that processes log entries. This architecture specifies the exact semantics: "replay" means scanning for consensus metadata (voter set from `VotersRecord`, epoch checkpoint from `LeaderChangeMessage`) — NOT calling `StateMachine::apply`. The impl plan Stage 6.1 step 4 confirms: "do NOT apply any entries to the `StateMachine`." Both documents describe the same recovery flow; this architecture provides implementation-level precision. |
 | **R3** | **Quorum-state field count** | Recovery loads **all 4** `QuorumState` fields: `current_term`, `voted_for`, `leader_id`, `leader_epoch` (§5.10 rule 5). | Impl plan Stage 6.1 step 2 says "load quorum-state file for `current_term` and `voted_for`" — listing 2 of 4 fields. | **Abbreviation.** The impl plan names the two most critical fields for brevity. The `QuorumStateStore::load()` trait (impl plan Stage 1.4) returns `Option<QuorumState>`, and `QuorumState` is defined with all 4 fields (impl plan Stage 1.2). The full struct is loaded — the step description is abbreviated, not incorrect. |
 | **R4** | **`read()` field count** | `read()` returns 7 fields: `current_term`, `role`, `leader_id`, `high_watermark`, `log_end_offset`, `voter_set`, `node_id` (§5.11). | Tech spec §2.1.5, e2e scenarios, and impl plan list 5 core fields (term, role, leader ID, HW, voter set). | **Abbreviation.** The 5-field list is the core subset common to all docs. `log_end_offset` and `node_id` are supplementary fields that are trivially available from the same `ConsensusState` struct. The sibling docs abbreviate the field list; they do not assert the struct has *only* 5 fields. No implementation conflict. |
-| **R5** | **`read()` implementation path** | `read()` returns node-local protocol metadata maintained by the event loop, exposed via a synchronisation primitive (`watch`/`RwLock`) that the event loop updates after each state mutation (§5.11). | Impl plan Stages 1.7 and 5.3 say "routes reads through the log for safety, meaning the returned state reflects the latest HW-committed position in the log." | **Same guarantee, different abstraction level.** The impl plan describes the *semantic* guarantee: the returned state reflects the latest HW-committed position. This architecture describes the *mechanism*: a `watch`/`RwLock` snapshot updated by the event loop (which itself processes log commits). Both produce identical observable behaviour — `read()` returns state that reflects committed log entries without the caller querying the log directly. The two descriptions are compatible. |
+| **R5** | **`read()` implementation path** | `read()` returns node-local protocol metadata maintained by the event loop, exposed via a `tokio::sync::watch` channel that the event loop updates after each state mutation (§5.11). | Impl plan Stages 1.7 and 5.3 say "routes reads through the log for safety, meaning the returned state reflects the latest HW-committed position in the log." | **Same guarantee, different abstraction level.** The impl plan describes the *semantic* guarantee: the returned state reflects the latest HW-committed position. This architecture describes the *mechanism*: a `watch` channel updated by the event loop (which itself processes log commits). Both produce identical observable behaviour — `read()` returns state that reflects committed log entries without the caller querying the log directly. The two descriptions are compatible. |
 | **R6** | **`ClusterId` generation source** | `ClusterId` UUID is generated once by the operator, passed to `bootstrap()` as a parameter (§5.9). | Tech spec §2.1.7 says "generated at bootstrap time." | **Compatible.** "Generated at bootstrap time" accurately describes when the UUID is created — the operator generates it at bootstrap time and passes it to all nodes. The tech spec is ambiguous about *who* generates it; this architecture resolves the ambiguity: the operator generates it (not auto-generated by the code). No conflict. |
-| **R7** | **Voter-set dual-quorum semantics** | This architecture distinguishes **committed** `voter_set` (elections, Check Quorum, `read()`) from **pending** `pending_membership_change` (HW advancement only). `ConsensusState` tracks both (§3.2). | E2e scenarios correctly describe the dual semantics: "HW uses new voter set on append, elections on commit." Impl plan and tech spec describe the same behaviour without modelling `pending_membership_change` as a separate field. | **Modelling granularity.** All four documents agree on the *behaviour*: HW advancement switches to the new voter set on append, elections switch on commit. This architecture introduces the `pending_membership_change` field as the implementation-level mechanism. Impl plan and tech spec operate at a higher level where the behaviour is described without naming the internal field. No contradiction — this is implementation detail vs. spec-level description. |
+| **R7** | **Voter-set dual-quorum semantics** | This architecture distinguishes **committed** `voter_set` (elections, Check Quorum, `read()`) from **pending** `pending_membership_change` (HW advancement only). `NodeState` tracks both fields (§3.2); the public `ConsensusState` exposes only the committed `voter_set`. | E2e scenarios correctly describe the dual semantics: "HW uses new voter set on append, elections on commit." Impl plan and tech spec describe the same behaviour without modelling `pending_membership_change` as a separate field. | **Modelling granularity.** All four documents agree on the *behaviour*: HW advancement switches to the new voter set on append, elections switch on commit. This architecture introduces the `pending_membership_change` field as the implementation-level mechanism. Impl plan and tech spec operate at a higher level where the behaviour is described without naming the internal field. No contradiction — this is implementation detail vs. spec-level description. |
 | **R8** | **Recovery VotersRecord handling** | On recovery, uncommitted `VotersRecord` entries are stored as `pending_membership_change` — they do NOT replace the committed `voter_set` from the snapshot (§5.10 rule 3). | Impl plan Stage 6.1 step 5 says "VotersRecord → update voter set." Tech spec §2.1.7 step (3) says "replaying log entries." | **Terminology difference.** The impl plan's "update voter set" refers to recovery-time bookkeeping — storing the `VotersRecord` as `pending_membership_change` so that HW advancement can use it if/when the leader confirms it is committed. It does NOT mean replacing the committed `voter_set` used for elections. The impl plan Stage 8.1 and e2e quorum-transition scenario both confirm that uncommitted `VotersRecord` entries are not effective for elections. This architecture provides the precise semantics: "update" means "store as pending change for HW purposes." |
 | **R9** | **Quorum-state schema adaptation** | `QuorumState { current_term, voted_for, leader_id, leader_epoch }` — four fields (§3.2). | Tech spec §2.1.7 lists KRaft's persisted fields: `currentTerm`, `votedFor`, and `votedDirectoryId`. | **KRaft adaptation.** KRaft's `votedDirectoryId` is a Kafka-specific node identity concept. xraft adapts this to two Rust-native fields: `leader_id: Option<NodeId>` (the known leader) and `leader_epoch: Term` (the leader's term, used for fencing in `RpcEnvelope`). This is consistent with the tech spec §2.1.8 KRaft Adaptation Mapping — xraft renames and restructures KRaft mechanisms for its own design. The tech spec's `votedDirectoryId` reference describes the KRaft source material; the architecture's `leader_id` + `leader_epoch` is the adapted xraft design. |
