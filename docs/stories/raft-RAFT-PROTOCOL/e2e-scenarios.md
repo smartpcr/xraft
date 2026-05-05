@@ -1046,12 +1046,13 @@ Feature: Client Interaction
     And the BatchAccumulator drains the entry to the log via IoAction::AppendLog
     And the propose future is parked in the DeferredCompletionQueue (keyed by offset)
     When followers Fetch and replicate the entry and the HW advances past it
-    Then the event loop invokes the three-phase commit sequence in order:
-      | Phase | Action                                                              |
-      | 1     | StateMachine::apply("set x=1") — one call per committed command     |
-      | 2     | Listener::handle_commit(batch) — one batch of committed AppRecords  |
-      | 3     | DeferredCompletionQueue::complete — resolves the propose future     |
-    And the propose future resolves with Ok (after phases 1–3 complete)
+    Then the event loop invokes the four-phase commit sequence in order (§4.1):
+      | Phase | Action                                                                          |
+      | 1     | StateMachine::apply("set x=1") — one call per committed command                 |
+      | 2     | Listener::handle_commit(batch) — one batch of committed AppRecords              |
+      | 3     | DeferredCompletionQueue::complete — resolves the propose future                 |
+      | 4     | DeferredReadQueue::drain — resolves pending read() via query() (no-op if empty) |
+    And the propose future resolves with Ok (after phase 3)
     And all callbacks are synchronous in-process calls within the event loop
 
   Scenario: Proposal rejected on follower
@@ -1064,54 +1065,46 @@ Feature: Client Interaction
     When a client calls propose("set x=1") on N1
     Then N1 returns an error indicating no leader is available
 
-  Scenario: Read returns consensus protocol state on the leader
-    # Per implementation plan Stage 5.3: read() -> Result<ConsensusState>.
-    # Returns a snapshot of the current committed protocol state (term, role,
-    # leader_id, high_watermark, voter_set). The HW reflects the latest
-    # HW-committed position in the log ("routes reads through the log for
-    # safety" — tech spec §2.1.5). The application accesses its own
-    # StateMachine state directly — not through read().
-    # Linearisable reads (read-index, lease-based) are out of scope (tech spec §2.2).
+  Scenario: Linearizable read on leader in steady state (leadership confirmed)
+    # Per architecture §5.11: read() returns S::ReadResult via StateMachine::query()
+    # after the leader confirms its authority (a committed current-term entry).
+    # The leader does NOT append a per-read log entry — it confirms leadership
+    # proof, then invokes query() synchronously within the event loop.
+    # Consensus metadata (term, role, HW, voter_set) is NOT returned by read()
+    # — it is available separately via RaftNode::metrics() -> RaftMetrics (§6.4).
     Given N1 is Leader for term 1
-    And the cluster has committed entries up to HW = 10
+    And a current-term entry has already been committed (HW has advanced past it)
+    And the StateMachine has state reflecting all committed writes
     When a client calls read() on N1
-    Then read() returns a ConsensusState snapshot containing:
-      term = 1, role = Leader, leader_id = Some(N1),
-      high_watermark = 10, voter_set = {N1, N2, N3}
-    And the high_watermark is an exclusive upper bound (entries 0–9 are committed)
-    And the application reads its own StateMachine state directly (not via read())
-    And consensus metrics are also available separately via the RaftMetrics struct
+    Then the event loop confirms leadership (current-term entry already committed)
+    And the event loop invokes StateMachine::query() synchronously
+    And read() resolves with Ok(S::ReadResult) — the application's query result
+    And the read completes in the same event-loop tick (no I/O, no log append)
 
-  Scenario: Read returns immediately even before current-term entry commits
-    # read() returns the current ConsensusState snapshot immediately — it does
-    # not block waiting for a committed current-term entry. The returned HW
-    # may reflect the previous term's committed position until the new leader's
-    # LeaderChangeMessage is committed and HW advances.
-    # Linearisable reads (which would require leadership proof) are out of scope.
+  Scenario: Read on fresh leader is deferred until leadership is confirmed
+    # Per architecture §5.11 path B: if no current-term entry is committed yet,
+    # the read is parked in the DeferredReadQueue until the LeaderChangeMessage
+    # commits (HW advances past it), at which point query() is invoked.
     Given N1 just won election for term 2 and appended a LeaderChangeMessage
     And the LeaderChangeMessage has NOT yet been committed (followers have not fetched it)
-    And HW is still at the previous term's committed position (e.g., HW = 5)
     When a client calls read() on N1
-    Then read() returns immediately with ConsensusState:
-      term = 2, role = Leader, leader_id = Some(N1), high_watermark = 5
-    And the client can observe that HW has not yet advanced (no current-term commit)
-    When followers Fetch the LeaderChangeMessage and HW advances to 6
-    And the client calls read() again on N1
-    Then read() returns ConsensusState with high_watermark = 6
+    Then the event loop detects no current-term entry is committed yet
+    And the ReadRequest is parked in the DeferredReadQueue
+    When followers Fetch the LeaderChangeMessage and HW advances past it
+    Then the event loop runs the four-phase commit sequence (§4.1)
+    And then drains the DeferredReadQueue as step 4 of commit notification
+    And for each parked read, the event loop invokes StateMachine::query()
+    And the client's read() future resolves with Ok(S::ReadResult)
 
-  Scenario: Read on follower returns follower's local consensus state
-    # read() returns the local ConsensusState on any node — leader or follower.
-    # A follower's view may be stale (HW lags behind the leader's HW until
-    # the next Fetch response arrives). The application checks the role field
-    # to determine if this node is the leader.
-    # Per implementation plan Stage 5.3: read() is not leader-only.
-    Given N1 is Leader for term 1 with HW = 10
-    And N2 is a Follower whose last Fetch response updated its HW to 8
+  Scenario: Read on follower returns NotLeader error
+    # Per architecture §5.11: read() is leader-only. A follower immediately
+    # returns Err(NotLeader { leader_id }) so the client can redirect.
+    # To inspect protocol metadata on any node, use RaftNode::metrics() (§6.4).
+    Given N1 is Leader for term 1
+    And N2 is a Follower
     When a client calls read() on N2
-    Then read() returns ConsensusState with:
-      term = 1, role = Follower, leader_id = Some(N1), high_watermark = 8
-    And the client can see N2 is a Follower (not the leader)
-    And the client can decide to redirect proposals to N1 based on the leader_id field
+    Then read() immediately returns Err(NotLeader { leader_id: Some(N1) })
+    And the client can use leader_id to redirect the read to N1
 
   Scenario: At-least-once semantics — duplicate proposal after leader failover
     Given a client proposes command "set x=1" to N1 (Leader)
@@ -1124,20 +1117,23 @@ Feature: Client Interaction
     And xraft does NOT perform built-in deduplication
     And it is the application's responsibility to make commands idempotent
 
-  Scenario: Read returns stale state during network partition
-    # read() is non-blocking and returns immediately. During a partition,
-    # a client may get stale ConsensusState from the old leader (which
-    # still believes it is the leader until check-quorum fires).
-    Given N1 is Leader for term 1 with HW = 10
+  Scenario: Pending reads resolved with error on leader step-down
+    # Per architecture §5.11 cancellation: when the leader steps down (via
+    # check-quorum failure, higher-term RPC, or self-removal), all pending
+    # reads in the DeferredReadQueue are resolved with Err(NotLeader).
+    Given N1 is Leader for term 1
+    And a current-term entry has been committed (leadership confirmed)
     When N1 becomes partitioned from N2 and N3
     And N2 wins election for term 2 and becomes the new Leader
-    And a client calls read() on N1 (which has not yet stepped down)
-    Then read() returns ConsensusState with term = 1, role = Leader, leader_id = Some(N1)
-    And this state is stale (N1 is no longer the true leader but does not know yet)
+    And a client calls read() on N1 (leadership still confirmed locally)
+    Then the event loop invokes StateMachine::query() and returns Ok(result)
+    # Note: this read succeeds because N1 still believes it is the leader.
+    # The returned state is linearizable w.r.t. N1's committed state up to
+    # the point of partition. Once check-quorum detects the partition:
     When N1's check-quorum timer fires and N1 steps down to Follower
-    And the client calls read() on N1 again
-    Then read() returns ConsensusState with role = Follower
-    And the client detects the leadership change and contacts N2
+    Then any pending reads in N1's DeferredReadQueue are resolved with Err(NotLeader { leader_id: None })
+    And subsequent read() calls on N1 return Err(NotLeader { leader_id: None })
+    And the client must discover the new leader (N2) and retry
 
   Scenario: Application-level dedup via request IDs (out of xraft scope)
     Given the application wraps commands with unique request IDs
@@ -1153,16 +1149,20 @@ Feature: Client Interaction
     And on N1, the event loop invokes Listener::handle_leader_change(leader_id=N2, term=2)
     And the callback is invoked synchronously within the event loop before IoActions are dispatched
 
-  Scenario: Listener callbacks on commit — three-phase ordering
+  Scenario: Listener callbacks on commit — four-phase ordering
     Given the application has registered a Listener with handle_commit
-    And the application implements StateMachine with apply()
+    And the application implements StateMachine with apply() and query()
     When entries at offsets 5–7 are committed (HW advances to 8; offsets < 8 committed)
-    Then the event loop executes the three-phase commit sequence per the architecture doc (§4.1):
-    And Phase 1: StateMachine::apply is called once per committed command entry (offsets 5, 6, 7 in order)
+    Then the event loop executes the four-phase commit sequence per the architecture doc (§4.1):
+      | Phase | Action                                                                         |
+      | 1     | StateMachine::apply — one call per committed command entry (offsets 5, 6, 7)    |
+      | 2     | Listener::handle_commit — one batch of committed AppRecords [5, 6, 7]          |
+      | 3     | DeferredCompletionQueue::complete — resolves client propose futures (offset<HW) |
+      | 4     | DeferredReadQueue::drain — resolves pending read() requests via query() (§5.11)|
     And control records (if any among 5–7) are handled internally and never reach StateMachine::apply
-    And Phase 2: Listener::handle_commit receives one batch of committed AppRecords [5, 6, 7]
-    And Phase 3: DeferredCompletionQueue::complete resolves client futures whose offset < HW (offsets 5, 6, 7)
-    And all three phases are synchronous in-process calls within the event loop
+    And phase 4 is a no-op in steady state (leadership already confirmed); it only fires
+      when the newly committed entries include the first current-term entry
+    And all four phases are synchronous in-process calls within the event loop
     And the Fetch response (via IoStage) reflects the same HW = 8 that the callbacks observed
 ```
 
