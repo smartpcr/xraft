@@ -98,13 +98,12 @@ callbacks (`StateMachine`, `Listener`), manages timers via the injected
 
 | Sub-component | Responsibility |
 |---------------|----------------|
-| **`RaftNode`** | Public API surface. Exposes `propose()`, `read()` (§5.11), `bootstrap()`, and lifecycle methods. `propose()` appends a command to the log and returns a future resolved on commit. `read()` returns `S::ReadResult` — the application state as queried via `StateMachine::query()` after the leader confirms its authority (a committed current-term entry); it does NOT append to the log (§5.11). Owns the `EventLoop`, `ReceiverTask`, and `IoStage`; coordinates startup, shutdown, and crash recovery. Generic over two application-provided types: `S: StateMachine` and `L: Listener` (both monomorphised at compile time for zero-cost dispatch). I/O and runtime traits (`LogStore`, `TransportSender`, `TransportReceiver`, `QuorumStateStore`, `SnapshotIO`, `Clock`) are injected as `Box<dyn ...>` trait objects at construction time. The `IoStage` borrows I/O trait objects via `&self` for concurrent dispatch — no `Arc` needed because all I/O methods take `&self` and require `Sync`. On construction, executes the recovery sequence (§5.10) before accepting any RPCs. |
-| **`EventLoop`** | Single-threaded async loop that processes protocol state transitions without blocking on I/O. The loop drains an inbound message queue (`tokio::sync::mpsc` — fed by the `ReceiverTask`, §4.4, and by `propose()`/`read()` calls) and dispatches to the appropriate handler. Uses the injected `Clock` directly for timer management (election timeouts, check-quorum deadlines, fetch intervals). **Processing order per message:** (1) The handler mutates `ConsensusState` (e.g., updating follower progress, recalculating HW on a Fetch request, or recording appended entries); (2) If the state change triggers application-visible effects — HW advancement, leadership change — the loop invokes callbacks in a fixed order: `StateMachine::apply` (one call per committed command entry), then `Listener::handle_commit` (one batch of committed `AppRecord` values), then `DeferredCompletionQueue::complete` (resolves client futures for committed offsets), then `DeferredReadQueue` drain (resolves pending reads via `StateMachine::query`, §5.11); (3) The handler collects `IoAction` values into an `IoActionBatch` (e.g., `SendRpc` for the Fetch response, `AppendLog` for newly staged entries); (4) The loop hands the batch to the `IoStage`, which executes storage and network-send operations concurrently; (5) The loop records I/O results (e.g., advancing the durable offset after `AppendLog` completes). Callbacks in step 2 are synchronous, in-process function calls — not external I/O — and always observe the fully updated protocol state before any IoAction is dispatched. Callbacks must be lightweight and non-blocking; applications that need heavy processing should hand off work to their own async tasks. This prevents slow `fsync` calls from delaying Fetch processing and triggering spurious elections. |
+| **`RaftNode`** | Public API surface. Exposes `propose()`, `read()` (§5.11), `bootstrap()`, and lifecycle methods. `propose()` appends a command to the log and returns a future resolved on commit. `read()` returns `ConsensusState` — a local, non-linearizable snapshot of the node's current protocol metadata (term, role, leader, HW, voter set); callable on any node (§5.11). Owns the `EventLoop`, `ReceiverTask`, and `IoStage`; coordinates startup, shutdown, and crash recovery. Generic over two application-provided types: `S: StateMachine` and `L: Listener` (both monomorphised at compile time for zero-cost dispatch). I/O and runtime traits (`LogStore`, `TransportSender`, `TransportReceiver`, `QuorumStateStore`, `SnapshotIO`, `Clock`) are injected as `Box<dyn ...>` trait objects at construction time. The `IoStage` borrows I/O trait objects via `&self` for concurrent dispatch — no `Arc` needed because all I/O methods take `&self` and require `Sync`. On construction, executes the recovery sequence (§5.10) before accepting any RPCs. |
+| **`EventLoop`** | Single-threaded async loop that processes protocol state transitions without blocking on I/O. The loop drains an inbound message queue (`tokio::sync::mpsc` — fed by the `ReceiverTask`, §4.4, and by `propose()` calls) and dispatches to the appropriate handler. Uses the injected `Clock` directly for timer management (election timeouts, check-quorum deadlines, fetch intervals). **Processing order per message:** (1) The handler mutates `ConsensusState` (e.g., updating follower progress, recalculating HW on a Fetch request, or recording appended entries); (2) If the state change triggers application-visible effects — HW advancement, leadership change — the loop invokes callbacks in a fixed order: `StateMachine::apply` (one call per committed command entry), then `Listener::handle_commit` (one batch of committed `AppRecord` values), then `DeferredCompletionQueue::complete` (resolves client futures for committed offsets); (3) The handler collects `IoAction` values into an `IoActionBatch` (e.g., `SendRpc` for the Fetch response, `AppendLog` for newly staged entries); (4) The loop hands the batch to the `IoStage`, which executes storage and network-send operations concurrently; (5) The loop records I/O results (e.g., advancing the durable offset after `AppendLog` completes). Callbacks in step 2 are synchronous, in-process function calls — not external I/O — and always observe the fully updated protocol state before any IoAction is dispatched. Callbacks must be lightweight and non-blocking; applications that need heavy processing should hand off work to their own async tasks. This prevents slow `fsync` calls from delaying Fetch processing and triggering spurious elections. `read()` calls are handled outside this pipeline — they return a snapshot of `ConsensusState` without entering the message queue (§5.11). |
 | **`IoStage`** | Executes `IoAction` batches produced by the `EventLoop`. Each action is one of: `PersistQuorumState(QuorumState)`, `AppendLog(Vec<LogEntry>)`, `TruncateSuffix(u64)`, `TruncatePrefix(u64)`, `SendRpc(NodeId, RpcEnvelope)`, `SaveSnapshot(Snapshot)`. The `IoStage` holds owned trait objects (`Box<dyn ...>`) for the injected I/O implementations (`LogStore`, `TransportSender`, `QuorumStateStore`, `SnapshotIO`). No `Arc` wrapping is needed — the `IoStage` is the sole owner, and concurrent access within a batch uses shared `&self` borrows (safe because all I/O traits require `Sync`). **Concurrency model:** Within a batch, the `IoStage` partitions actions by trait object and executes *across* trait objects concurrently via `tokio::join!` (e.g., `LogStore::append` runs concurrently with `TransportSender::send` and `QuorumStateStore::save`). Operations on the *same* trait object within one batch are serialised — at most one log-write action (`AppendLog`, `TruncateSuffix`, or `TruncatePrefix`) appears per batch, so no concurrent mutation of a single `LogStore` occurs. All I/O trait methods take `&self` and implementations use interior mutability (e.g., async mutex) for write serialisation. Multiple `SendRpc` actions target different peers and use `TransportSender::send(&self)` concurrently — safe because `TransportSender: Sync`. Storage operations complete with `fsync` before the loop processes the next message that depends on them. **Application callbacks** (`StateMachine::apply`, `Listener::handle_commit`, `Listener::handle_leader_change`) are NOT dispatched by the `IoStage` — they are invoked directly by the `EventLoop` during message processing, immediately after a state change triggers them (e.g., HW advancement during Fetch handling). This ensures callbacks execute synchronously within the event loop's single-threaded context and always see consistent, up-to-date protocol state. The event loop produces the `IoAction` batch *after* callbacks have been invoked, so the Fetch response sent via `IoStage` reflects the same HW that callbacks observed. **Note:** The `IoStage` does NOT call `TransportReceiver` or `Clock` — those are used by the `ReceiverTask` (§4.4) and `EventLoop` respectively. |
 | **`BatchAccumulator`** | Stages incoming `propose()` calls into a batch buffer. On each event-loop tick (or when the batch is full), the accumulated entries are drained into a single `AppendLog` I/O action. This amortises `fsync` cost across multiple proposals (group commit). Analogous to KRaft's `BatchAccumulator`. |
 | **`DeferredCompletionQueue`** | Parks `tokio::sync::oneshot` senders keyed by log offset. When the high watermark advances, the queue completes all futures whose offset is now **< HW** (strictly less than — see §3.1 canonical HW definition). Analogous to KRaft's `DeferredEventQueue` / purgatory. |
-| **`DeferredReadQueue`** | Parks `tokio::sync::oneshot` senders for pending `read()` requests that are waiting for leadership confirmation (§5.11). When the first current-term entry commits (HW advances past the `LeaderChangeMessage` offset), the event loop drains this queue: for each entry, it calls `StateMachine::query()` and resolves the oneshot with the result. On step-down or shutdown, all entries are resolved with an error. |
-| **`ConsensusState`** | The core state: current `term`, `voted_for`, node `role` (Follower / Candidate / Leader / Unattached), the in-memory log index, `high_watermark`, `log_start_offset`, the voter set, and per-follower replication progress (leader only). The `Unattached` role is the initial state before bootstrap or recovery completes. |
+| **`ConsensusState`** | The core state: current `term`, `voted_for`, node `role` (Follower / Candidate / Leader / Unattached), the in-memory log index, `high_watermark`, `log_start_offset`, the voter set, and per-follower replication progress (leader only). The `Unattached` role is the initial state before bootstrap or recovery completes. Also the return type of `RaftNode::read()` — callers receive a snapshot of these fields (§5.11). |
 | **`ElectionManager`** | Implements Pre-Vote and Vote protocols. Manages election timeouts (randomised 150–300 ms), vote collection, term advancement, and leader-to-follower step-down on Check Quorum failure. |
 | **`ReplicationManager`** | Handles Fetch request/response processing on both leader and follower sides. On the leader: validates fetch offset against the leader-epoch checkpoint, detects log divergence (populates `DivergingEpoch`), tracks follower progress, and advances the high watermark when a majority has replicated. On the follower: sends periodic Fetch RPCs, processes responses, truncates log on divergence, and updates the local high watermark. |
 | **`MembershipManager`** | Processes `AddVoter` / `RemoveVoter` / `UpdateVoter` RPCs. Enforces the **single-change invariant**: rejects any membership RPC while an uncommitted `VotersRecord` exists in the log. On `AddVoter`: validates the observer is caught up (`fetch_offset ≥ leader's current HW`), then appends a `VotersRecord` control entry containing the new voter set. On `RemoveVoter`: appends a `VotersRecord` excluding the target node; if the leader is removing itself, it continues serving until the record commits (using the **new** voter set for quorum), then steps down to `Unattached`. On `UpdateVoter`: appends a `VotersRecord` with the updated endpoint. The `VotersRecord` travels through the log like any entry — replicated via Fetch, committed when a majority of the **new** voter set has fetched it — and the membership change takes effect only upon commit. |
@@ -361,7 +360,7 @@ enum IoAction {
 
 The event loop processes each inbound message (RPC, proposal, timer tick)
 in a strict sequence: (1) mutate `ConsensusState`; (2) invoke application
-callbacks synchronously if needed (see §4.1 four-phase commit notification);
+callbacks synchronously if needed (see §4.1 three-phase commit notification);
 (3) collect zero or more `IoAction` values into an `IoActionBatch`. After
 callbacks and IoAction collection complete, the batch is handed to the
 `IoStage` for concurrent execution. The event loop `await`s the `IoStage`
@@ -553,7 +552,7 @@ internally (e.g., updating the voter set from a `VotersRecord`, recording
 the leader-epoch from a `LeaderChangeMessage`), and calls
 `StateMachine::apply` only for entries whose `entry_type` is `Command`.
 
-**Four-phase commit notification (fixed ordering).** When HW advances
+**Three-phase commit notification (fixed ordering).** When HW advances
 during message processing (e.g., when a Fetch request reveals that a
 majority has replicated), the `EventLoop` executes these steps in order
 before producing any `IoAction`:
@@ -564,17 +563,15 @@ before producing any `IoAction`:
 2. **`Listener::handle_commit`** — called once with the full batch of newly
    committed `AppRecord` values. Used for external notification (metrics,
    indexing, replication to external systems). Receives only application
-   records; control records are filtered.
+   records; control records are filtered. **This is the primary mechanism
+   for applications to build their own queryable read-side state** — the
+   application processes committed records in the `Listener` callback and
+   updates an application-owned data structure (e.g., an `Arc<RwLock<T>>`)
+   that can be queried outside of xraft. See §5.11.
 3. **`DeferredCompletionQueue::complete`** — resolves the `oneshot` future
    for every committed entry whose offset is now `< HW`.
-4. **`DeferredReadQueue::drain`** — if the newly committed entries include
-   a current-term entry (triggering leadership confirmation), the event
-   loop drains pending `read()` requests: for each, it calls
-   `StateMachine::query()` synchronously and resolves the oneshot with the
-   result. In steady state (leadership already confirmed) this step is a
-   no-op. See §5.11.
 
-All four steps are **synchronous, in-process function calls** within the
+All three steps are **synchronous, in-process function calls** within the
 event loop's single-threaded task — they are not external I/O and are not
 mediated by `IoAction` / `IoStage`. External I/O (sending the Fetch
 response, appending log entries) is dispatched via `IoAction` *after*
@@ -588,17 +585,9 @@ Snapshots are split into two parts:
 
 ```rust
 pub trait StateMachine: Send + 'static {
-    /// The application-defined read result type.
-    type ReadResult: Send + 'static;
-
     /// Apply a committed application record to the state machine.
     /// Control records (NoOp, VotersRecord) are never passed here.
     fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>;
-
-    /// Query the current committed state. Called by the EventLoop to
-    /// serve `RaftNode::read()` requests after leadership is confirmed.
-    /// Must be lightweight and non-blocking (same rules as `apply`).
-    fn query(&self) -> Result<Self::ReadResult>;
 
     /// Take a snapshot of the current application state.
     fn snapshot(&self) -> Result<AppSnapshot>;
@@ -612,11 +601,28 @@ pub trait StateMachine: Send + 'static {
 command. `AppSnapshot` is likewise opaque bytes. xraft never interprets
 either; it only stores, replicates, and delivers them.
 
-The `query` method is the read-path counterpart to `apply`. While `apply`
-mutates state on commit, `query` reads committed state for `RaftNode::read()`
-requests. It is invoked synchronously by the event loop (same single-threaded
-context as `apply`) and must not be confused with `snapshot()`, which is a
-heavier persistence/compaction operation returning opaque bytes.
+**Application read-side state model.** xraft does NOT mediate application
+state reads. The `StateMachine` is owned by the `EventLoop` and mutated
+exclusively by `apply()` during commit processing — applications cannot
+safely query it concurrently. Instead, applications build their own
+queryable read-side state outside of xraft using one of two patterns:
+
+1. **Listener-driven materialisation (recommended).** The application's
+   `Listener::handle_commit` callback receives every committed `AppRecord`
+   batch. The application processes these records and updates an
+   application-owned data structure (e.g., `Arc<RwLock<HashMap<K, V>>>`)
+   that can be queried concurrently from application threads. This is the
+   KRaft model — brokers maintain their own metadata cache from committed
+   log entries.
+
+2. **Shared state machine wrapper.** The application wraps its state in
+   `Arc<RwLock<T>>` and implements `StateMachine` as a thin adapter that
+   acquires a write lock in `apply()`. Application threads acquire read
+   locks to query state. This requires careful lock ordering to avoid
+   blocking the event loop.
+
+Both patterns keep xraft's event loop free of application-specific read
+logic and avoid the safety pitfalls of linearizable-read claims (§5.11).
 
 #### `Listener` (core → application callbacks)
 
@@ -1871,7 +1877,7 @@ leader to provide the authoritative HW via subsequent Fetch responses.
    │                         │        │
    │ Apply entries 81..100   │        │
    │ to state machine        │        │
-   │ (four-phase commit      │        │
+   │ (three-phase commit     │        │
    │  notification, §4.1):   │        │
    │ 1. Command entries →    │        │
    │    SM.apply (one per    │        │
@@ -1919,12 +1925,11 @@ leader to provide the authoritative HW via subsequent Fetch responses.
 4. **Leader provides the authoritative HW.** After resuming as follower,
    the node sends Fetch requests to the leader. The leader's Fetch
    response includes the current HW. The node advances its local HW to
-   `min(leader_HW, local_log_end_offset)` and executes the four-phase
+   `min(leader_HW, local_log_end_offset)` and executes the three-phase
    commit notification (§4.1) for all entries between the old HW and the
    new HW: `StateMachine::apply` for command entries, `Listener::handle_commit`
    for the batch, `DeferredCompletionQueue::complete` (no-op post-crash
-   since there are no pending client futures), and `DeferredReadQueue::drain`
-   (also no-op post-crash — no pending reads). Control records are always
+   since there are no pending client futures). Control records are always
    filtered from `SM::apply` and handled internally.
 
 5. **Always resume as Follower.** A recovering node never resumes as
@@ -1942,164 +1947,102 @@ leader to provide the authoritative HW via subsequent Fetch responses.
    entries), the leader responds with a `SnapshotId` and the node falls
    back to snapshot transfer (§5.4).
 
-### 5.11 Client Read (Leadership-Proof)
+### 5.11 Client Read (Protocol Metadata)
 
-The leader confirms its authority by verifying that a current-term entry
-has been committed (the `LeaderChangeMessage` appended at the start of
-the term, or any subsequent entry). Once confirmed, it queries the state
-machine synchronously within the event loop. **No per-read log entry is
-appended** — the existing committed current-term entry serves as the
-leadership proof. The returned state reflects every write committed
-before the read was issued.
+`RaftNode::read()` returns a `ConsensusState` snapshot — the node's
+current protocol metadata (term, role, leader ID, high watermark, voter
+set). This is a **local, non-linearizable** read of the node's in-memory
+state. It does NOT read application state and does NOT contact other
+nodes.
 
-> **Reconciliation with tech-spec §2.2 out-of-scope listing.**
+> **Alignment with sibling documents.**
 >
-> The tech spec lists "Linearisable reads — Read-index or lease-based
-> reads" as out of scope. Those are two specific **optimised** read
-> techniques: *read-index* (leader broadcasts a per-read heartbeat to a
-> majority before serving the read) and *lease-based* (leader assumes
-> continued authority based on clock bounds). This architecture
-> implements **neither**. Instead it uses a simpler leadership-proof
-> mechanism: the leader checks whether an already-committed current-term
-> entry exists in the log. No per-read network round-trip; no clock
-> assumptions.
+> The tech spec defines `read() → Result<State>` and says "initial
+> implementation routes reads through the log for safety." The
+> implementation plan defines `read() → Result<ConsensusState>`. This
+> architecture aligns with the implementation plan's concrete signature:
+> `read()` returns protocol metadata that reflects the node's current
+> view of the log's committed position (HW).
 >
-> The tech spec also says "initial implementation routes reads through
-> the log for safety." This architecture satisfies that requirement —
-> the leadership proof IS the log: the committed `LeaderChangeMessage`
-> proves the leader was elected by a majority after any prior leader.
->
-> This read path achieves linearizable semantics (see "Why this achieves
-> linearizable semantics" below) through the protocol's existing commit
-> guarantees — not through an additional mechanism layered on top.
-> Therefore it does not conflict with the out-of-scope exclusion of
-> read-index and lease-based techniques.
+> The tech spec also lists "Linearisable reads — Read-index or
+> lease-based reads" as out of scope. This architecture does NOT
+> implement any linearizable-read mechanism. The `read()` call returns
+> local metadata — it makes no linearizability guarantees.
 
 ```
-    Client            RaftNode        EventLoop          StateMachine
-       │                 │                │                    │
-       │── read() ──────►│                │                    │
-       │                 │                │                    │
-       │                 │── ReadRequest ►│                    │
-       │                 │  (mpsc chan.)  │                    │
-       │                 │               │                    │
-       │                 │         ┌─────┴──────┐             │
-       │                 │         │ Am I       │             │
-       │                 │         │ leader?    │             │
-       │                 │         │ YES        │             │
-       │                 │         └─────┬──────┘             │
-       │                 │               │                    │
-       │                 │         ┌─────┴──────┐             │
-       │                 │         │ Leadership │             │
-       │                 │         │ proof:     │             │
-       │                 │         │ Is any     │             │
-       │                 │         │ current-   │             │
-       │                 │         │ term entry │             │
-       │                 │         │ committed? │             │
-       │                 │         │ (HW > LCM  │             │
-       │                 │         │  offset)   │             │
-       │                 │         └─────┬──────┘             │
-       │                 │               │                    │
-       │                 │      ┌────────┴────────┐           │
-       │                 │      │                 │           │
-       │                 │      ▼ YES             ▼ NO        │
-       │                 │                                    │
-       │                 │  (A) Confirmed:    (B) Pending:    │
-       │                 │  Proceed to query  Park read in    │
-       │                 │                   DeferredRead-    │
-       │                 │                   Queue; resolve   │
-       │                 │                   when LCM commits │
-       │                 │                                    │
-       │                 │  ┌── (once leadership confirmed) ──┐
-       │                 │  │                                  │
-       │                 │  │     ┌─────┴──────┐               │
-       │                 │  │     │ Invoke     │               │
-       │                 │  │     │ SM.query() │               │
-       │                 │  │     │ (sync, in- │               │
-       │                 │  │     │  process,  │──── query() ─►│
-       │                 │  │     │  inside    │               │
-       │                 │  │     │  event     │◄── Result ───│
-       │                 │  │     │  loop)     │               │
-       │                 │  │     └─────┬──────┘               │
-       │                 │  │           │                      │
-       │                 │  │    Resolve oneshot               │
-       │                 │  │    with query result             │
-       │                 │  │           │                      │
-       │                 │◄─┘           │                      │
-       │                 │              │                      │
-       │◄── Ok(result) ─│              │                      │
-       │                 │              │                      │
+    Client            RaftNode         ConsensusState
+       │                 │                    │
+       │── read() ──────►│                    │
+       │                 │── snapshot ───────►│
+       │                 │◄── ConsensusState ─│
+       │◄── Ok(state) ──│                    │
+       │                 │                    │
 ```
 
-**Read flow mechanics:**
+**Read semantics:**
 
-1. **Entry point.** `RaftNode::read()` sends a `ReadRequest` to the event
-   loop via the same mpsc channel used for proposals and RPCs. It returns
-   a `Future<Result<S::ReadResult>>` backed by a `oneshot` receiver.
+1. **Entry point.** `RaftNode::read()` returns the current `ConsensusState`
+   immediately. It does NOT enter the event loop's message queue. The
+   `ConsensusState` is accessed via a synchronisation primitive (e.g.,
+   `tokio::sync::watch` or `Arc<RwLock<...>>`) that the event loop updates
+   after each state mutation.
 
-2. **Leadership check.** If the node is not the leader, the event loop
-   immediately resolves the future with `Err(NotLeader { leader_id })`.
+2. **Callable on any node.** Unlike `propose()` (which requires the
+   leader), `read()` is callable on any node — leader, follower,
+   candidate, or unattached. The returned metadata reflects that node's
+   local view, which may be stale relative to the cluster's authoritative
+   state.
 
-3. **Leadership proof.** A new leader appends a `LeaderChangeMessage` as
-   its first entry (§3.2). Until this entry (or any subsequent
-   current-term entry) is committed, the leader cannot prove its authority
-   — a stale leader from a prior term might still be serving reads. The
-   event loop checks whether `HW > offset_of_first_current_term_entry`.
+3. **No linearizability guarantee.** A partitioned node may return an
+   outdated `leader_id`, `high_watermark`, or `role`. Callers must treat
+   the returned state as a best-effort snapshot. For leader discovery,
+   callers should retry on a different node if a `propose()` call returns
+   `NotLeader`.
 
-4. **Path A — confirmed leader (steady state).** If a current-term entry
-   is already committed (the common case after the first few Fetch
-   rounds), the event loop invokes `StateMachine::query(&self)`
-   synchronously within its single-threaded context and resolves the
-   client's oneshot with the result. No log entry is appended and no I/O
-   is required — the read completes in the same event-loop tick as the
-   `ReadRequest` message.
+4. **Not an application-state read.** `read()` does NOT query the
+   `StateMachine`. Applications build their own queryable read-side state
+   from committed records delivered via `Listener::handle_commit` (see
+   §4.1 application read-side state model). This separation is deliberate:
+   it avoids false linearizability claims and keeps the event loop free of
+   application-specific read logic.
 
-5. **Path B — pending confirmation (fresh leader).** If no current-term
-   entry is committed yet, the event loop parks the `ReadRequest` in a
-   `DeferredReadQueue` (analogous to `DeferredCompletionQueue` but for
-   reads). When the `LeaderChangeMessage` commits (HW advances past its
-   offset), the four-phase commit notification (§4.1) runs — step 4
-   of that notification drains the `DeferredReadQueue`: for each parked
-   read, it calls `StateMachine::query()` and resolves the oneshot.
+**`ConsensusState` fields returned by `read()`:**
 
-6. **Cancellation.** If the leader steps down (via Check Quorum failure,
-   higher-term RPC, or `RemoveVoter` self-removal), all pending reads in
-   the `DeferredReadQueue` are resolved with `Err(NotLeader { .. })`. On
-   `shutdown()`, pending reads are resolved with `Err(Shutdown)`.
-
-**Why this achieves linearizable semantics.** A committed current-term
-entry proves the leader was elected by a majority *after* any prior
-leader. All `apply()` calls up to the current HW have executed before
-`query()` runs. Therefore the returned state reflects every write
-committed before the read was issued — the definition of
-linearizability. This property falls out of the existing commit
-protocol; it does not require the read-index or lease-based mechanisms
-that the tech spec excludes.
+```rust
+pub struct ConsensusState {
+    pub current_term: u64,
+    pub role: Role,                    // Leader | Follower | Candidate | Unattached
+    pub leader_id: Option<NodeId>,
+    pub high_watermark: u64,           // exclusive upper bound (§3.1)
+    pub log_end_offset: u64,
+    pub voter_set: Vec<VoterInfo>,
+    pub node_id: NodeId,
+}
+```
 
 **`RaftNode::read()` proposed signature:**
 
 ```rust
 impl<S: StateMachine, L: Listener> RaftNode<S, L> {
-    /// Leadership-proof read. Returns the application state as of the
-    /// latest committed offset. Leader-only; followers return NotLeader.
+    /// Read the current protocol state. Returns a local, non-linearizable
+    /// snapshot of the node's consensus metadata. Callable on any node.
     ///
-    /// The leader confirms its authority (a current-term entry is committed),
-    /// then queries the state machine synchronously within the event loop.
-    /// If leadership is not yet confirmed (fresh leader whose
-    /// LeaderChangeMessage has not committed), the returned future parks
-    /// until confirmation completes. This is an async/future-backed call.
-    pub async fn read(&self) -> Result<S::ReadResult> { ... }
+    /// This does NOT read application state — applications maintain their
+    /// own read-side state from Listener::handle_commit callbacks (§4.1).
+    pub fn read(&self) -> Result<ConsensusState> { ... }
 }
 ```
 
-Consensus metadata (term, role, HW, voter set) is NOT returned by `read()`
-— it is available separately via `RaftNode::metrics() -> RaftMetrics` (§6.4),
-which is a non-linearizable snapshot of the current protocol state.
+**Relationship to `propose()`.** `propose()` appends a command entry to
+the log and waits for HW to advance past it — it is async and
+leader-only. `read()` returns local metadata immediately — it is
+synchronous and callable on any node. The two are independent.
 
-**Relationship to `propose()`.** `propose()` appends a command entry to the
-log and waits for HW to advance past it. `read()` does NOT append any entry;
-it only waits for an existing current-term entry to commit (if not already
-committed). In steady state, `read()` completes without any I/O at all.
+**Relationship to `metrics()`.** `RaftNode::metrics()` (§6.4) returns
+observability counters and latencies (election latency, append rate,
+commit latency). `read()` returns protocol state (term, role, HW, voter
+set). The two do not overlap: `read()` is for callers making routing or
+leadership decisions; `metrics()` is for monitoring dashboards.
 
 ---
 
@@ -2114,7 +2057,7 @@ concrete `fsync` implementation lives in `xraft-storage`, not in
 `xraft-core`. Application callbacks (`StateMachine::apply`,
 `Listener::handle_commit`) are synchronous in-process calls, not external
 I/O, and are invoked by the event loop before the `IoAction` batch is
-dispatched (see §4.1 four-phase commit notification).
+dispatched (see §4.1 three-phase commit notification).
 
 | Write | When | Guarantee |
 |-------|------|-----------|
@@ -2181,7 +2124,7 @@ implementation. §7.3 confirms which sibling documents are fully aligned.
 | **I/O trait objects** | Storage / Network-Send I/O traits injected as `Box<dyn ...>` — no `Arc`. `IoStage` borrows via `&self` with `Sync` bound. | impl plan Stage 1.7 |
 | **Transport split** | Separate `TransportSender` (`&self`, `Sync`) and `TransportReceiver` (`&mut self`, not `Sync`). `split()` on concrete transports. | impl plan Stage 1.4, architecture §4.4 |
 | **Clock placement** | `Clock` is a Runtime trait, passed to the `EventLoop` (not `IoStage`), not mediated by `IoAction`. | impl plan Stage 1.4/1.7 |
-| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state → snapshot → log scan (metadata only — no SM replay) → resume as follower → learn HW from leader → apply entries via four-phase commit notification. See Divergence 8. | tech spec §2.1.7, impl plan Phase 6 |
+| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state → snapshot → log scan (metadata only — no SM replay) → resume as follower → learn HW from leader → apply entries via three-phase commit notification. See Divergence 8. | tech spec §2.1.7, impl plan Phase 6 |
 | **Timing parameters** | 150–300 ms election timeout (randomised), 50 ms fetch interval. | tech spec §4.3 |
 | **Quorum math** | Majority = `⌊V/2⌋ + 1`; HW = descending-sorted voter offsets at index `⌊V/2⌋` (0-indexed). Only voters count. | all docs |
 
@@ -2195,7 +2138,7 @@ positions, and declares which interpretation governs implementation.
 | Document | Statement | Section |
 |----------|-----------|---------|
 | **Tech spec** | "application callbacks are staged and executed asynchronously outside the loop" | §4.4.1 |
-| **This architecture** | Callbacks (`StateMachine::apply`, `Listener::handle_commit`, `DeferredCompletionQueue::complete`, `DeferredReadQueue::drain`) are **synchronous, in-process calls** invoked by the `EventLoop` during message processing, after state mutation but before `IoAction` dispatch. | §4.1 |
+| **This architecture** | Callbacks (`StateMachine::apply`, `Listener::handle_commit`, `DeferredCompletionQueue::complete`) are **synchronous, in-process calls** invoked by the `EventLoop` during message processing, after state mutation but before `IoAction` dispatch. | §4.1 |
 | **Impl plan** | Uses the synchronous-callback model from this architecture. | Stages 4.1, 5.1 |
 | **E2e scenarios** | Uses the synchronous-callback model from this architecture. | Client Interaction feature |
 
@@ -2230,58 +2173,58 @@ when `entry_offset < HW`), the `FetchResponse` (HW field), and the
 less-than) when testing whether an entry is committed — using `<=`
 would incorrectly include one uncommitted entry.
 
-#### Divergence 3 — Commit notification: three phases vs four
+#### Divergence 3 — Commit notification phases (RESOLVED)
 
 | Document | Statement | Section |
 |----------|-----------|---------|
-| **Impl plan** | Uses "three-phase commit notification": (1) `StateMachine::apply`, (2) `Listener::handle_commit`, (3) `DeferredCompletionQueue::complete`. Does not include `DeferredReadQueue::drain`. | Stages 5.1, 5.3, 6.1 |
-| **This architecture** | Defines **four-phase** commit notification, adding (4) `DeferredReadQueue::drain` — resolves pending `read()` requests via `StateMachine::query()`. | §4.1 |
-| **E2e scenarios** | Uses the four-phase model from this architecture. | Client Interaction feature |
+| **Impl plan** | Uses "three-phase commit notification": (1) `StateMachine::apply`, (2) `Listener::handle_commit`, (3) `DeferredCompletionQueue::complete`. | Stages 5.1, 5.3, 6.1 |
+| **This architecture** | Uses **three-phase** commit notification — same three steps in the same order. | §4.1 |
+| **E2e scenarios** | Previously used a four-phase model (with a fourth `DeferredReadQueue::drain` step). This is now stale — see §7.4. | Client Interaction feature |
 
-**Canonical resolution:** Four-phase commit notification (this
-architecture §4.1). Step 4 (`DeferredReadQueue::drain`) is required for
-the leadership-proof read path defined in §5.11. The implementation
-plan's three-phase model omits the read-path step. *Required
-sibling-doc changes:* See §7.4.
+**Resolution:** This architecture now uses three-phase commit
+notification, aligned with the implementation plan. The prior
+four-phase model (which included a `DeferredReadQueue::drain` step
+for a `StateMachine::query()`-based read path) has been removed.
+The e2e scenarios document adopted the prior four-phase model and
+its **Feature: Client Interaction** section must be updated to
+reflect the three-phase model and the `read() → ConsensusState`
+semantics (see §7.4).
 
-#### Divergence 4 — `read()` semantics and `StateMachine` trait shape
+#### Divergence 4 — `read()` semantics and `StateMachine` trait shape (RESOLVED)
 
 | Document | Statement | Section |
 |----------|-----------|---------|
 | **Tech spec** | `read() → Result<State>`. "Initial implementation routes reads through the log for safety." Out-of-scope list includes: "Linearisable reads — Read-index or lease-based reads." `StateMachine` trait has `apply`, `snapshot`, `restore` only (no `query`). | §2.1.5, §2.2 |
 | **Impl plan** | `read() → Result<ConsensusState>` — returns protocol metadata (term, role, leader, HW, voter set). `StateMachine` trait has `apply`, `snapshot`, `restore` only. | Stages 1.7, 5.3, 1.4 |
-| **This architecture** | `read() → Result<S::ReadResult>` — async/future-backed, leader-only, returns application state via `StateMachine::query()`. No per-read log entry appended; the leader confirms authority via a committed current-term entry (§5.11). `StateMachine` trait adds `type ReadResult` and `fn query(&self)`. Protocol metadata available via `RaftNode::metrics()`. | §5.11, §4.1 |
-| **E2e scenarios** | Uses the `S::ReadResult` / `query()` model from this architecture. | Client Interaction feature |
+| **This architecture** | `read() → Result<ConsensusState>` — local, non-linearizable snapshot of protocol metadata. Callable on any node. `StateMachine` trait has `apply`, `snapshot`, `restore` only (no `query`). Applications build their own read-side state from `Listener::handle_commit` callbacks. | §5.11, §4.1 |
+| **E2e scenarios** | Previously used `S::ReadResult` / `query()` model. This is now stale — see §7.4. | Client Interaction feature |
 
-**Canonical resolution:** `read()` returns `S::ReadResult` via
-`StateMachine::query()` (this architecture §5.11). Protocol metadata
-(term, role, HW, voter set) is available separately via
-`RaftNode::metrics()` — never via `read()`.
+**Resolution:** `read()` returns `ConsensusState` — a local,
+non-linearizable snapshot of protocol metadata. This is now aligned
+across the architecture, implementation plan, and tech spec. Key
+alignment points:
 
-Three reconciliation points:
+1. **`StateMachine` trait shape** — `apply`, `snapshot`, `restore` only.
+   No `query()` method, no `ReadResult` associated type. Aligned across
+   all three documents.
 
-1. **"Routes reads through the log"** — this architecture satisfies the
-   tech spec's requirement. The read path depends on the log's committed
-   state: the committed `LeaderChangeMessage` is the leadership proof.
-   No separate mechanism (heartbeat broadcast, clock lease) is involved.
+2. **No linearizable-read claims** — the tech spec correctly excludes
+   read-index and lease-based reads as out of scope. This architecture
+   makes no linearizability claims for `read()`. The returned metadata is
+   a local snapshot that may be stale on a partitioned node.
 
-2. **"Linearisable reads" out of scope** — the tech spec excludes two
-   specific optimised techniques: *read-index* (per-read heartbeat
-   broadcast to a majority) and *lease-based* (clock-dependent leadership
-   assumption). This architecture uses neither. The leadership-proof
-   mechanism relies on an already-committed current-term entry, which is
-   a simpler approach that achieves linearizable semantics through the
-   protocol's existing commit guarantees (§5.11 "Why this achieves
-   linearizable semantics").
+3. **Application state reads** — applications build their own queryable
+   read-side state from committed records delivered via
+   `Listener::handle_commit` (§4.1). xraft does not mediate application
+   state reads. This matches the KRaft model where brokers maintain their
+   own metadata cache from committed log entries.
 
-3. **`read()` is async/future-backed** — a fresh leader whose
-   `LeaderChangeMessage` has not yet committed parks the `ReadRequest`
-   in the `DeferredReadQueue`; the returned future resolves once
-   leadership is confirmed. Sibling docs that describe `read()` as
-   returning an immediate `Result` should be updated to reflect the
-   future-backed, leader-only semantics.
+4. **Tech-spec wording** — the tech spec's `read() → Result<State>` and
+   "routes reads through the log for safety" should be clarified to
+   `read() → Result<ConsensusState>` (protocol metadata). See §7.4.
 
-*Required sibling-doc changes:* See §7.4.
+The e2e scenarios document adopted the prior architecture's
+`S::ReadResult` / `query()` design and must be updated — see §7.4.
 
 #### Divergence 5 — `LogStore` method receivers
 
@@ -2348,7 +2291,7 @@ be truncated on divergence detection. Applying them would put the state
 machine in an incorrect state with no rollback mechanism. The recovering
 node instead waits for the leader to provide the authoritative HW via
 Fetch responses, then applies entries `[old_HW, new_HW)` through the
-standard four-phase commit notification (§4.1). This is
+standard three-phase commit notification (§4.1). This is
 **safety-critical**: premature replay could violate state machine safety
 (Raft invariant 5).
 
