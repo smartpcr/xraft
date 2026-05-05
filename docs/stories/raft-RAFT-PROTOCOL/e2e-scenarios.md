@@ -262,9 +262,9 @@ Feature: Pull-Based Log Replication
     And N2 resumes Fetching from offset 15 with updated last_fetched_epoch
 
   Scenario: Fetch includes cluster_id for identity verification
-    Given the cluster has cluster_id "cluster-abc-123"
-    When N2 sends a Fetch RPC with cluster_id "cluster-xyz-999"
-    Then N1 rejects the Fetch due to cluster_id mismatch
+    Given the cluster is configured with cluster_id "cluster-abc-123"
+    When N2 sends a Fetch RPC with a mismatched cluster_id "cluster-xyz-999" in the RpcEnvelope
+    Then N1 rejects the Fetch due to cluster_id mismatch (per architecture §6.2)
     And the rejection prevents cross-cluster contamination
 
   Scenario: Leader responds with leader identity in Fetch response
