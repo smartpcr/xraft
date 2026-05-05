@@ -2307,6 +2307,137 @@ commit latency). `read()` returns protocol state (term, role, HW, voter
 set). The two do not overlap: `read()` is for callers making routing or
 leadership decisions; `metrics()` is for monitoring dashboards.
 
+### 5.12 Graceful Shutdown
+
+`RaftNode::shutdown()` orchestrates a cooperative teardown that ensures
+in-flight I/O completes and the application receives notification before
+the node stops. The sequence applies identically to all roles; the only
+behavioural difference is that a leader's departure triggers a new
+election among the remaining voters.
+
+```
+    Application               RaftNode             EventLoop           ReceiverTask       IoStage
+        │                        │                     │                    │                │
+        │── shutdown() ─────────►│                     │                    │                │
+        │                        │                     │                    │                │
+        │                  ┌─────┴──────┐              │                    │                │
+        │                  │ Phase 1:   │              │                    │                │
+        │                  │ Stop inflow│              │                    │                │
+        │                  │            │              │                    │                │
+        │                  │ 1. Drop    │              │                    │                │
+        │                  │  propose_tx│              │                    │                │
+        │                  │  (reject   │              │                    │                │
+        │                  │   new      │              │                    │                │
+        │                  │   propose) │              │                    │                │
+        │                  │ 2. Send    │              │                    │                │
+        │                  │  Shutdown  │              │                    │                │
+        │                  │  msg to    │              │                    │                │
+        │                  │  EventLoop │              │                    │                │
+        │                  │  via mpsc  │              │                    │                │
+        │                  └─────┬──────┘              │                    │                │
+        │                        │                     │                    │                │
+        │                        │── Shutdown ────────►│                    │                │
+        │                        │   (mpsc message)    │                    │                │
+        │                        │                     │                    │                │
+        │                        │               ┌─────┴──────┐            │                │
+        │                        │               │ Phase 2:   │            │                │
+        │                        │               │ Drain and  │            │                │
+        │                        │               │ notify     │            │                │
+        │                        │               │            │            │                │
+        │                        │               │ 1. Drain   │            │                │
+        │                        │               │  remaining │            │                │
+        │                        │               │  msgs from │            │                │
+        │                        │               │  mpsc      │            │                │
+        │                        │               │  queue     │            │                │
+        │                        │               │            │            │                │
+        │                        │               │ 2. Invoke  │            │                │
+        │                        │               │  Listener  │            │                │
+        │                        │               │  ::begin_  │            │                │
+        │                        │               │  shutdown()│            │                │
+        │                        │               │            │            │                │
+        │                        │               │ 3. Resolve │            │                │
+        │                        │               │  all       │            │                │
+        │                        │               │  Deferred  │            │                │
+        │                        │               │  Completion│            │                │
+        │                        │               │  futures   │            │                │
+        │                        │               │  with      │            │                │
+        │                        │               │  Err(      │            │                │
+        │                        │               │  Shutdown) │            │                │
+        │                        │               └─────┬──────┘            │                │
+        │                        │                     │                    │                │
+        │                        │               ┌─────┴──────┐            │                │
+        │                        │               │ Phase 3:   │            │                │
+        │                        │               │ Complete   │            │                │
+        │                        │               │ pending    │            │                │
+        │                        │               │ IoAction   │────────────┼──► .execute() │
+        │                        │               │ batch      │            │   completes   │
+        │                        │               └─────┬──────┘            │                │
+        │                        │                     │                    │                │
+        │                        │               ┌─────┴──────┐            │                │
+        │                        │               │ Phase 4:   │            │                │
+        │                        │               │ Stop tasks │────────────┤                │
+        │                        │               │            │  drop mpsc │                │
+        │                        │               │ Drop Recv  │  sender →  │                │
+        │                        │               │ Task mpsc  │  task exits │                │
+        │                        │               │ sender     │            │                │
+        │                        │               │            │            │                │
+        │                        │               │ EventLoop  │            │                │
+        │                        │               │ task exits  │            │                │
+        │                        │               └─────┬──────┘            │                │
+        │                        │                     │                    │                │
+        │                        │◄── join ────────────│                    │                │
+        │                        │  (both tasks done)  │                    │                │
+        │                        │                     │                    │                │
+        │◄── Ok(()) ─────────────│                     │                    │                │
+        │                        │                     │                    │                │
+```
+
+**Shutdown invariants:**
+
+1. **No new proposals after shutdown starts.** Dropping `propose_tx`
+   causes any subsequent `propose()` call to return `Err(Shutdown)`.
+   Proposals already queued in the mpsc channel are drained and
+   processed normally by the event loop (including their `IoAction`
+   batches) before the loop exits.
+
+2. **Application notification before stop.** `Listener::begin_shutdown()`
+   is called within the event loop — after draining queued messages but
+   before resolving pending futures. The application can flush caches,
+   close external connections, or log the event.
+
+3. **Pending client futures resolved.** All outstanding `propose()`
+   futures still in the `DeferredCompletionQueue` are resolved with
+   `Err(Shutdown)` so callers are unblocked. No future is leaked.
+
+4. **In-flight I/O completes.** The last `IoAction` batch produced by
+   the drain phase is fully executed (awaited) before the event loop
+   exits. This ensures the log and quorum-state file are consistent
+   on disk.
+
+5. **ReceiverTask teardown.** The event loop drops the receiver-side
+   of the mpsc channel shared with the `ReceiverTask`, causing the
+   `ReceiverTask` to observe a closed channel and exit. No explicit
+   abort is needed.
+
+6. **Leader shutdown triggers election.** When the shutting-down node
+   is the leader, followers detect the absence of Fetch responses
+   (their election timeouts fire) and elect a new leader. The shutdown
+   node does not attempt to transfer leadership proactively — the
+   protocol's election mechanism handles it.
+
+**Proposed API:**
+
+```rust
+impl<S: StateMachine, L: Listener> RaftNode<S, L> {
+    /// Initiate graceful shutdown. Returns when all tasks have stopped
+    /// and pending I/O has completed.
+    ///
+    /// After this call, `propose()` returns `Err(Shutdown)` and `read()`
+    /// returns the last known `ConsensusState`. The node is inert.
+    pub async fn shutdown(&self) -> Result<()>;
+}
+```
+
 ---
 
 ## 6. Cross-Cutting Concerns
@@ -2367,6 +2498,80 @@ pub struct RaftMetrics {
 }
 ```
 
+### 6.5 Node Role State Machine
+
+All role transitions are driven by the `EventLoop` in response to RPCs,
+timer events, or `shutdown()`. No transition bypasses the event loop.
+
+```
+                      ┌──────────────────────────────────────────────┐
+                      │                                              │
+                      │  ┌───────────┐                               │
+              ┌───────┼─►│ Unattached│◄────────────────────┐        │
+              │       │  └─────┬─────┘                     │        │
+              │       │        │                            │        │
+              │       │        │ bootstrap() OR             │        │
+              │       │        │ recovery completes         │        │
+              │       │        │                            │        │
+              │       │        ▼                            │        │
+              │       │  ┌───────────┐  election    ┌──────┴─────┐  │
+              │       │  │ Follower  │─ timeout ───►│ Candidate  │  │
+              │       │  │           │  expires     │            │  │
+              │       │  │           │◄─────────────│  (loses    │  │
+              │       │  │           │ higher term  │   or       │  │
+              │       │  │           │ received     │   timeout) │  │
+              │       │  └─────┬─────┘              └──────┬─────┘  │
+              │       │        │                           │        │
+              │       │        │ (step-down                │ wins   │
+              │       │        │  from leader:             │ majority│
+              │       │        │  higher term              │        │
+              │       │        │  or Check                 │        │
+              │       │        │  Quorum fail)             │        │
+              │       │        │                           │        │
+              │       │        │    ┌───────────┐          │        │
+              │       │        └────│  Leader   │◄─────────┘        │
+              │       │             │           │                   │
+              │       │             └─────┬─────┘                   │
+              │       │                   │                         │
+              │       │  RemoveVoter      │  RemoveVoter committed  │
+              │       │  committed        │  (self removed)         │
+              │       │  (self removed)   │                         │
+              │       └───────────────────┼─────────────────────────┘
+                                          │
+                              (transitions to Unattached)
+```
+
+**Transition rules:**
+
+| From | To | Trigger | Persist before transition |
+|------|----|---------|--------------------------|
+| **Unattached** | Follower | `bootstrap()` completes; or crash recovery (§5.10) restores state | `QuorumState` (if bootstrap) |
+| **Follower** | Candidate | Election timeout expires; Pre-Vote majority received | — (Pre-Vote does not change term) |
+| **Candidate** | Leader | Majority of real votes received | `QuorumState` (voted_for = self, term incremented) |
+| **Candidate** | Follower | Higher term received; or election timeout → restart | `QuorumState` (term update) |
+| **Leader** | Follower | Higher-term RPC received; or Check Quorum fails | `QuorumState` (term update) |
+| **Follower** | Unattached | Committed `VotersRecord` excludes this node | — |
+| **Leader** | Unattached | Committed `VotersRecord` excludes this node (self-removal) | — |
+| **Candidate** | Unattached | Committed `VotersRecord` excludes this node | — |
+
+**Role invariants:**
+- `Unattached` nodes do not start election timers, do not send Fetch or
+  Vote RPCs, and reject proposals with `NotLeader`.
+- Only `Leader` accepts `propose()` calls.
+- Only `Follower` and `Candidate` run election timers.
+- Only `Leader` runs the Check Quorum timer.
+- `Follower` sends periodic Fetch RPCs to the leader.
+
+### 6.6 Backpressure and Flow Control
+
+| Mechanism | Component | Behaviour |
+|-----------|-----------|-----------|
+| **Proposal queue limit** | `BatchAccumulator` | Caps pending proposals at `RaftConfig::max_batch_size`. When full, `propose()` returns `Err(ProposalQueueFull)` immediately — the caller must back off and retry. |
+| **Fetch response size** | `ReplicationManager` | The leader caps each `FetchResponse` payload at `RaftConfig::max_fetch_bytes` (default 1 MiB). Followers that are far behind receive entries in multiple Fetch rounds rather than one unbounded response. |
+| **Batch drain rate** | `EventLoop` | The event loop drains at most `max_batch_size` entries from the `BatchAccumulator` per tick. Excess entries remain staged for the next tick. This bounds per-tick I/O cost. |
+| **Snapshot chunk size** | `FetchSnapshotRequest` | Followers request snapshot chunks with `max_bytes` per request. The leader streams chunks of bounded size, preventing a single snapshot transfer from monopolising the network. |
+| **mpsc channel capacity** | `ReceiverTask` → `EventLoop` | The inbound message channel uses a bounded `tokio::sync::mpsc` with a configurable capacity. If the event loop falls behind (e.g., during a slow `fsync`), the `ReceiverTask` blocks on send, applying TCP-level backpressure to peers. |
+
 ---
 
 ## 7. Cross-Document Alignment
@@ -2409,6 +2614,9 @@ exists, the canonical design is defined by this architecture document.
 | **Error type** | `XraftError` with 6 variants: `StorageError`, `TransportError`, `NotLeader`, `ProposalQueueFull`, `InvalidClusterId`, `Shutdown`. | architecture §3.2, impl plan Stage 1.5, architecture §6.3 (error handling) |
 | **Leader-epoch checkpoint** | In-memory `BTreeMap<Term, u64>` mapping epoch → start_offset. Rebuilt on recovery from log scan; used for Fetch divergence detection. Persisted to file by `xraft-storage`. | architecture §2.2 (`LeaderEpochCheckpoint` component), §3.2 (data structure), §5.3 (usage in divergence flow), impl plan Stage 2.3 |
 | **Observer replication** | Observers use the same Fetch RPC path as voters but with `is_voter = false` — their `fetch_offset` is excluded from HW calculation and they do not participate in elections. | architecture §5.2 (observer note), e2e scenarios preamble (observer definition), tech spec §2.1.3 |
+| **Graceful shutdown** | `shutdown()` → drop propose channel → send Shutdown to EventLoop → drain queue → `Listener::begin_shutdown()` → resolve pending futures with `Err(Shutdown)` → complete last IoAction batch → stop ReceiverTask → stop EventLoop. Leader shutdown triggers follower election timeouts. | architecture §5.12, e2e Graceful Shutdown and Lifecycle |
+| **Node role state machine** | Four roles (`Unattached`, `Follower`, `Candidate`, `Leader`) with 8 defined transitions. `Unattached` is the initial and terminal state (pre-bootstrap / post-removal). All transitions driven by EventLoop. | architecture §6.5 (state diagram + transition table), impl plan Stage 1.2, e2e preamble line 17 |
+| **Backpressure** | Five mechanisms: proposal queue limit (`max_batch_size`), Fetch response cap (`max_fetch_bytes`), batch drain rate, snapshot chunk size, bounded mpsc channel. `propose()` returns `Err(ProposalQueueFull)` when the BatchAccumulator is full. | architecture §6.6, architecture §3.2 (`RaftConfig`, `XraftError`) |
 
 ### 7.2 Verified Resolutions
 
