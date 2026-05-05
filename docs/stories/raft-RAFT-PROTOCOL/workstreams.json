@@ -1,9 +1,9 @@
 [
   {
     "title": "Cargo Workspace and Root Configuration",
-    "description": "Cargo Workspace and Root Configuration (8 steps)",
+    "description": "Cargo Workspace and Root Configuration (9 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-cargo-workspace-and-root-configuration",
-    "contentHash": "3e95c81cc3c44372e7f8623282a09f6615eaa36dadb5fe93f375ef4b608ef619",
+    "contentHash": "ca02a67d471a8c1825df416ee1044cebd5440a1ade39698c9fd00a908a26e6e0",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-cargo-workspace-and-root-configuration",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-cargo-workspace-and-root-configuration",
     "status": "planning"
@@ -280,9 +280,9 @@
   },
   {
     "title": "Invariant Checker",
-    "description": "Invariant Checker (6 steps)",
+    "description": "Invariant Checker (7 steps)",
     "anchor": "phase-test-harness-xraft-test/stage-invariant-checker",
-    "contentHash": "ad433325161cd16afe6dacc74609d159c1ebe50660e074aa2cafbc77c7570c4a",
+    "contentHash": "5fec0d59ed02ce12b054db0d98d2529264f155e8cfe08ac33592018e29968f10",
     "workstreamId": "ws-raft-raft-protocol-phase-test-harness-xraft-test-stage-invariant-checker",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-test-harness-xraft-test-stage-invariant-checker",
     "status": "planning"

@@ -760,14 +760,10 @@ Feature: Dynamic Quorum — Add Voter
     And N1 is Leader for term 1
 
   Scenario: Add a fourth voter to the cluster
-    # Per architecture doc §5.5: once a VotersRecord is appended, HW advancement
-    # immediately uses the NEW voter set for quorum calculation. N4's fetch_offset
-    # counts toward commit of the VotersRecord itself.
-    Given N4 is an Observer that has caught up with the leader (N4's fetch_offset ≥ leader's HW)
+    Given N4 is an Observer that has caught up with the leader (log is current)
     When a client sends an AddVoter RPC for N4 to N1
-    Then N1 validates N4 is caught up (fetch_offset ≥ HW) and no pending VotersRecord exists
-    And N1 appends a VotersRecord control entry to the log with voter set [N1, N2, N3, N4]
-    When the VotersRecord is committed (majority of the NEW voter set [N1, N2, N3, N4] — i.e. 3 of 4)
+    Then N1 appends a VotersRecord control entry to the log with voter set [N1, N2, N3, N4]
+    When the VotersRecord is committed (replicated to a majority of the current voter set [N1, N2, N3])
     Then the active voter set becomes [N1, N2, N3, N4]
     And the quorum size increases to 3 (majority of 4)
     And N4 participates in future elections and quorum calculations
@@ -1024,32 +1020,24 @@ Feature: Client Interaction
     When a client calls propose("set x=1") on N1
     Then N1 returns an error indicating no leader is available
 
-  Scenario: Read routes through the log on the leader
-    # Per tech spec §2.1.5: "Initial implementation routes reads through the log
-    # for safety." The leader appends a read-marker to the log, waits for commit
-    # (HW advances past it), and then returns the current applied state.
-    # This is the simplest (but most expensive) approach to consistent reads.
-    # Optimised read paths (read-index, lease-based) are out of scope (tech spec §2.2).
+  Scenario: Read returns node-local committed state on any node
     Given N1 is Leader for term 1 with high watermark 11 (offsets 0–10 committed)
     And the StateMachine has applied all committed command entries (control records filtered)
     When a client calls read() on N1
-    Then N1 appends a read-marker entry to the log at offset 11
-    And N1 parks the read future in the DeferredCompletionQueue (keyed by offset 11)
-    When followers Fetch and replicate the read-marker and HW advances to 12
-    Then the read future resolves with the current StateMachine state
-    And the returned state reflects all StateMachine::apply() calls through offset 10
-    And the read-marker is a consensus control record — it is not passed to StateMachine::apply
+    Then read() returns the node-local committed/applied state
+    And the returned state reflects all StateMachine::apply() calls through HW − 1 = offset 10
+    And read() is available on any RaftNode — not restricted to the leader (per tech spec §2.1.5)
+    And reads are NOT linearisable (per tech spec §2.2 — linearisable reads are out of scope)
     And consensus metadata (term, role, HW, voter_set) is accessible separately via RaftMetrics
 
-  Scenario: Read rejected on follower — follower cannot append to the log
-    # Because read() routes through the log (appends a read-marker that must be
-    # committed), only the leader can service read() calls. Followers return an error.
+  Scenario: Read on follower returns potentially stale state
     Given N1 is Leader for term 1 with high watermark 11 (offsets 0–10 committed)
-    And N2 is a Follower
+    And N2 is a Follower whose local HW is 8 (it has applied entries through offset 7)
     When a client calls read() on N2
-    Then N2 returns an error indicating it is not the leader
-    And the error includes the current leader's identity (N1)
-    And the client should redirect the read() call to N1
+    Then read() returns N2's node-local committed/applied state (through offset 7)
+    And this state may lag behind the leader's state (leader HW = 11, follower HW = 8)
+    And the read is still valid — it reflects a consistent prefix of committed entries
+    And to get more up-to-date state, the client may call read() on the leader instead
 
   Scenario: At-least-once semantics — duplicate proposal after leader failover
     Given a client proposes command "set x=1" to N1 (Leader)
