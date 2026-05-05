@@ -208,20 +208,20 @@ Feature: Pull-Based Log Replication
     And the follower fetch interval is configured to 50ms
 
   Scenario: Single entry replication via Fetch
-    Given the log is empty across all nodes
+    Given no application entries have been proposed (the log contains only the LeaderChangeMessage at offset 0)
     When a client proposes command "set x=1" to N1
     Then N1 appends "set x=1" at offset 1, term 1 to its log
-    When N2 sends a Fetch RPC to N1 with offset 0
+    When N2 sends a Fetch RPC to N1 with fetch offset 1
     Then N1 responds with entry [offset 1, term 1, "set x=1"]
     And N2 appends the entry to its local log
-    When N3 sends a Fetch RPC to N1 with offset 0
+    When N3 sends a Fetch RPC to N1 with fetch offset 1
     Then N1 responds with entry [offset 1, term 1, "set x=1"]
     And N3 appends the entry to its local log
 
   Scenario: Batch replication — multiple entries in one Fetch
-    Given the leader N1 has entries at offsets 1–5 in its log
-    And N2's log is empty
-    When N2 sends a Fetch RPC to N1 with offset 0
+    Given the leader N1 has application entries at offsets 1–5 (offset 0 is LeaderChangeMessage)
+    And N2 has only replicated up to offset 0
+    When N2 sends a Fetch RPC to N1 with fetch offset 1
     Then N1 responds with entries [1, 2, 3, 4, 5]
     And N2 appends all 5 entries to its local log in order
 
@@ -606,8 +606,9 @@ Feature: Cluster Bootstrap
     Given each node is configured with the initial voter set [N1, N2, N3]
     And each node has an empty log and no snapshot
     When all three nodes start simultaneously
-    Then each node loads the bootstrap voter set
-    And each node starts in Follower state with term 0
+    Then each node starts in Unattached state with term 0
+    And each node loads the bootstrap voter set from configuration
+    And each node transitions from Unattached to Follower state
     And a leader election occurs (one node's election timeout expires first)
     And the winning leader commits a VotersRecord control entry with [N1, N2, N3]
     And the clusterId "cluster-abc-123" is associated with all subsequent RPCs
@@ -615,10 +616,10 @@ Feature: Cluster Bootstrap
   Scenario: Bootstrap leader appends initial VotersRecord
     Given N1 wins the initial election for term 1
     When N1 transitions to Leader
-    Then N1 appends a LeaderChangeMessage (no-op) at offset 1, term 1
-    And N1 appends a VotersRecord control entry at offset 2, term 1
+    Then N1 appends a LeaderChangeMessage (no-op) at offset 0, term 1
+    And N1 appends a VotersRecord control entry at offset 1, term 1
       with voter set [N1, N2, N3]
-    When both entries are committed
+    When both entries are committed (HW advances to 1)
     Then the cluster is fully bootstrapped
     And subsequent membership changes use AddVoter / RemoveVoter RPCs
 
@@ -633,8 +634,8 @@ Feature: Cluster Bootstrap
   Scenario: Uninitialized node joins as observer
     Given the cluster [N1, N2, N3] is running with committed entries 1–100
     And N4 is a new uninitialized node with no log and no snapshot
-    When N4 starts and connects to the cluster
-    Then N4 joins as an Observer (non-voting)
+    When N4 starts (initially in Unattached state) and connects to the cluster
+    Then N4 transitions to Observer role (non-voting)
     And N4 begins sending Fetch RPCs to the leader
     And if the leader's log starts beyond offset 0, N4 receives a SnapshotId
     And N4 downloads the snapshot via FetchSnapshot before normal replication
@@ -665,7 +666,7 @@ Feature: Dynamic Quorum — Add Voter
     Given N4 is an Observer that has caught up with the leader (log is current)
     When a client sends an AddVoter RPC for N4 to N1
     Then N1 appends a VotersRecord control entry to the log with voter set [N1, N2, N3, N4]
-    When the VotersRecord is committed (replicated to majority of the NEW configuration)
+    When the VotersRecord is committed (replicated to a majority of the current voter set [N1, N2, N3])
     Then the active voter set becomes [N1, N2, N3, N4]
     And the quorum size increases to 3 (majority of 4)
     And N4 participates in future elections and quorum calculations
@@ -684,7 +685,8 @@ Feature: Dynamic Quorum — Add Voter
   Scenario: AddVoter during network partition
     Given N3 is partitioned from N1 and N2
     When a client sends AddVoter for N4 to N1
-    Then N1 can still commit the VotersRecord with N1 + N2 + N4 = 3 of 4 (majority)
+    Then N1 can still commit the VotersRecord with N1 + N2 = 2 of 3 (majority of current voters [N1, N2, N3])
+    And N4 replicates the VotersRecord via Fetch as an observer
     And when the partition heals, N3 learns the new voter set via Fetch
 
   Scenario: Add voter fails if observer has not caught up
@@ -712,17 +714,18 @@ Feature: Dynamic Quorum — Remove Voter
   Scenario: Remove a follower from the cluster
     When a client sends a RemoveVoter RPC for N3 to N1
     Then N1 appends a VotersRecord with voter set [N1, N2]
-    When the VotersRecord is committed
-    Then the active voter set becomes [N1, N2]
+    When the VotersRecord is committed (replicated to a majority of the current voter set [N1, N2, N3])
+    Then the new voter set [N1, N2] takes effect
     And the quorum size decreases to 2 (majority of 2)
     And N3's Vote RPCs are ignored by the remaining nodes
 
   Scenario: Remove the leader — leader steps down after commit
     When a client sends a RemoveVoter RPC for N1 (the leader itself) to N1
     Then N1 appends a VotersRecord with voter set [N2, N3]
-    And N1 continues serving as leader until the VotersRecord is committed
+    And N1 continues serving as leader until the VotersRecord is committed by the current voter set [N1, N2, N3]
     When the VotersRecord is committed
-    Then N1 steps down to Follower state
+    Then the new voter set [N2, N3] takes effect
+    And N1 steps down to Follower state
     And N2 or N3 triggers a new election and becomes the new Leader
 
   Scenario: Removed node's vote requests are ignored
@@ -738,7 +741,7 @@ Feature: Dynamic Quorum — Remove Voter
     And N3's endpoint changes from 10.0.0.3:9000 to 10.0.0.30:9000
     When a client sends an UpdateVoter RPC for N3 with the new endpoint to N1
     Then N1 appends a VotersRecord with updated endpoint for N3
-    When the VotersRecord is committed
+    When the VotersRecord is committed (by the current voter set)
     Then all nodes update N3's address in their voter configuration
     And N3 remains a voting member with unchanged voting rights
 ```
@@ -771,7 +774,7 @@ Feature: Dynamic Quorum — Observer Promotion
     When a client sends AddVoter for N4 to N1
     Then N1 accepts the request because N4 is caught up
     And N1 appends a VotersRecord with voter set [N1, N2, N3, N4]
-    And once committed, N4 becomes a full voting member
+    And once committed by the current voter set [N1, N2, N3], N4 becomes a full voting member
 
   Scenario: Observer survives leader election
     Given N4 is an Observer replicating from N1

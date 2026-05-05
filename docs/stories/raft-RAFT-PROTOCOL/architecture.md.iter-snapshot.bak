@@ -78,7 +78,7 @@ loop `await`s trait methods but never opens files or sockets itself.
 
 | Sub-component | Responsibility |
 |---------------|----------------|
-| **`RaftNode`** | Public API surface. Exposes `propose()`, `read()`, `bootstrap()`, and lifecycle methods. Owns the `EventLoop` and coordinates startup, shutdown, and crash recovery. Accepts a generic `StateMachine` type parameter (monomorphised at compile time). On construction, executes the recovery sequence (§5.9) before accepting any RPCs. |
+| **`RaftNode`** | Public API surface. Exposes `propose()`, `read()`, `bootstrap()`, and lifecycle methods. Owns the `EventLoop` and coordinates startup, shutdown, and crash recovery. Accepts a generic `StateMachine` type parameter (monomorphised at compile time). On construction, executes the recovery sequence (§5.10) before accepting any RPCs. |
 | **`EventLoop`** | Single-threaded async loop that processes protocol state transitions without blocking on I/O. The loop drains an inbound message queue (`tokio::sync::mpsc`) and dispatches to the appropriate handler. **I/O staging model:** The loop never directly awaits `LogStore::append()` or `Transport::send()` inline. Instead, handlers produce `IoAction` values (described below) collected into an `IoActionBatch`. After each message is processed, the loop hands the batch to the `IoStage`, which executes storage and network operations concurrently, then returns results. The loop then applies I/O results (e.g., advancing durable offsets, completing client futures) as synchronous state updates. This prevents slow `fsync` calls from delaying Fetch processing and triggering spurious elections. |
 | **`IoStage`** | Executes `IoAction` batches produced by the `EventLoop`. Each action is one of: `PersistQuorumState(QuorumState)`, `AppendLog(Vec<LogEntry>)`, `TruncateSuffix(u64)`, `TruncatePrefix(u64)`, `SendRpc(NodeId, RpcEnvelope)`, `SaveSnapshot(Snapshot)`, `NotifyListener(ListenerEvent)`. The `IoStage` calls the injected trait objects (`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`) concurrently via `tokio::join!` or `FuturesUnordered`. Storage operations complete with `fsync` before the loop processes the next message that depends on them. |
 | **`BatchAccumulator`** | Stages incoming `propose()` calls into a batch buffer. On each event-loop tick (or when the batch is full), the accumulated entries are drained into a single `AppendLog` I/O action. This amortises `fsync` cost across multiple proposals (group commit). Analogous to KRaft's `BatchAccumulator`. |
@@ -156,19 +156,27 @@ Term {
 LogEntry {
     offset: u64                     // position in the log (0-indexed)
     term: Term                      // term when the entry was created
-    entry_type: EntryType           // Command | NoOp | VotersRecord
+    entry_type: EntryType           // Command | LeaderChangeMessage | VotersRecord
     payload: Bytes                  // serialised command or control record
 }
 ```
 
-`EntryType` variants:
-- **`Command`** — application-level state machine command (contains an
-  `AppRecord`). The only type delivered to `StateMachine::apply`.
-- **`LeaderChangeMessage`** — no-op control record committed by a new leader
-  to establish commit state for the new term. Handled internally by xraft
-  (updates leader-epoch checkpoint); never reaches the application.
-- **`VotersRecord`** — control record encoding a membership change. Handled
-  internally by xraft (updates voter set); never reaches the application.
+`EntryType` variants — the log contains two classes of entries:
+
+- **`Command`** — application-level state machine command (wraps an
+  `AppRecord`). The only entry type delivered to `StateMachine::apply`.
+  These are **application records**.
+
+The following two are **consensus control records**, owned entirely by
+xraft. They travel through the log like any entry (replicated, committed,
+snapshotted) but are never exposed to the application's `StateMachine`:
+
+- **`LeaderChangeMessage`** — control record committed by a new leader to
+  establish commit state for the new term. When committed, the event loop
+  updates the leader-epoch checkpoint internally. Never reaches `apply`.
+- **`VotersRecord`** — control record encoding a membership change (add,
+  remove, or update a voter). When committed, the event loop updates the
+  in-memory voter set internally. Never reaches `apply`.
 
 #### `VotersRecord`
 
@@ -223,7 +231,11 @@ ConsensusState {
 ```
 FollowerProgress {
     node_id: NodeId
-    fetch_offset: u64               // last offset this follower has fetched
+    fetch_offset: u64               // from the latest FetchRequest: the next offset
+                                    // this follower wants to read (= follower's
+                                    // log_end_offset). The follower has replicated
+                                    // entries [0, fetch_offset). Used directly in
+                                    // HW calculation.
     last_fetch_timestamp: Instant   // when this follower last sent a Fetch
     is_voter: bool                  // whether this follower counts for quorum
 }
@@ -340,7 +352,9 @@ VoteResponse {
 ```
 FetchRequest {
     replica_id: NodeId              // follower/observer sending the request
-    fetch_offset: u64               // offset the follower wants to read from
+    fetch_offset: u64               // next offset the follower wants to read
+                                    // (= follower's log_end_offset; follower
+                                    // has entries [0, fetch_offset))
     last_fetched_epoch: Term        // epoch of the follower's last log entry
     max_bytes: u32                  // maximum response size
 }
@@ -348,7 +362,8 @@ FetchRequest {
 FetchResponse {
     leader_id: NodeId
     leader_epoch: Term
-    high_watermark: u64             // current committed offset
+    high_watermark: u64             // exclusive upper bound: entries with
+                                    // offset < HW are committed
     log_start_offset: u64           // leader's log start (after compaction)
     entries: Vec<LogEntry>          // log entries starting at fetch_offset
 
@@ -766,82 +781,130 @@ leader. Two fetch rounds are required for a follower to observe a commit.
        │          │ log @off=5 │             │                   │
        │          │ term=T     │             │                   │
        │          │ fsync      │             │                   │
+       │          │ log_end=6  │             │                   │
        │          └─────┬──────┘             │                   │
        │                │                    │                   │
        │                │  ◄── FetchRequest ─│                   │
        │                │      (fetch_off=5, │                   │
        │                │       epoch=T)     │                   │
        │                │                    │                   │
+       │          ┌─────┴──────┐             │                   │
+       │          │ Update B's │             │                   │
+       │          │ progress:  │             │                   │
+       │          │ B.fetch=5  │             │                   │
+       │          │ (B has 0-4)│             │                   │
+       │          │ HW calc:   │             │                   │
+       │          │ [A=6,B=5,  │             │                   │
+       │          │  C=5]      │             │                   │
+       │          │ sorted →   │             │                   │
+       │          │ [6,5,5]    │             │                   │
+       │          │ idx ⌊3/2⌋  │             │                   │
+       │          │ =1 → 5     │             │                   │
+       │          │ HW stays 5 │             │                   │
+       │          │ (was 5     │             │                   │
+       │          │  already)  │             │                   │
+       │          └─────┬──────┘             │                   │
+       │                │                    │                   │
        │                │── FetchResponse ──►│                   │
        │                │   entries=[off=5], │                   │
-       │                │   HW=4 (not yet    │                   │
-       │                │   committed)       │                   │
+       │                │   HW=5 (off 5 not  │                   │
+       │                │   committed: 5≮5)  │                   │
        │                │                    │                   │
        │                │                    │  ┌──────────┐     │
        │                │                    │  │Append 5  │     │
        │                │                    │  │fsync     │     │
+       │                │                    │  │B.log_end │     │
+       │                │                    │  │  =6      │     │
        │                │                    │  └──────────┘     │
        │                │                    │                   │
        │                │  ◄── FetchRequest ─┼───────────────────│
-       │                │      (fetch_off=5) │                   │
+       │                │      (fetch_off=5) │  (C has 0-4)      │
        │                │                    │                   │
        │                │── FetchResponse ───┼──────────────────►│
        │                │   entries=[off=5], │                   │
-       │                │   HW=4             │                   │
+       │                │   HW=5 (unchanged) │                   │
+       │                │                    │                   │
+       │                │                    │  ◄── Round 2 ───  │
+       │                │  ◄── FetchRequest ─│                   │
+       │                │      (fetch_off=6) │                   │
        │                │                    │                   │
        │          ┌─────┴──────┐             │                   │
-       │          │ B fetched  │             │                   │
-       │          │ off=6, C   │             │                   │
-       │          │ fetched 6. │             │                   │
-       │          │ Offsets:   │             │                   │
-       │          │ A=6,B=5,   │             │                   │
-       │          │ C=5 sorted │             │                   │
-       │          │ desc=[6,5, │             │                   │
-       │          │ 5] idx     │             │                   │
-       │          │ ⌊3/2⌋=1   │             │                   │
-       │          │ → HW ← 5  │             │                   │
+       │          │ Update B's │             │                   │
+       │          │ progress:  │             │                   │
+       │          │ B.fetch=6  │             │                   │
+       │          │ (B has 0-5)│             │                   │
+       │          │ HW calc:   │             │                   │
+       │          │ [A=6,B=6,  │             │                   │
+       │          │  C=5]      │             │                   │
+       │          │ sorted →   │             │                   │
+       │          │ [6,6,5]    │             │                   │
+       │          │ idx 1 → 6  │             │                   │
+       │          │ HW ← 6    │             │                   │
+       │          │ ────────── │             │                   │
+       │          │ off 5 now  │             │                   │
+       │          │ committed  │             │                   │
+       │          │ (5 < 6) ✓  │             │                   │
+       │          │ SM.apply(5)│             │                   │
+       │          │ Complete   │             │                   │
+       │          │ client fut.│             │                   │
        │          └─────┬──────┘             │                   │
-       │                │                    │                   │
-       │                │  ◄── FetchRequest ─│  (second round)   │
-       │                │      (fetch_off=6) │                   │
        │                │                    │                   │
        │                │── FetchResponse ──►│                   │
        │                │   entries=[],      │                   │
-       │                │   HW=5 ◄── commit! │                   │
+       │                │   HW=6 ◄── commit  │                   │
+       │                │   visible to B     │                   │
        │                │                    │                   │
        │◄── Ok(result) ─│                    │                   │
-       │   (committed)  │                    │  apply(off=5)     │
+       │   (committed)  │                    │  B.apply(off=5)   │
        │                │                    │                   │
 ```
 
+**Fetch-offset semantics (critical definition).** A follower's
+`fetch_offset` in a `FetchRequest` is the **next offset the follower wants
+to read** — equivalently, the follower's `log_end_offset`. A follower with
+`fetch_offset = N` has replicated entries `[0, N)` (offsets 0 through N−1
+inclusive). The leader records this value in `FollowerProgress.fetch_offset`
+and uses it directly in the HW calculation. The leader's own contribution
+to the HW calculation is its `log_end_offset`.
+
+**High-watermark semantics.** HW is an **exclusive upper bound** — entry at
+offset O is committed when `O < HW`. Equivalently, `HW − 1` is the last
+committed offset. HW is never persisted to disk (see §5.10 Crash Recovery).
+
 **High-watermark advancement rule (quorum math).** The leader maintains
-`FollowerProgress` for each voter. When a Fetch request arrives from
-follower F at `fetch_offset = N`, the leader records that F has replicated
-up to `N-1`. To compute the new high watermark, the leader collects the
-replicated offset for every voter (including itself) and sorts them in
-**descending** order. The new high watermark is the value at index
-`⌊V/2⌋` (0-indexed), where `V` is the total number of voters. This is
-the highest offset replicated by at least a **majority** (`⌊V/2⌋ + 1`)
-of voters.
+`FollowerProgress` for each voter. On each incoming Fetch request, the
+leader (1) updates the follower's `fetch_offset`, (2) recalculates HW,
+(3) includes the new HW in the FetchResponse. To compute the new HW,
+the leader collects `fetch_offset` for every voter (including itself —
+using its own `log_end_offset`) and sorts them in **descending** order.
+The new HW is the value at index `⌊V/2⌋` (0-indexed), where `V` is the
+total number of voters. This is the highest offset at or above which at
+least a **majority** (`⌊V/2⌋ + 1`) of voters have replicated. HW can
+only advance forward — it never decreases.
 
-*Example (V=3, offsets [10, 8, 5]):* Sorted descending: [10, 8, 5].
-Index ⌊3/2⌋ = 1 → value 8. Two voters (10, 8) have replicated ≥ 8 →
-majority. HW ← 8.
+*Example (V=3, fetch_offsets [10, 8, 5]):* Sorted descending: [10, 8, 5].
+Index ⌊3/2⌋ = 1 → HW = 8. Two voters have fetch_offset ≥ 8, meaning
+both have entries [0, 8). Majority reached → entries 0–7 committed.
 
-*Example (V=5, offsets [10, 8, 7, 5, 3]):* Sorted descending:
-[10, 8, 7, 5, 3]. Index ⌊5/2⌋ = 2 → value 7. Three voters (10, 8, 7)
-have replicated ≥ 7 → majority. HW ← 7.
+*Example (V=5, fetch_offsets [10, 8, 7, 5, 3]):* Sorted descending:
+[10, 8, 7, 5, 3]. Index ⌊5/2⌋ = 2 → HW = 7. Three voters have
+fetch_offset ≥ 7 → entries 0–6 committed.
 
-*Example (V=4, offsets [10, 8, 5, 3]):* Sorted descending:
-[10, 8, 5, 3]. Index ⌊4/2⌋ = 2 → value 5. Three voters (10, 8, 5)
-have replicated ≥ 5 → majority. HW ← 5.
+*Example (V=4, fetch_offsets [10, 8, 5, 3]):* Sorted descending:
+[10, 8, 5, 3]. Index ⌊4/2⌋ = 2 → HW = 5. Three voters have
+fetch_offset ≥ 5 → entries 0–4 committed.
 
 Only voters count; observers do not contribute to quorum.
 
-**Two-round commit visibility:** A follower fetches entries in round 1 but
-receives the old HW. The leader advances HW after majority replication. The
-follower sees the new HW in round 2's response and can then apply committed
-entries to the state machine.
+**Two-round commit visibility.** A follower fetches new entries in round 1.
+At that point its `fetch_offset` has not yet increased (the leader recorded
+the OLD value when the Fetch arrived). In round 2, the follower sends a new
+Fetch with its updated `fetch_offset`, which triggers the leader to
+recalculate HW and include the advanced value in the response. The follower
+then sees the new HW and can apply newly committed entries to the state
+machine. This is inherent to the pull-based model — the Fetch that delivers
+entries cannot also deliver the HW that commits them, because the leader
+has not yet counted the follower's replication of those entries.
 
 ### 5.3 Log Divergence Detection and Truncation
 
@@ -1023,7 +1086,135 @@ catches up via Fetch, then is promoted to voter.
 This prevents disjoint majorities that could arise from concurrent membership
 changes.
 
-### 5.6 Check Quorum (Leader Liveness)
+### 5.6 Dynamic Membership Change (Remove Voter)
+
+Removing an existing voter from the cluster. Covers both the case where a
+follower is removed and the special case where the leader removes itself.
+
+```
+    Admin         Leader (N1)       Follower N2       Follower N3
+      │              │                 │                 │
+      │─ RemoveVoter►│                 │                 │
+      │  (node=N3)   │                 │                 │
+      │              │                 │                 │
+      │        ┌─────┴──────┐          │                 │
+      │        │ Validate:  │          │                 │
+      │        │ 1. Am I    │          │                 │
+      │        │    leader? │          │                 │
+      │        │ 2. No      │          │                 │
+      │        │    pending │          │                 │
+      │        │    change? │          │                 │
+      │        │ 3. N3 in   │          │                 │
+      │        │    voter   │          │                 │
+      │        │    set?    │          │                 │
+      │        │ 4. Append  │          │                 │
+      │        │    Voters- │          │                 │
+      │        │    Record  │          │                 │
+      │        │    voters= │          │                 │
+      │        │    [N1,N2] │          │                 │
+      │        └─────┬──────┘          │                 │
+      │              │                 │                 │
+      │              │  ◄── Fetch ─────│                 │
+      │              │── FetchResp ───►│                 │
+      │              │  (includes      │                 │
+      │              │   VotersRecord  │  ◄── Fetch ─────│
+      │              │   [N1,N2])      │                 │
+      │              │                 │                 │
+      │              │── FetchResp ────┼────────────────►│
+      │              │  (includes      │                 │
+      │              │   VotersRecord  │                 │
+      │              │   [N1,N2])      │                 │
+      │              │                 │                 │
+      │        ┌─────┴──────┐          │                 │
+      │        │ Majority   │          │                 │
+      │        │ of NEW     │          │                 │
+      │        │ config     │          │                 │
+      │        │ [N1,N2]    │          │                 │
+      │        │ fetched    │          │                 │
+      │        │ VotersRec. │          │                 │
+      │        │ HW adv.    │          │                 │
+      │        │ N3 is no   │          │                 │
+      │        │ longer a   │          │                 │
+      │        │ voter.     │          │                 │
+      │        └─────┬──────┘          │                 │
+      │              │                 │                 │
+      │◄── Ok ───────│                 │                 │
+      │              │                 │                 │
+```
+
+**Quorum calculation during RemoveVoter.** The `VotersRecord` is committed
+using the **new** voter set for quorum purposes. In the example above, once
+the VotersRecord `[N1, N2]` is appended, HW advancement requires a majority
+of `{N1, N2}` (i.e., both nodes). N3's fetch progress is no longer counted.
+This ensures the new configuration is durable on a majority of the new
+membership before taking effect.
+
+**Leader self-removal.** When the leader receives `RemoveVoter` for itself:
+
+```
+    Admin         Leader (N1)       Follower N2       Follower N3
+      │              │                 │                 │
+      │─ RemoveVoter►│                 │                 │
+      │  (node=N1)   │                 │                 │
+      │              │                 │                 │
+      │        ┌─────┴──────┐          │                 │
+      │        │ Append     │          │                 │
+      │        │ VotersRec  │          │                 │
+      │        │ [N2,N3]    │          │                 │
+      │        │ Continue   │          │                 │
+      │        │ as leader  │          │                 │
+      │        │ until      │          │                 │
+      │        │ committed  │          │                 │
+      │        └─────┬──────┘          │                 │
+      │              │                 │                 │
+      │              │  ◄── Fetch ─────│                 │
+      │              │── FetchResp ───►│  ◄── Fetch ─────│
+      │              │── FetchResp ────┼────────────────►│
+      │              │                 │                 │
+      │        ┌─────┴──────┐          │                 │
+      │        │ VotersRec  │          │                 │
+      │        │ committed  │          │                 │
+      │        │ (majority  │          │                 │
+      │        │  of [N2,N3]│          │                 │
+      │        │  fetched)  │          │                 │
+      │        │            │          │                 │
+      │        │ N1 steps   │          │                 │
+      │        │ down to    │          │                 │
+      │        │ Unattached │          │                 │
+      │        └─────┬──────┘          │                 │
+      │              │                 │                 │
+      │◄── Ok ───────│                 │                 │
+      │              │                 │                 │
+      │              │           ┌─────┴──────┐          │
+      │              │           │ N2 or N3   │          │
+      │              │           │ election   │          │
+      │              │           │ timeout →  │          │
+      │              │           │ new leader │          │
+      │              │           └─────┬──────┘          │
+      │              │                 │                 │
+```
+
+**Leader self-removal rules:**
+1. The leader appends the `VotersRecord` that excludes itself and continues
+   serving as leader (processing Fetch requests, advancing HW) until the
+   `VotersRecord` is committed.
+2. Commitment requires a majority of the **new** voter set (which does not
+   include the departing leader). This guarantees the new configuration is
+   durable on the surviving members.
+3. Once committed, the leader steps down to `Unattached` and stops accepting
+   proposals. It does not transition to `Follower` because it is no longer
+   a member of the voter set.
+4. The remaining voters' election timers fire, and a new leader is elected
+   from the new configuration.
+
+**Removed node behaviour.** After N3 learns of its removal (by fetching
+and applying the `VotersRecord` that excludes it), N3 transitions to
+`Unattached` and stops participating in elections. If N3 has not yet
+learned of its removal and attempts an election, the Pre-Vote protocol
+and the remaining voters' knowledge of the current voter set cause them
+to reject N3's Vote requests — preventing cluster disruption.
+
+### 5.7 Check Quorum (Leader Liveness)
 
 The leader periodically verifies it can still reach a majority of voters.
 
@@ -1075,7 +1266,7 @@ within the election timeout window. If the count is below majority
 (`⌊V/2⌋ + 1` where V is the voter count), the leader steps down to
 follower to prevent split-brain.
 
-### 5.7 Client Proposal (Full Path — with I/O Staging)
+### 5.8 Client Proposal (Full Path — with I/O Staging)
 
 End-to-end flow from client command to committed state machine application.
 The `EventLoop` produces `IoAction` values; the `IoStage` executes them
@@ -1142,7 +1333,7 @@ via injected trait objects. No raw I/O occurs inside `xraft-core`.
 If the node is not the leader, `propose()` returns
 `Err(NotLeader { leader_id })` so the client can redirect.
 
-### 5.8 Cluster Bootstrap
+### 5.9 Cluster Bootstrap
 
 A fresh cluster with no prior state. Each node is configured with a static
 initial voter set and a shared `cluster_id`. All nodes start in the
@@ -1223,10 +1414,13 @@ initial voter set and a shared `cluster_id`. All nodes start in the
 - The `cluster_id` is set once at bootstrap and included in every RPC. Nodes
   reject RPCs with a mismatched `cluster_id`.
 
-### 5.9 Crash Recovery
+### 5.10 Crash Recovery
 
 A node that was previously running crashes (or is stopped) and restarts.
 Recovery restores durable state and re-enters the cluster as a follower.
+**The high watermark is never persisted**, so the recovering node does not
+know which log entries were committed before the crash. It relies on the
+leader to provide the authoritative HW via subsequent Fetch responses.
 
 ```
     Recovering Node N2           Running Leader N1
@@ -1253,29 +1447,61 @@ Recovery restores durable state and re-enters the cluster as a follower.
    │                         │        │
    │ b. Restore state mach.  │        │
    │    from AppSnapshot     │        │
+   │    (SM state is now at  │        │
+   │     offset 80)          │        │
    │                         │        │
-   │ c. Scan log segments    │        │
+   │ c. Set HW ← 81         │        │
+   │    (snapshot offset + 1;│        │
+   │     entries [0,81) are  │        │
+   │     known committed     │        │
+   │     because they are    │        │
+   │     included in the     │        │
+   │     snapshot)            │        │
+   │                         │        │
+   │ d. Scan log segments    │        │
    │    from offset 81.      │        │
    │    Verify CRC per batch.│        │
    │    Truncate at first    │        │
    │    corrupt/partial rec. │        │
    │    Entries found:       │        │
-   │    81..95 (valid)       │        │
+   │    81..95 (valid on     │        │
+   │    disk, but committed  │        │
+   │    status UNKNOWN)      │        │
    │                         │        │
-   │ d. Replay committed     │        │
-   │    entries (81..HW) to  │        │
-   │    state machine via    │        │
-   │    apply():             │        │
-   │    - Command entries →  │        │
-   │      StateMachine.apply │        │
+   │ e. DO NOT apply entries │        │
+   │    81..95 to the state  │        │
+   │    machine. Their       │        │
+   │    committed status is  │        │
+   │    unknown — some may   │        │
+   │    be uncommitted tail  │        │
+   │    entries that will be │        │
+   │    truncated on         │        │
+   │    divergence.          │        │
+   │                         │        │
+   │ f. Rebuild leader-epoch │        │
+   │    checkpoint from log  │        │
+   │    (scan for Leader-    │        │
+   │    ChangeMessage entries │        │
+   │    to build epoch →     │        │
+   │    start_offset map)    │        │
+   │                         │        │
+   │ g. Process control recs │        │
+   │    in log (81..95) for  │        │
+   │    internal bookkeeping │        │
+   │    only:                │        │
    │    - VotersRecord →     │        │
    │      update voter set   │        │
    │    - LeaderChangeMes. → │        │
    │      update leader-     │        │
    │      epoch checkpoint   │        │
-   │                         │        │
-   │ e. Rebuild leader-epoch │        │
-   │    checkpoint from log  │        │
+   │    (These are consensus │        │
+   │    metadata updates,    │        │
+   │    NOT state machine    │        │
+   │    applications. Even   │        │
+   │    if truncated later,  │        │
+   │    the leader's Fetch   │        │
+   │    will provide correct │        │
+   │    entries.)             │        │
    └─────┬───────────────────┘        │
          │                            │
    ┌─────┴───────────────────┐        │
@@ -1298,36 +1524,74 @@ Recovery restores durable state and re-enters the cluster as a follower.
          │                            │
          │◄─ FetchResponse ──────────│
          │   entries=[96..100],       │
-         │   HW=100                   │
+         │   HW=101                   │
          │                            │
    ┌─────┴───────────────────┐        │
-   │ Apply newly fetched     │        │
-   │ entries. Filter:        │        │
+   │ Phase 4: Catch up via   │        │
+   │ leader's HW             │        │
+   │                         │        │
+   │ Leader says HW=101.     │        │
+   │ Local HW was 81.        │        │
+   │ Advance local HW to     │        │
+   │ min(101, log_end_offset) │        │
+   │ = min(101, 101) = 101.  │        │
+   │                         │        │
+   │ Apply entries 81..100   │        │
+   │ to state machine:       │        │
    │ - Command → SM.apply    │        │
-   │ - Control → internal    │        │
-   │ Advance local HW.      │        │
+   │ - Control recs →        │        │
+   │   already processed     │        │
+   │   in Phase 2g (skip)    │        │
+   │                         │        │
    │ Normal operation.       │        │
-   └─────┬───────────────────┘        │
+   └─────┴───────────────────┘        │
          │                            │
 ```
 
-**Recovery invariants:**
-- A recovering node **always** starts as Follower, regardless of its prior
-  role. It must win a new election to become leader.
-- `current_term` and `voted_for` are read from the `quorum-state` file
-  before any RPC is processed. This prevents double-voting.
-- Log integrity is verified via CRC-32C checksums. The first corrupt or
-  incomplete batch causes truncation of that batch and everything after it.
-  Only committed entries (offset < HW at crash time) are guaranteed to
-  survive; uncommitted tail entries may be lost (which is safe — they were
-  never committed).
-- The high watermark is **not** persisted. On recovery, the node sets its
-  HW to the snapshot's `last_included_offset` and advances it as committed
-  entries are replayed. The authoritative HW comes from the leader via
-  subsequent Fetch responses.
-- If the log is entirely behind the leader's LSO, the node receives a
-  `SnapshotId` in the Fetch response and falls back to snapshot transfer
-  (§5.4).
+**Recovery invariants (crash-recovery HW rules):**
+
+1. **HW is never persisted.** On recovery, HW is initialised to
+   `snapshot.last_included_offset + 1` (or `0` if no snapshot exists). This
+   represents the exclusive upper bound of offsets known to be committed
+   (the snapshot captures only committed state). Entries in the log beyond
+   this point have **unknown** committed status.
+
+2. **No state machine replay during recovery.** Log entries between the
+   snapshot offset and `log_end_offset` are NOT applied to the
+   `StateMachine` during recovery, because their committed status is
+   unknown. Some may be uncommitted tail entries from a deposed leader
+   that will be truncated when the current leader detects divergence.
+   Applying them would put the state machine in an incorrect state with
+   no rollback mechanism.
+
+3. **Control records are processed for bookkeeping.** `VotersRecord` and
+   `LeaderChangeMessage` entries in the recovered log are scanned to
+   rebuild the voter set and leader-epoch checkpoint. These are internal
+   consensus metadata — not state machine mutations — and are idempotent.
+   If the log is later truncated due to divergence, the leader's correct
+   entries will overwrite these values.
+
+4. **Leader provides the authoritative HW.** After resuming as follower,
+   the node sends Fetch requests to the leader. The leader's Fetch
+   response includes the current HW. The node advances its local HW to
+   `min(leader_HW, local_log_end_offset)` and applies all entries between
+   the old HW and the new HW to the state machine (filtering control
+   records as usual).
+
+5. **Always resume as Follower.** A recovering node never resumes as
+   leader regardless of its prior role. It must win a new election.
+   `current_term` and `voted_for` are read from the `quorum-state` file
+   before any RPC is processed, preventing double-voting.
+
+6. **Log integrity via CRC-32C.** Each batch in the log is checksummed.
+   The first corrupt or incomplete batch triggers truncation of that batch
+   and all subsequent entries. This is safe because entries beyond HW are
+   uncommitted by definition (they were not yet replicated to a majority).
+
+7. **Snapshot fallback.** If the recovering node's `fetch_offset` is below
+   the leader's `log_start_offset` (the leader has compacted the needed
+   entries), the leader responds with a `SnapshotId` and the node falls
+   back to snapshot transfer (§5.4).
 
 ---
 
@@ -1413,11 +1677,16 @@ All crate names, trait definitions, and module structures below are
 - **Timing parameters** (150–300 ms election timeout, 50 ms fetch interval)
   per §4.3.
 - **Quorum math** — majority is `⌊V/2⌋ + 1`; HW advancement uses
-  descending-sorted voter offsets at index `⌊V/2⌋`. Consistent with
-  §2.1.1 of the tech spec.
-- **Bootstrap & recovery** (§5.8, §5.9) align with tech spec §2.1.7.
+  descending-sorted voter `fetch_offset` values at index `⌊V/2⌋`. HW is
+  an exclusive upper bound (entry at offset O is committed when O < HW).
+  Consistent with §2.1.1 of the tech spec.
+- **Bootstrap & recovery** (§5.9, §5.10) align with tech spec §2.1.7.
   Bootstrap uses static voter set → leader commits `VotersRecord`. Recovery
-  reads `quorum-state` → loads snapshot → replays log → resumes as follower.
+  reads `quorum-state` → loads snapshot → scans log → resumes as follower
+  → learns HW from leader → applies committed entries.
+- **Membership changes** — §5.5 (AddVoter) and §5.6 (RemoveVoter) cover
+  the full lifecycle including leader self-removal. Consistent with tech
+  spec §2.1.3.
 
 ### Open Items for Sibling Documents
 
@@ -1426,7 +1695,7 @@ All crate names, trait definitions, and module structures below are
   log replication → persistence → snapshot → membership → simulation harness.
   The `IoStage` and `BatchAccumulator` should be implemented in the core
   replication phase (they are not optional add-ons).
-- `e2e-scenarios.md`: Sequence flows §5.1–§5.9 here define the "happy path"
-  and key failure modes including bootstrap (§5.8) and crash recovery (§5.9).
-  The E2E document should define concrete test scenarios with expected
-  assertions for each flow.
+- `e2e-scenarios.md`: Sequence flows §5.1–§5.10 here define the "happy
+  path" and key failure modes including bootstrap (§5.9), crash recovery
+  (§5.10), and remove-voter (§5.6). The E2E document should define concrete
+  test scenarios with expected assertions for each flow.

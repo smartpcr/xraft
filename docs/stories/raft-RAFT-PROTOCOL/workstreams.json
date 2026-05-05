@@ -10,9 +10,9 @@
   },
   {
     "title": "Core Domain Types in \u0060xraft-core\u0060",
-    "description": "Core Domain Types in \u0060xraft-core\u0060 (8 steps)",
+    "description": "Core Domain Types in \u0060xraft-core\u0060 (9 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-core-domain-types-in-xraft-core",
-    "contentHash": "0fc497b25497c8b358454d76ed1c1dbe93350e767f4fd7053fe29c285510974a",
+    "contentHash": "ff00ed0702e7620b676faa96f5145f049c437110611d62418818304059c919d5",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-core-domain-types-in-xraft-core",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-core-domain-types-in-xraft-core",
     "status": "planning"
@@ -30,7 +30,7 @@
     "title": "Trait Definitions (Storage, Transport, Clock)",
     "description": "Trait Definitions (Storage, Transport, Clock) (7 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-trait-definitions-storage-transport-clock",
-    "contentHash": "dc2b45a2f8835bd73ff82ba7c47e55d8556cc058bf5d8bbf0e25868d858678fc",
+    "contentHash": "53bd4fa8a822b02df8cad6878474ac176b04b0dbb461405306c294478ecb8f64",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-clock",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-clock",
     "status": "planning"
@@ -45,19 +45,19 @@
     "status": "planning"
   },
   {
-    "title": "Application Record Types and Listener Trait",
-    "description": "Application Record Types and Listener Trait (4 steps)",
-    "anchor": "phase-project-scaffolding-and-core-types/stage-application-record-types-and-listener-trait",
-    "contentHash": "14706e8b237e35a15074ff16006294f943ebe6248c065b4a243ae5077cc8f593",
-    "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-application-record-types-and-listener-trait",
-    "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-application-record-types-and-listener-trait",
+    "title": "Listener Trait and ListenerEvent",
+    "description": "Listener Trait and ListenerEvent (3 steps)",
+    "anchor": "phase-project-scaffolding-and-core-types/stage-listener-trait-and-listenerevent",
+    "contentHash": "44b9da5196d5c68554730c2a4f516453b5fea79ecbed551f80e6cb0364a58027",
+    "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-listener-trait-and-listenerevent",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-listener-trait-and-listenerevent",
     "status": "planning"
   },
   {
     "title": "\u0060RaftNode\u0060 Public API Skeleton",
     "description": "\u0060RaftNode\u0060 Public API Skeleton (7 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-raftnode-public-api-skeleton",
-    "contentHash": "5ec4608547d2d9d7d6453d0707b88fd7cbe046011cc78eee45fbdd0a87665082",
+    "contentHash": "402e6cb29795817adab65dbcdfc06a7e00924a46c3411c36f81df3c77286e8fb",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
     "status": "planning"
@@ -66,16 +66,16 @@
     "title": "Segment Log \u2014 Write Path",
     "description": "Segment Log \u2014 Write Path (6 steps)",
     "anchor": "phase-storage-layer-xraft-storage/stage-segment-log-write-path",
-    "contentHash": "013e1f98a78641f70197577b5a524029c12c163284633b0288b9498b630236c5",
+    "contentHash": "c7d56e4152015257a869603fab4433f0d3c32ee77cd129f1170ddae0cffaa247",
     "workstreamId": "ws-raft-raft-protocol-phase-storage-layer-xraft-storage-stage-segment-log-write-path",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-storage-layer-xraft-storage-stage-segment-log-write-path",
     "status": "planning"
   },
   {
     "title": "Segment Log \u2014 Read and Truncation",
-    "description": "Segment Log \u2014 Read and Truncation (4 steps)",
+    "description": "Segment Log \u2014 Read and Truncation (5 steps)",
     "anchor": "phase-storage-layer-xraft-storage/stage-segment-log-read-and-truncation",
-    "contentHash": "c493ff7f72fbcf32132c85b7b8e0a6aa97e3d168e49d9499bcc590b7d66f5a0f",
+    "contentHash": "5b6a5f406214ef648c9cb355f29dbc25cfb8700abc86da5c6b3485abc1aab741",
     "workstreamId": "ws-raft-raft-protocol-phase-storage-layer-xraft-storage-stage-segment-log-read-and-truncation",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-storage-layer-xraft-storage-stage-segment-log-read-and-truncation",
     "status": "planning"
@@ -138,7 +138,7 @@
     "title": "Event Loop Skeleton and Timer Infrastructure",
     "description": "Event Loop Skeleton and Timer Infrastructure (5 steps)",
     "anchor": "phase-election-and-leader-lifecycle-xraft-core/stage-event-loop-skeleton-and-timer-infrastructure",
-    "contentHash": "e0423a40b6af5da721897c0055757df5eb7442bcfb378be590ded94684d7bfbe",
+    "contentHash": "b358920267500eea3de63680c4c8064411a0aa34549c0e28cdd645c9f2f3080a",
     "workstreamId": "ws-raft-raft-protocol-phase-election-and-leader-lifecycle-xraft-core-stage-event-loop-skeleton-and-timer-infrastructure",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-election-and-leader-lifecycle-xraft-core-stage-event-loop-skeleton-and-timer-infrastructure",
     "status": "planning"
@@ -190,18 +190,18 @@
   },
   {
     "title": "High Watermark Advancement and Commit Notification",
-    "description": "High Watermark Advancement and Commit Notification (6 steps)",
+    "description": "High Watermark Advancement and Commit Notification (7 steps)",
     "anchor": "phase-pull-based-log-replication-xraft-core/stage-high-watermark-advancement-and-commit-notification",
-    "contentHash": "15b4f3e25870a9c7b582f1a3c0a7138c4ba119bf557f39eb00c543eea808eb0a",
+    "contentHash": "d6071390f81f458b1a13b514c581c72940937dfe11f7e276099a7ce7ac165eab",
     "workstreamId": "ws-raft-raft-protocol-phase-pull-based-log-replication-xraft-core-stage-high-watermark-advancement-and-commit-notification",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-pull-based-log-replication-xraft-core-stage-high-watermark-advancement-and-commit-notification",
     "status": "planning"
   },
   {
     "title": "Crash Recovery Sequence",
-    "description": "Crash Recovery Sequence (4 steps)",
+    "description": "Crash Recovery Sequence (3 steps)",
     "anchor": "phase-persistence-crash-recovery-and-bootstrap-xraft-core/stage-crash-recovery-sequence",
-    "contentHash": "4725d8d79e9e4f37187610020e6c351a47f9c14d6805d5ec314f7f8df9709901",
+    "contentHash": "c24e8b67d9babba569c3babaad367e930ac4b1ff615e6657002d7d7d01a9cb57",
     "workstreamId": "ws-raft-raft-protocol-phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-crash-recovery-sequence",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-crash-recovery-sequence",
     "status": "planning"
@@ -210,7 +210,7 @@
     "title": "Cluster Bootstrap",
     "description": "Cluster Bootstrap (4 steps)",
     "anchor": "phase-persistence-crash-recovery-and-bootstrap-xraft-core/stage-cluster-bootstrap",
-    "contentHash": "b7228198a8aa8e93a81079f9d8d31251707f7bcffd565f6a1530f21a826d7867",
+    "contentHash": "e584876d9b6225264fc607021c45d00c17d9cd730662cf2b041b04acb8f766bb",
     "workstreamId": "ws-raft-raft-protocol-phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-cluster-bootstrap",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-cluster-bootstrap",
     "status": "planning"
@@ -228,7 +228,7 @@
     "title": "Snapshot Transfer via FetchSnapshot RPC",
     "description": "Snapshot Transfer via FetchSnapshot RPC (4 steps)",
     "anchor": "phase-log-compaction-and-snapshot-transfer-xraft-core/stage-snapshot-transfer-via-fetchsnapshot-rpc",
-    "contentHash": "86ac2d23e76402fd544c91eb8d8d6d744adfa95437f9c9fdde0799fadf2e2e8a",
+    "contentHash": "5194bd974e417225a1c6d65ee275be484dd75a63d1c920a83a793abb78e2a7ce",
     "workstreamId": "ws-raft-raft-protocol-phase-log-compaction-and-snapshot-transfer-xraft-core-stage-snapshot-transfer-via-fetchsnapshot-rpc",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-log-compaction-and-snapshot-transfer-xraft-core-stage-snapshot-transfer-via-fetchsnapshot-rpc",
     "status": "planning"
@@ -264,7 +264,7 @@
     "title": "In-Memory Storage and Simulated Clock",
     "description": "In-Memory Storage and Simulated Clock (5 steps)",
     "anchor": "phase-test-harness-xraft-test/stage-in-memory-storage-and-simulated-clock",
-    "contentHash": "02a186924d6fdde366f6a0b446c4904c37b7ec361277c3cb0a099b7c6c8fe931",
+    "contentHash": "60148f32b717f778164b7a83934d53e42cb2ac73bf311fa529868d2afbc8beed",
     "workstreamId": "ws-raft-raft-protocol-phase-test-harness-xraft-test-stage-in-memory-storage-and-simulated-clock",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-test-harness-xraft-test-stage-in-memory-storage-and-simulated-clock",
     "status": "planning"
