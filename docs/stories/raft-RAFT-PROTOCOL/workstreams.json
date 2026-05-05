@@ -246,7 +246,7 @@
     "title": "Membership Manager \u2014 Add Voter",
     "description": "Membership Manager \u2014 Add Voter (6 steps)",
     "anchor": "phase-dynamic-quorum-membership-changes/stage-membership-manager-add-voter",
-    "contentHash": "815abd40e6bfd176da93c5d199faeecdc1849a565c23794cbf2d550a74787985",
+    "contentHash": "0db39f6d35358ce21f5f656bf0c53142a7549bb7880d75c35205b740264fdc10",
     "workstreamId": "ws-raft-raft-protocol-phase-dynamic-quorum-membership-changes-stage-membership-manager-add-voter",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-dynamic-quorum-membership-changes-stage-membership-manager-add-voter",
     "status": "planning"
@@ -255,7 +255,7 @@
     "title": "Membership Manager \u2014 Remove Voter",
     "description": "Membership Manager \u2014 Remove Voter (4 steps)",
     "anchor": "phase-dynamic-quorum-membership-changes/stage-membership-manager-remove-voter",
-    "contentHash": "f7325ce24a26bfc99f9fb431df7e1a570828e05d9e69f62428815cf403248ff5",
+    "contentHash": "12d64bf546405fa6116828b5200f72302aa7a855323f13c6297659f35dc179bb",
     "workstreamId": "ws-raft-raft-protocol-phase-dynamic-quorum-membership-changes-stage-membership-manager-remove-voter",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-dynamic-quorum-membership-changes-stage-membership-manager-remove-voter",
     "status": "planning"
