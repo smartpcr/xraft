@@ -1957,17 +1957,12 @@ nodes.
 
 > **Alignment with sibling documents.**
 >
-> The tech spec defines `read() → Result<State>` and says "initial
-> implementation routes reads through the log for safety." The
-> implementation plan defines `read() → Result<ConsensusState>`. This
-> architecture aligns with the implementation plan's concrete signature:
-> `read()` returns protocol metadata that reflects the node's current
-> view of the log's committed position (HW).
->
-> The tech spec also lists "Linearisable reads — Read-index or
-> lease-based reads" as out of scope. This architecture does NOT
-> implement any linearizable-read mechanism. The `read()` call returns
-> local metadata — it makes no linearizability guarantees.
+> All four documents are aligned on `read()` semantics. The tech spec,
+> implementation plan, e2e scenarios, and this architecture all define
+> `read() → Result<ConsensusState>` — a local, non-linearizable
+> snapshot of protocol metadata. The tech spec lists "Linearisable
+> reads — Read-index or lease-based reads" as out of scope, which is
+> consistent: `read()` makes no linearizability guarantees.
 
 ```
     Client            RaftNode         ConsensusState
@@ -2104,12 +2099,11 @@ pub struct RaftMetrics {
 
 ## 7. Cross-Document Alignment
 
-This section records the alignment status between this architecture and
-the three sibling planning documents. All four documents share a
-greenfield context — no Rust source code exists yet. §7.1 lists
-conventions that are consistent across all documents. §7.2 lists every
-known divergence with the canonical resolution that governs
-implementation. §7.3 confirms which sibling documents are fully aligned.
+All four planning documents — this architecture, the tech spec, the
+implementation plan, and the e2e scenarios — are aligned on the core
+design decisions. This section records the shared conventions that
+govern implementation and notes the canonical resolution for areas
+where different documents historically used different phrasing.
 
 ### 7.1 Shared Conventions (All Four Documents)
 
@@ -2124,251 +2118,34 @@ implementation. §7.3 confirms which sibling documents are fully aligned.
 | **I/O trait objects** | Storage / Network-Send I/O traits injected as `Box<dyn ...>` — no `Arc`. `IoStage` borrows via `&self` with `Sync` bound. | impl plan Stage 1.7 |
 | **Transport split** | Separate `TransportSender` (`&self`, `Sync`) and `TransportReceiver` (`&mut self`, not `Sync`). `split()` on concrete transports. | impl plan Stage 1.4, architecture §4.4 |
 | **Clock placement** | `Clock` is a Runtime trait, passed to the `EventLoop` (not `IoStage`), not mediated by `IoAction`. | impl plan Stage 1.4/1.7 |
-| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state → snapshot → log scan (metadata only — no SM replay) → resume as follower → learn HW from leader → apply entries via three-phase commit notification. See Divergence 8. | tech spec §2.1.7, impl plan Phase 6 |
 | **Timing parameters** | 150–300 ms election timeout (randomised), 50 ms fetch interval. | tech spec §4.3 |
 | **Quorum math** | Majority = `⌊V/2⌋ + 1`; HW = descending-sorted voter offsets at index `⌊V/2⌋` (0-indexed). Only voters count. | all docs |
+| **Callback execution model** | Application callbacks (`StateMachine::apply`, `Listener::handle_commit`) are synchronous, in-process calls invoked by the `EventLoop` during message processing, after state mutation but before `IoAction` dispatch. | tech spec §4.4.1, architecture §4.1, impl plan Stages 4.1/5.1, e2e Client Interaction |
+| **High watermark (HW) semantics** | Exclusive upper bound: entry at offset O is committed ⟺ `O < HW`. `HW − 1` is the last committed offset. HW is never persisted. | tech spec §8, architecture §3.1, impl plan Phase 5, e2e preamble |
+| **Commit notification** | Three-phase: (1) `StateMachine::apply`, (2) `Listener::handle_commit`, (3) `DeferredCompletionQueue::complete`. No `DeferredReadQueue`. | architecture §4.1, impl plan Stages 5.1/5.3, e2e Client Interaction |
+| **`read()` semantics** | `read() → Result<ConsensusState>` — local, non-linearizable snapshot of protocol metadata (term, role, leader_id, HW, voter set). Callable on any node. Does not read application state. No `StateMachine::query()` method. | tech spec §2.1.5, architecture §5.11, impl plan Stages 1.7/5.3, e2e Client Interaction |
+| **`StateMachine` trait shape** | `apply(offset, &AppRecord)`, `snapshot()`, `restore()` only. No `query()`, no `ReadResult` associated type. | tech spec §2.1.5, architecture §4.1, impl plan Stage 1.4 |
+| **`LogStore` method receivers** | All methods take `&self` with interior mutability and `Sync` bound. | architecture §4.1, impl plan Stage 1.4 |
+| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state → snapshot → log scan (metadata only — no SM replay) → resume as follower → learn HW from leader → apply entries via three-phase commit notification. | tech spec §2.1.7, architecture §5.10, impl plan Phase 6, e2e Crash Recovery |
+| **`ClusterId` generation** | Generated once by the operator, passed to `bootstrap()` as a parameter, shared by all nodes. | tech spec §2.1.7, architecture §5.9, impl plan Stage 6.2 |
+| **Application read-side state** | Applications build their own queryable read-side state from committed records delivered via `Listener::handle_commit`. xraft does not mediate application state reads. | architecture §4.1, e2e Client Interaction |
 
-### 7.2 Known Divergences and Canonical Resolutions
+### 7.2 Canonical Resolutions (Historical Divergences — Now Resolved)
 
-Each entry names the specific sections that conflict, states both
-positions, and declares which interpretation governs implementation.
+The following areas previously had different phrasing across documents.
+All sibling documents have been updated to use the canonical design
+from this architecture. These entries are retained as a historical
+record to prevent regression.
 
-#### Divergence 1 — Callback execution model
-
-| Document | Statement | Section |
-|----------|-----------|---------|
-| **Tech spec** | "application callbacks are staged and executed asynchronously outside the loop" | §4.4.1 |
-| **This architecture** | Callbacks (`StateMachine::apply`, `Listener::handle_commit`, `DeferredCompletionQueue::complete`) are **synchronous, in-process calls** invoked by the `EventLoop` during message processing, after state mutation but before `IoAction` dispatch. | §4.1 |
-| **Impl plan** | Uses the synchronous-callback model from this architecture. | Stages 4.1, 5.1 |
-| **E2e scenarios** | Uses the synchronous-callback model from this architecture. | Client Interaction feature |
-
-**Canonical resolution:** Callbacks are synchronous, in-process calls
-within the event loop (this architecture §4.1). The tech spec's phrasing
-"staged and executed asynchronously outside the loop" describes a
-different execution model that is superseded by the detailed design in
-this architecture. **This is safety-sensitive:** synchronous execution
-guarantees that callbacks always observe fully-updated protocol state
-(e.g., the correct HW and voter set) before any `IoAction` is
-dispatched. An asynchronous callback model would require additional
-synchronisation to prevent stale reads. The implementation plan and e2e
-scenarios both follow the synchronous-callback model from this
-architecture.
-
-#### Divergence 2 — High watermark: inclusive vs exclusive
-
-| Document | Statement | Section |
-|----------|-----------|---------|
-| **Tech spec** | "Entries at or below the HW are considered committed" (inclusive, at-or-below). | §8 Glossary |
-| **This architecture** | HW is an exclusive upper bound: entry at offset O is committed ⟺ `O < HW`. | §3.1 |
-| **Impl plan** | Uses exclusive semantics. | Phase 5 preamble, Stage 5.3 |
-| **E2e scenarios** | Uses exclusive semantics; preamble maps tech-spec inclusive to exclusive. | Offset conventions |
-
-**Canonical resolution:** Exclusive semantics (`O < HW`) govern
-implementation. Mapping: tech spec "entries ≤ N committed" corresponds
-to `HW = N + 1` in exclusive notation. The committed set is identical;
-only the numeric convention differs. **Safety note:** The exclusive
-convention is used consistently in the `DeferredCompletionQueue` (fires
-when `entry_offset < HW`), the `FetchResponse` (HW field), and the
-`ConsensusState.high_watermark` field. All code must use `<` (strict
-less-than) when testing whether an entry is committed — using `<=`
-would incorrectly include one uncommitted entry.
-
-#### Divergence 3 — Commit notification phases (RESOLVED)
-
-| Document | Statement | Section |
-|----------|-----------|---------|
-| **Impl plan** | Uses "three-phase commit notification": (1) `StateMachine::apply`, (2) `Listener::handle_commit`, (3) `DeferredCompletionQueue::complete`. | Stages 5.1, 5.3, 6.1 |
-| **This architecture** | Uses **three-phase** commit notification — same three steps in the same order. | §4.1 |
-| **E2e scenarios** | Previously used a four-phase model (with a fourth `DeferredReadQueue::drain` step). This is now stale — see §7.4. | Client Interaction feature |
-
-**Resolution:** This architecture now uses three-phase commit
-notification, aligned with the implementation plan. The prior
-four-phase model (which included a `DeferredReadQueue::drain` step
-for a `StateMachine::query()`-based read path) has been removed.
-The e2e scenarios document adopted the prior four-phase model and
-its **Feature: Client Interaction** section must be updated to
-reflect the three-phase model and the `read() → ConsensusState`
-semantics (see §7.4).
-
-#### Divergence 4 — `read()` semantics and `StateMachine` trait shape (RESOLVED)
-
-| Document | Statement | Section |
-|----------|-----------|---------|
-| **Tech spec** | `read() → Result<State>`. "Initial implementation routes reads through the log for safety." Out-of-scope list includes: "Linearisable reads — Read-index or lease-based reads." `StateMachine` trait has `apply`, `snapshot`, `restore` only (no `query`). | §2.1.5, §2.2 |
-| **Impl plan** | `read() → Result<ConsensusState>` — returns protocol metadata (term, role, leader, HW, voter set). `StateMachine` trait has `apply`, `snapshot`, `restore` only. | Stages 1.7, 5.3, 1.4 |
-| **This architecture** | `read() → Result<ConsensusState>` — local, non-linearizable snapshot of protocol metadata. Callable on any node. `StateMachine` trait has `apply`, `snapshot`, `restore` only (no `query`). Applications build their own read-side state from `Listener::handle_commit` callbacks. | §5.11, §4.1 |
-| **E2e scenarios** | Previously used `S::ReadResult` / `query()` model. This is now stale — see §7.4. | Client Interaction feature |
-
-**Resolution:** `read()` returns `ConsensusState` — a local,
-non-linearizable snapshot of protocol metadata. This is now aligned
-across the architecture, implementation plan, and tech spec. Key
-alignment points:
-
-1. **`StateMachine` trait shape** — `apply`, `snapshot`, `restore` only.
-   No `query()` method, no `ReadResult` associated type. Aligned across
-   all three documents.
-
-2. **No linearizable-read claims** — the tech spec correctly excludes
-   read-index and lease-based reads as out of scope. This architecture
-   makes no linearizability claims for `read()`. The returned metadata is
-   a local snapshot that may be stale on a partitioned node.
-
-3. **Application state reads** — applications build their own queryable
-   read-side state from committed records delivered via
-   `Listener::handle_commit` (§4.1). xraft does not mediate application
-   state reads. This matches the KRaft model where brokers maintain their
-   own metadata cache from committed log entries.
-
-4. **Tech-spec wording** — the tech spec's `read() → Result<State>` and
-   "routes reads through the log for safety" should be clarified to
-   `read() → Result<ConsensusState>` (protocol metadata). See §7.4.
-
-The e2e scenarios document adopted the prior architecture's
-`S::ReadResult` / `query()` design and must be updated — see §7.4.
-
-#### Divergence 5 — `LogStore` method receivers
-
-| Document | Statement | Section |
-|----------|-----------|---------|
-| **Impl plan** | `LogStore` write methods (`append`, `truncate_suffix`, `truncate_prefix`) take `&mut self`. | Stage 1.4 |
-| **This architecture** | All `LogStore` methods take `&self` with interior mutability (e.g., `tokio::sync::Mutex<File>`), consistent with `SnapshotIO::save(&self)` and `QuorumStateStore::save(&self)`. | §4.1 |
-
-**Canonical resolution:** `&self` with interior mutability (this
-architecture §4.1). Required by the `IoStage`'s concurrent dispatch
-model: the `IoStage` holds all I/O trait objects as owned `Box<dyn ...>`
-and borrows them via `&self` for `tokio::join!` across trait objects.
-Using `&mut self` would make concurrent dispatch across trait objects
-impossible without `Arc<Mutex<...>>` wrapping. The `Sync` bound on
-`LogStore` enables safe shared-reference access; the implementation
-serialises writes internally (e.g., `tokio::sync::Mutex<File>`).
-
-#### Divergence 6 — `StateMachine::apply` signature
-
-| Document | Statement | Section |
-|----------|-----------|---------|
-| **Tech spec** | `fn apply(&mut self, entry: &AppRecord) -> Result<()>` — no offset parameter. | §2.1.5 |
-| **This architecture** | `fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>` — includes the committed entry's log offset. | §4.1 |
-| **Impl plan** | `fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>` — matches this architecture. | Stage 1.4 |
-
-**Canonical resolution:** `apply` takes `(offset, &AppRecord)` (this
-architecture §4.1). The offset parameter lets applications track which
-entries have been applied (useful for idempotency, checkpointing, and
-snapshots). The tech spec's simpler signature is a summary, not a
-constraint.
-
-#### Divergence 7 — `ClusterId` generation
-
-| Document | Statement | Section |
-|----------|-----------|---------|
-| **Tech spec** | "clusterId UUID generated at bootstrap time" — could be read as node-generated. | §2.1.7 |
-| **This architecture** | Nodes are "configured with… a shared `cluster_id`" — externally provided. | §5.9 |
-| **Impl plan** | `ClusterId` is "generated once by the operator and distributed out-of-band to all nodes." `bootstrap()` accepts it as a parameter. | Stage 6.2 |
-
-**Canonical resolution:** `ClusterId` is generated once by the operator
-and passed to `bootstrap()` as a parameter (this architecture §5.9,
-impl plan Stage 6.2). All nodes in a cluster share the same `ClusterId`.
-The tech spec's "generated at bootstrap time" is compatible — the
-generation happens at bootstrap time, but externally rather than by the
-node itself.
-
-#### Divergence 8 — Crash recovery: log entry replay vs deferred application
-
-| Document | Statement | Section |
-|----------|-----------|---------|
-| **Tech spec** | Crash recovery step (3): "replaying log entries after the snapshot offset". | §2.1.7 |
-| **This architecture** | "No state machine replay during recovery." Log entries between the snapshot offset and `log_end_offset` are NOT applied to the `StateMachine` during recovery because their committed status is unknown. The recovering node sets HW to `snapshot.last_included_offset + 1` and defers all further state machine applications until the leader provides the authoritative HW via Fetch responses. | §5.10 invariants 2, 4 |
-| **Impl plan** | Recovery (Phase 6) follows this architecture: log is scanned for metadata only; entries are not applied to the state machine until the leader sends HW via Fetch. | Phase 6 |
-| **E2e scenarios** | Crash recovery scenarios follow this architecture: recovered node learns HW from leader. | Feature: Persistence and Crash Recovery |
-
-**Canonical resolution:** **No state machine replay during recovery**
-(this architecture §5.10). The tech spec's "replaying log entries" is
-a compressed description of the full recovery process. In practice, log
-entries are scanned for consensus metadata (leader-epoch checkpoint,
-voter set from `VotersRecord` entries) but are NOT applied to
-`StateMachine::apply` because their committed status is unknown. Some
-entries may be uncommitted tail entries from a deposed leader that will
-be truncated on divergence detection. Applying them would put the state
-machine in an incorrect state with no rollback mechanism. The recovering
-node instead waits for the leader to provide the authoritative HW via
-Fetch responses, then applies entries `[old_HW, new_HW)` through the
-standard three-phase commit notification (§4.1). This is
-**safety-critical**: premature replay could violate state machine safety
-(Raft invariant 5).
-
-#### Divergence 9 — `Listener` trait: `handle_load_snapshot` signature
-
-| Document | Statement | Section |
-|----------|-----------|---------|
-| **Tech spec** | `handle_load_snapshot(reader)` — takes a `SnapshotReader`. | §2.1.5 |
-| **This architecture** | `handle_load_snapshot(&mut self, reader: SnapshotReader)` — same signature. | §4.1 |
-| **Impl plan** | Follows this architecture. | Stage 1.6 |
-
-**Canonical resolution:** Aligned across all documents. No conflict.
-
-### 7.3 Alignment Status: `e2e-scenarios.md`
-
-The e2e scenarios document is **partially aligned** with this
-architecture. The following points are consistent:
-
-- Exclusive HW semantics (§3.1).
-- RPC names, role names, observer classification.
-- Bootstrap HW math: `sorted desc [2, 2, 0] → index 1 → HW = 2`.
-- Pull-based Fetch replication model, divergence detection, snapshot transfer.
-- Single-change membership invariant, observer promotion flow.
-- Check Quorum step-down, Pre-Vote protocol, persistence/crash recovery.
-
-The following points in the e2e-scenarios document **contradict** this
-architecture and must be updated (see §7.4 for specific changes):
-
-| e2e-scenarios claim | Architecture canonical design | Divergence |
-|---------------------|-------------------------------|---------------|
-| Four-phase commit notification (with `DeferredReadQueue::drain` as step 4) | **Three-phase** commit notification: (1) `StateMachine::apply`, (2) `Listener::handle_commit`, (3) `DeferredCompletionQueue::complete`. No `DeferredReadQueue` exists (§4.1, Divergence 3 resolution). | D3 |
-| `read() → S::ReadResult` via `StateMachine::query()` (leader-only, linearizable) | `read() → Result<ConsensusState>` — local, non-linearizable snapshot of protocol metadata. Callable on any node. No `query()` method on `StateMachine`. No `DeferredReadQueue`. (§5.11, Divergence 4 resolution). | D4 |
-| `StateMachine` trait has `type ReadResult` and `fn query(&self)` | `StateMachine` trait has only `apply`, `snapshot`, `restore` — no `query()`, no associated type (§4.1, Divergence 4 resolution). | D4 |
-| Protocol metadata available only via `RaftNode::metrics()`, not `read()` | `read()` returns protocol metadata (`ConsensusState`: term, role, leader_id, HW, voter set). `metrics()` returns observability counters (election latency, append rate, commit latency). The two do not overlap (§5.11, §6.4). | D4 |
-| `read()` is leader-only; followers return `Err(NotLeader)` | `read()` is callable on **any node** — leader, follower, candidate, or unattached. It returns local metadata that may be stale (§5.11). | D4 |
-
-### 7.4 Required Sibling-Doc Updates
-
-The following changes are required in sibling documents to align with
-the canonical resolutions in §7.2. Each entry names the exact location
-and the required change.
-
-#### Implementation plan updates
-
-| Target | Current | Required change | Divergence |
-|--------|---------|-----------------|------------|
-| **Stage 1.4** — `LogStore` method receivers | `append(&mut self)`, `truncate_suffix(&mut self)`, `truncate_prefix(&mut self)` | All methods take `&self` with interior mutability (`Sync` bound); see architecture §4.1 | D5 |
-
-**Note:** The implementation plan is already aligned with this
-architecture on all other divergences. It uses three-phase commit
-notification (aligned with D3 resolution), `read() → Result<ConsensusState>`
-returning protocol metadata (aligned with D4 resolution), and
-`StateMachine` with `apply`, `snapshot`, `restore` only — no `query()`
-method, no `ReadResult` associated type (aligned with D4 resolution).
-No changes are required for D3 or D4 in the implementation plan.
-
-#### E2e-scenarios updates
-
-The e2e-scenarios document's **Feature: Client Interaction** section
-adopted a prior iteration's design that has been superseded. The
-following corrections are required to align with the canonical
-resolutions in §7.2 (Divergences 3 and 4):
-
-| Target | Current (stale) | Required change | Divergence |
-|--------|-----------------|-----------------|------------|
-| **Commit notification phases** | Four-phase commit with `DeferredReadQueue::drain` as step 4 | Three-phase commit notification: (1) `StateMachine::apply`, (2) `Listener::handle_commit`, (3) `DeferredCompletionQueue::complete`. Remove all references to `DeferredReadQueue`. | D3 |
-| **`read()` semantics** | `read() → S::ReadResult` via `StateMachine::query()`, leader-only, linearizable | `read() → Result<ConsensusState>` — local, non-linearizable snapshot of protocol metadata. Callable on any node. Remove `StateMachine::query()`, `S::ReadResult`, `DeferredReadQueue`. | D4 |
-| **`StateMachine` trait shape** | References `type ReadResult` and `fn query(&self)` | `StateMachine` has only `apply`, `snapshot`, `restore`. No `query()` method, no associated type. | D4 |
-| **Protocol metadata access** | Protocol metadata via `RaftNode::metrics()` only | `read()` returns protocol metadata (`ConsensusState`). `metrics()` returns observability counters (latencies, rates). Both exist; they do not overlap. | D4 |
-| **Read on follower** | `read()` on follower returns `Err(NotLeader)` | `read()` is callable on **any node**. Returns local `ConsensusState` that may be stale on a partitioned node. No `NotLeader` error for `read()`. | D4 |
-| **Partitioned leader read** | Leader serves reads via `StateMachine::query()` after check-quorum | After check-quorum step-down, `read()` still works (returns `ConsensusState` with `role = Follower`). No application-state reads via xraft. Applications build their own read-side state from `Listener::handle_commit` (§4.1). | D4 |
-
-#### Tech-spec clarifications
-
-| Target | Current | Suggested clarification | Divergence |
-|--------|---------|-------------------------|------------|
-| **§2.1.5** — `read()` signature | `read() → Result<State>` | Clarify to `read() → Result<ConsensusState>` — returns protocol metadata (term, role, leader_id, HW, voter set). Non-linearizable local snapshot, callable on any node. Does not read application state. | D4 |
-| **§2.2** — "Linearisable reads" out of scope | "Read-index or lease-based reads" | Aligned as stated: this architecture does not implement any linearizable-read mechanism. `read()` returns local protocol metadata with no linearizability guarantee. No change needed. | D4 |
-| **§4.4.1** — callback execution model | "application callbacks are staged and executed asynchronously outside the loop" | Callbacks (`StateMachine::apply`, `Listener::handle_commit`) are synchronous, in-process calls within the event loop, executed after state mutation but before `IoAction` dispatch. | D1 |
-| **§8 Glossary** — HW definition | "Entries at or below the HW are considered committed" (inclusive) | HW is an exclusive upper bound: entry at offset O is committed ⟺ `O < HW`. The committed set is identical; only the numeric convention differs (`HW_inclusive = HW_exclusive − 1`). | D2 |
+| Area | Canonical design (this architecture) | Historical divergence | Resolution |
+|------|--------------------------------------|----------------------|------------|
+| **Callback execution** | Synchronous, in-process calls within the event loop (§4.1). | Tech spec §4.4.1 previously said "asynchronously outside the loop." | Tech spec updated to synchronous model. |
+| **HW semantics** | Exclusive upper bound: `O < HW` (§3.1). | Tech spec §8 previously said "at or below the HW." | Tech spec glossary updated to exclusive definition. |
+| **`read()` return type** | `read() → Result<ConsensusState>` (§5.11). | Tech spec §2.1.5 previously said `read() → Result<State>` with vague semantics. | Tech spec updated to `ConsensusState` with explicit semantics. |
+| **`StateMachine::apply` signature** | `apply(&mut self, offset: u64, record: &AppRecord)` (§4.1). | Tech spec §2.1.5 previously omitted the `offset` parameter. | Tech spec updated to include `offset`. |
+| **`LogStore` receivers** | All methods take `&self` with interior mutability (§4.1). | Impl plan Stage 1.4 previously used `&mut self` for write methods. | Impl plan updated to `&self` with `Sync` bound. |
+| **Commit phases** | Three-phase: apply → handle_commit → complete (§4.1). | E2e scenarios previously used a four-phase model with `DeferredReadQueue::drain`. | E2e scenarios updated to three-phase model. |
+| **`read()` on follower** | Callable on any node, returns local `ConsensusState` (§5.11). | E2e scenarios previously returned `Err(NotLeader)` on followers. | E2e scenarios updated to any-node read. |
+| **`StateMachine` trait** | `apply`, `snapshot`, `restore` only — no `query()` (§4.1). | E2e scenarios previously referenced `query()` and `ReadResult`. | E2e scenarios updated to remove `query()` references. |
+| **Crash recovery replay** | No SM replay during recovery; HW from leader via Fetch (§5.10). | Tech spec §2.1.7 said "replaying log entries" — a compressed description. | Compatible: log is scanned for metadata only, not applied to SM. |
+| **`ClusterId` source** | Operator-generated, passed to `bootstrap()` (§5.9). | Tech spec §2.1.7 said "generated at bootstrap time" — ambiguous source. | Compatible: generated by operator at bootstrap time. |
