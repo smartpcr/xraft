@@ -61,9 +61,11 @@ executes those actions concurrently via the injected async trait objects
 (`LogStore`, `Transport`, `SnapshotIO`, `QuorumStateStore`, `Clock`). The
 event loop never opens files or sockets directly; all concrete external I/O
 is provided by the transport and storage crates at construction time.
-Application callbacks are not external I/O — they are trait-object calls
-that execute within the event loop's thread and always observe fully
-updated protocol state before any `IoAction` is dispatched. Incoming
+Application callbacks are not external I/O — they are synchronous,
+in-process method calls (statically dispatched when the generic type
+parameters are monomorphised) that execute within the event loop's thread
+and always observe fully updated protocol state before any `IoAction` is
+dispatched. Incoming
 proposals are staged in a `BatchAccumulator` and drained on each tick;
 client futures are parked in a `DeferredCompletionQueue` until the high
 watermark advances past their offset. This mirrors KRaft's
@@ -79,12 +81,16 @@ spurious elections.
 ### 2.1 Proposed `xraft-core` — Consensus Engine
 
 The central crate. Contains no direct I/O code — all storage and network
-operations are dispatched through injected async trait objects. The event
-loop `await`s trait methods but never opens files or sockets itself.
+operations are expressed as `IoAction` values produced by the event loop
+and executed by the `IoStage`, which calls the injected async trait objects
+(`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`, `Clock`). The
+event loop itself never opens files or sockets; it only mutates in-memory
+`ConsensusState`, invokes synchronous application callbacks (`StateMachine`,
+`Listener`), and emits `IoAction` batches.
 
 | Sub-component | Responsibility |
 |---------------|----------------|
-| **`RaftNode`** | Public API surface. Exposes `propose()`, `read()`, `bootstrap()`, and lifecycle methods. Owns the `EventLoop` and coordinates startup, shutdown, and crash recovery. Accepts a generic `StateMachine` type parameter (monomorphised at compile time). On construction, executes the recovery sequence (§5.10) before accepting any RPCs. |
+| **`RaftNode`** | Public API surface. Exposes `propose()`, `read()`, `bootstrap()`, and lifecycle methods. Owns the `EventLoop` and coordinates startup, shutdown, and crash recovery. Generic over two application-provided types: `S: StateMachine` and `L: Listener` (both monomorphised at compile time for zero-cost dispatch). I/O traits (`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`, `Clock`) are injected as trait objects (`Box<dyn ...>`) at construction time. On construction, executes the recovery sequence (§5.10) before accepting any RPCs. |
 | **`EventLoop`** | Single-threaded async loop that processes protocol state transitions without blocking on I/O. The loop drains an inbound message queue (`tokio::sync::mpsc`) and dispatches to the appropriate handler. **Processing order per message:** (1) The handler mutates `ConsensusState` (e.g., updating follower progress, recalculating HW on a Fetch request, or recording appended entries); (2) If the state change triggers application-visible effects — HW advancement, leadership change — the loop invokes callbacks in a fixed order: `StateMachine::apply` (one call per committed command entry), then `Listener::handle_commit` (one batch of committed `AppRecord` values), then `DeferredCompletionQueue::complete` (resolves client futures for committed offsets); (3) The handler collects `IoAction` values into an `IoActionBatch` (e.g., `SendRpc` for the Fetch response, `AppendLog` for newly staged entries); (4) The loop hands the batch to the `IoStage`, which executes storage and network operations concurrently; (5) The loop records I/O results (e.g., advancing the durable offset after `AppendLog` completes). Callbacks in step 2 are synchronous, in-process function calls — not external I/O — and always observe the fully updated protocol state before any IoAction is dispatched. This prevents slow `fsync` calls from delaying Fetch processing and triggering spurious elections. |
 | **`IoStage`** | Executes `IoAction` batches produced by the `EventLoop`. Each action is one of: `PersistQuorumState(QuorumState)`, `AppendLog(Vec<LogEntry>)`, `TruncateSuffix(u64)`, `TruncatePrefix(u64)`, `SendRpc(NodeId, RpcEnvelope)`, `SaveSnapshot(Snapshot)`. The `IoStage` calls the injected trait objects (`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`) concurrently via `tokio::join!` or `FuturesUnordered`. Storage operations complete with `fsync` before the loop processes the next message that depends on them. **Application callbacks** (`StateMachine::apply`, `Listener::handle_commit`, `Listener::handle_leader_change`) are NOT dispatched by the `IoStage` — they are invoked directly by the `EventLoop` during message processing, immediately after a state change triggers them (e.g., HW advancement during Fetch handling). This ensures callbacks execute synchronously within the event loop's single-threaded context and always see consistent, up-to-date protocol state. The event loop produces the `IoAction` batch *after* callbacks have been invoked, so the Fetch response sent via `IoStage` reflects the same HW that callbacks observed. |
 | **`BatchAccumulator`** | Stages incoming `propose()` calls into a batch buffer. On each event-loop tick (or when the batch is full), the accumulated entries are drained into a single `AppendLog` I/O action. This amortises `fsync` cost across multiple proposals (group commit). Analogous to KRaft's `BatchAccumulator`. |
@@ -319,18 +325,24 @@ enum IoAction {
     TruncatePrefix(u64)                 // truncate log up to offset (compaction)
     SendRpc(NodeId, RpcEnvelope)        // send message to peer
     SaveSnapshot(Snapshot)              // write snapshot atomically
-    NotifyListener(ListenerEvent)       // callback to application
 }
+// NOTE: Application callbacks (StateMachine::apply, Listener::handle_commit,
+// Listener::handle_leader_change) are NOT IoAction variants. They are
+// synchronous, in-process calls invoked directly by the EventLoop during
+// message processing — before the IoAction batch is produced. See §4.1.
 ```
 
 The event loop processes each inbound message (RPC, proposal, timer tick)
-and collects zero or more `IoAction` values into an `IoActionBatch`. After
-the message handler returns, the batch is handed to the `IoStage` for
-concurrent execution. The loop blocks on the `IoStage` result before
-processing the next message, ensuring that all I/O for a given message
-completes before state advances. This staging model keeps the consensus
-state machine purely synchronous while allowing I/O to be parallelised
-(e.g., `fsync` the log and send RPCs concurrently).
+in a strict sequence: (1) mutate `ConsensusState`; (2) invoke application
+callbacks synchronously if needed (see §4.1 three-phase commit notification);
+(3) collect zero or more `IoAction` values into an `IoActionBatch`. After
+callbacks and IoAction collection complete, the batch is handed to the
+`IoStage` for concurrent execution. The event loop `await`s the `IoStage`
+result before processing the next message, ensuring that all external I/O
+for a given message completes before state advances. This staging model
+keeps the consensus state machine and application callbacks purely
+synchronous while allowing external I/O to be parallelised (e.g., `fsync`
+the log and send RPCs concurrently).
 
 #### `AppRecord` and `AppSnapshot` (application-owned types)
 
@@ -489,6 +501,17 @@ default 256) to the byte position in the `.log` file for fast seeks.
 ## 4. Interfaces Between Components
 
 ### 4.1 Trait Definitions
+
+xraft defines two categories of traits with different dispatch models:
+
+| Category | Traits | Dispatch | Bounds | Caller |
+|----------|--------|----------|--------|--------|
+| **Application** (synchronous) | `StateMachine`, `Listener` | Static (generic type parameters on `RaftNode`, monomorphised) | `Send + 'static` | `EventLoop` — invoked synchronously during message processing, before `IoAction` batch is produced |
+| **I/O** (asynchronous) | `LogStore`, `Transport`, `SnapshotIO`, `QuorumStateStore`, `Clock` | Dynamic (injected as `Box<dyn ...>` trait objects) | `Send + Sync + 'static`, `#[async_trait]` | `IoStage` — invoked concurrently after the event loop produces an `IoAction` batch |
+
+This separation ensures that application callbacks always see consistent,
+fully-updated protocol state (they run inside the event loop before any I/O
+is dispatched), while external I/O is parallelised by the `IoStage`.
 
 #### `StateMachine` (application → core)
 
@@ -1747,12 +1770,19 @@ All crate names, trait definitions, and module structures below are
   `RemoveVoter`, `UpdateVoter`.
 - **Pull-based replication** per §3 Non-Goals item 2 — no `AppendEntries`.
 - **Serialisation** uses `serde` + `bincode` per §6 Key Design Decisions.
-- **State machine interface** is generic (monomorphised) per §6. The trait
+- **State machine interface** is generic (monomorphised) per §6:
+  `RaftNode<S: StateMachine, L: Listener>`. Both application traits use
+  synchronous methods (`fn`, not `async fn`) and are invoked directly by
+  the event loop — they are not external I/O. The `StateMachine` trait
   receives only `AppRecord` values; control records (`LeaderChangeMessage`,
   `VotersRecord`) are handled internally by xraft and never reach `apply`.
   This matches §2.1.1: "Control records are owned by xraft and are never
   exposed to the application's `StateMachine::apply`." Snapshots are split:
   `SnapshotMetadata` (consensus) and `AppSnapshot` (application).
+  I/O traits (`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`,
+  `Clock`) are injected as trait objects (`Box<dyn ...>`) and use
+  `#[async_trait]` — they are called exclusively by the `IoStage`, never
+  directly by the event loop.
 - **Segment-file log storage** per §6.
 - **I/O staging** per §4.4.1 — the event loop produces `IoAction` values
   and the `IoStage` executes them via injected trait objects for all
