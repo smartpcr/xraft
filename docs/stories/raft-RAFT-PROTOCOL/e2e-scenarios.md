@@ -829,10 +829,11 @@ Feature: Dynamic Quorum — Add Voter
     And the single-change invariant (architecture §5.5) is enforced even across leader transitions
     And the original VotersRecord must be committed or truncated before a new change is accepted
 
-  Scenario: AddVoter cannot commit when new node becomes unreachable
-    # Because HW advancement uses the NEW voter set, the new node's
-    # fetch_offset matters. If N4 becomes unreachable after AddVoter is appended
-    # but before commit, quorum of [N1, N2, N3, N4] may stall.
+  Scenario: AddVoter commits even when new node becomes unreachable (3 of 4 majority)
+    # Because HW advancement uses the NEW voter set [N1, N2, N3, N4],
+    # all four nodes' fetch_offsets count toward quorum. However, if
+    # N4 becomes unreachable, the remaining 3 nodes (N1 + N2 + N3)
+    # still form a majority of the 4-node set (3 of 4 ≥ ⌊4/2⌋ + 1 = 3).
     Given N4 is an Observer that was caught up (fetch_offset ≥ HW)
     When a client sends AddVoter for N4 to N1
     And N1 appends a VotersRecord [N1, N2, N3, N4]
@@ -1063,44 +1064,54 @@ Feature: Client Interaction
     When a client calls propose("set x=1") on N1
     Then N1 returns an error indicating no leader is available
 
-  Scenario: Read routes through the log on the leader
-    # Per tech spec §2.1.5: "Initial implementation routes reads through the log
-    # for safety." read() completes only after the leader has a committed
-    # current-term entry, confirming it is still the authoritative leader.
-    # A new leader always appends a LeaderChangeMessage (no-op) as its first
-    # entry (architecture doc §3.2); once this entry (or any subsequent
-    # current-term entry) is committed, the leader's authority is confirmed.
-    # Optimised read paths (read-index, lease-based) are out of scope (tech spec §2.2).
+  Scenario: Read returns consensus protocol state on the leader
+    # Per implementation plan Stage 5.3: read() -> Result<ConsensusState>.
+    # Returns a snapshot of the current committed protocol state (term, role,
+    # leader_id, high_watermark, voter_set). The HW reflects the latest
+    # HW-committed position in the log ("routes reads through the log for
+    # safety" — tech spec §2.1.5). The application accesses its own
+    # StateMachine state directly — not through read().
+    # Linearisable reads (read-index, lease-based) are out of scope (tech spec §2.2).
     Given N1 is Leader for term 1
-    And N1's LeaderChangeMessage for term 1 has been committed (HW > its offset)
-    And the StateMachine has applied all committed command entries (control records filtered)
+    And the cluster has committed entries up to HW = 10
     When a client calls read() on N1
-    Then the read() call confirms a current-term entry is committed (leadership proof)
-    And read() returns the current committed StateMachine state
-    And the returned state reflects all StateMachine::apply() calls up to the current HW
-    And consensus metadata (term, role, HW, voter_set) is accessible separately via RaftMetrics
+    Then read() returns a ConsensusState snapshot containing:
+      term = 1, role = Leader, leader_id = Some(N1),
+      high_watermark = 10, voter_set = {N1, N2, N3}
+    And the high_watermark is an exclusive upper bound (entries 0–9 are committed)
+    And the application reads its own StateMachine state directly (not via read())
+    And consensus metrics are also available separately via the RaftMetrics struct
 
-  Scenario: Read waits when no current-term entry is committed yet
-    # A new leader must commit at least one entry from its term to confirm
-    # authority. read() waits until the LeaderChangeMessage (or any current-term
-    # entry) is committed before returning state.
+  Scenario: Read returns immediately even before current-term entry commits
+    # read() returns the current ConsensusState snapshot immediately — it does
+    # not block waiting for a committed current-term entry. The returned HW
+    # may reflect the previous term's committed position until the new leader's
+    # LeaderChangeMessage is committed and HW advances.
+    # Linearisable reads (which would require leadership proof) are out of scope.
     Given N1 just won election for term 2 and appended a LeaderChangeMessage
     And the LeaderChangeMessage has NOT yet been committed (followers have not fetched it)
+    And HW is still at the previous term's committed position (e.g., HW = 5)
     When a client calls read() on N1
-    Then the read future is pending (waiting for a current-term entry to commit)
-    When followers Fetch the LeaderChangeMessage and HW advances past its offset
-    Then the read future resolves with the current committed StateMachine state
+    Then read() returns immediately with ConsensusState:
+      term = 2, role = Leader, leader_id = Some(N1), high_watermark = 5
+    And the client can observe that HW has not yet advanced (no current-term commit)
+    When followers Fetch the LeaderChangeMessage and HW advances to 6
+    And the client calls read() again on N1
+    Then read() returns ConsensusState with high_watermark = 6
 
-  Scenario: Read rejected on follower — only leader can service reads
-    # Because read() routes through the log (requires a committed current-term
-    # entry as leadership proof — tech spec §2.1.5), only the leader can
-    # service read() calls. Followers return an error with leader redirection.
-    Given N1 is Leader for term 1
-    And N2 is a Follower
+  Scenario: Read on follower returns follower's local consensus state
+    # read() returns the local ConsensusState on any node — leader or follower.
+    # A follower's view may be stale (HW lags behind the leader's HW until
+    # the next Fetch response arrives). The application checks the role field
+    # to determine if this node is the leader.
+    # Per implementation plan Stage 5.3: read() is not leader-only.
+    Given N1 is Leader for term 1 with HW = 10
+    And N2 is a Follower whose last Fetch response updated its HW to 8
     When a client calls read() on N2
-    Then N2 returns an error indicating it is not the leader
-    And the error includes the current leader's identity (N1)
-    And the client should redirect the read() call to N1
+    Then read() returns ConsensusState with:
+      term = 1, role = Follower, leader_id = Some(N1), high_watermark = 8
+    And the client can see N2 is a Follower (not the leader)
+    And the client can decide to redirect proposals to N1 based on the leader_id field
 
   Scenario: At-least-once semantics — duplicate proposal after leader failover
     Given a client proposes command "set x=1" to N1 (Leader)
@@ -1113,13 +1124,20 @@ Feature: Client Interaction
     And xraft does NOT perform built-in deduplication
     And it is the application's responsibility to make commands idempotent
 
-  Scenario: Read fails during leader failover
-    Given a client calls read() on N1 (Leader for term 1)
-    And the read is pending (waiting for leadership confirmation via a committed current-term entry)
-    When N1 crashes before the read completes
-    And N2 becomes the new Leader for term 2
-    Then N1's read future never resolves (connection lost)
-    And the client retries read() against the new leader N2
+  Scenario: Read returns stale state during network partition
+    # read() is non-blocking and returns immediately. During a partition,
+    # a client may get stale ConsensusState from the old leader (which
+    # still believes it is the leader until check-quorum fires).
+    Given N1 is Leader for term 1 with HW = 10
+    When N1 becomes partitioned from N2 and N3
+    And N2 wins election for term 2 and becomes the new Leader
+    And a client calls read() on N1 (which has not yet stepped down)
+    Then read() returns ConsensusState with term = 1, role = Leader, leader_id = Some(N1)
+    And this state is stale (N1 is no longer the true leader but does not know yet)
+    When N1's check-quorum timer fires and N1 steps down to Follower
+    And the client calls read() on N1 again
+    Then read() returns ConsensusState with role = Follower
+    And the client detects the leadership change and contacts N2
 
   Scenario: Application-level dedup via request IDs (out of xraft scope)
     Given the application wraps commands with unique request IDs
