@@ -1,0 +1,21 @@
+[package]
+name = "xraft-transport"
+edition.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xraft-core = { path = "../xraft-core" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+bytes = "1"
+tracing = "0.1"
+async-trait = "0.1"
+rand = "0.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+uuid = { version = "1" }
