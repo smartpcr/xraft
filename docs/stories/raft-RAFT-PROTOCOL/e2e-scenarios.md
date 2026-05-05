@@ -371,24 +371,32 @@ Feature: Log Divergence and Truncation
     Given a 3-node cluster [N1, N2, N3]
 
   Scenario: Follower truncates divergent entries on DivergingEpoch
-    Given N1 was Leader for term 1 and appended entries at offsets 1–5
-    And N2 replicated entries 1–3 but N1 crashed before entries 4–5 were committed
+    Given N1 was Leader for term 1 and appended entries at offsets 0–5
+    And N2 replicated entries 0–3 but N1 crashed before entries 4–5 were committed
     And N3 becomes Leader for term 2 and appends new entries at offsets 4–6
-    When N2 sends a Fetch RPC to N3 (new leader)
-    And N3 detects that N2's entry at offset 4 has term 1 instead of term 2
-    Then N3 responds with DivergingEpoch indicating the divergence point
-    And N2 truncates its log from offset 4 onward
-    And N2 Fetches the correct entries at offsets 4–6 from N3
+    And N3's leader-epoch-checkpoint maps term 1 → start 0 and term 2 → start 4
+    When N2 sends a Fetch RPC to N3 with last_fetched_epoch=1 and fetch_offset=4
+    Then N3 checks its leader-epoch-checkpoint for epoch 1
+    And N3 sees epoch 1 ended at offset 4 (term 2 starts at 4)
+    And N2's fetch_offset (4) does not exceed the epoch boundary so no divergence on epoch
+    And N3 responds with entries starting at offset 4 from term 2
+    And N2 receives entries at offsets 4–6 from term 2
+    And N2 truncates its divergent entry at offset 4 (term 1) via suffix truncation
+    And N2 appends the leader's entries at offsets 4–6 (term 2)
 
   Scenario: Multiple Fetch rounds to resolve deep divergence
-    Given N2 has entries at offsets 1–10 from terms [1,1,1,2,2,2,3,3,3,3]
-    And the new leader N3 has entries at offsets 1–8 from terms [1,1,1,2,2,2,4,4]
-    When N2 sends a Fetch RPC to N3
-    Then N3 responds with DivergingEpoch for term 3 (N2's entries at offsets 7–10)
-    And N2 truncates offsets 7–10
-    When N2 sends another Fetch RPC
-    Then N3 responds with entries at offsets 7–8 from term 4
-    And N2's log now matches the leader's
+    Given N2 has entries at offsets 0–10 from terms [1,1,1,1,2,2,2,3,3,3,3]
+    And the new leader N3 has entries at offsets 0–8 from terms [1,1,1,1,2,2,2,4,4]
+    And N3's leader-epoch-checkpoint maps term 1→0, term 2→4, term 4→7
+    When N2 sends a Fetch RPC to N3 with last_fetched_epoch=3 and fetch_offset=11
+    Then N3 has no entry for epoch 3 in its checkpoint (epoch 3 never existed on leader)
+    And N3 finds the next lower epoch: epoch 2 ended at offset 7 (term 4 starts at 7)
+    And N3 responds with DivergingEpoch { epoch: 3, end_offset: 7 }
+    And N2 truncates its log from offset 7 onward (discards offsets 7–10)
+    When N2 sends another Fetch RPC with last_fetched_epoch=2 and fetch_offset=7
+    Then N3 checks epoch 2: it ended at offset 7 on the leader; N2's fetch_offset is 7 — no divergence
+    And N3 responds with entries at offsets 7–8 from term 4
+    And N2 appends entries 7–8 and its log now matches the leader's
 
   Scenario: Leader validates Fetch against leader-epoch-checkpoint
     Given N1 is Leader for term 5
@@ -539,12 +547,12 @@ Feature: Log Compaction and Snapshots
     Given N1 has committed entries at offsets 0–100
     And N1's state machine has applied all entries up to offset 100
     When the snapshot threshold is reached (e.g., every 100 entries)
-    Then N1 writes a snapshot to stable storage containing:
-      | Field            | Value                       |
-      | last_included_offset | 100                         |
-      | last_included_term | 1                           |
-      | voterSet         | [N1, N2, N3]                |
-      | stateMachineData | <serialised state at offset 100> |
+    Then N1 writes a snapshot to stable storage with SnapshotMetadata and AppSnapshot:
+      | Field                        | Value                                              |
+      | metadata.last_included_offset | 100                                               |
+      | metadata.last_included_term   | 1                                                 |
+      | metadata.voters              | [N1, N2, N3]                                       |
+      | app_snapshot.data            | StateMachine::snapshot() return value (opaque bytes)|
     And N1 performs prefix truncation of entries 0–100 via LogStore::truncate_prefix
     And N1's log start offset (LSO) advances to 101
     # Prefix truncation is a safe storage operation on committed entries
@@ -665,8 +673,16 @@ Feature: Cluster Bootstrap
     Then N1 appends a LeaderChangeMessage (no-op) at offset 0, term 1
     And N1 appends a VotersRecord control entry at offset 1, term 1
       with voter set [N1, N2, N3]
-    When both entries are committed (HW advances to 2; offsets 0–1 committed)
-    Then the cluster is fully bootstrapped
+    And N1's log_end_offset is 2
+    # Two-round visibility: followers must Fetch and then report back
+    When N2 sends a Fetch RPC with fetch_offset 0
+    Then N1 responds with entries [0, 1] and current HW
+    When N2 sends a Fetch RPC with fetch_offset 2 (N2 now has entries [0, 2))
+    Then N1 records N2's fetch_offset as 2
+    And N1 recalculates HW: sorted desc [N1=2, N2=2, N3=0] → index 1 → 2
+    And N1 advances HW to 2 (offsets 0 and 1 committed: 0 < 2 ✓, 1 < 2 ✓)
+    And the VotersRecord at offset 1 is committed
+    And the cluster is fully bootstrapped
     And subsequent membership changes use AddVoter / RemoveVoter RPCs
 
   Scenario: Node reads quorum-state file on startup
@@ -871,23 +887,24 @@ Feature: Client Interaction
     When a client calls propose("set x=1") on N1
     Then N1 returns an error indicating no leader is available
 
-  Scenario: Read returns current committed state via log routing
+  Scenario: Read returns current committed state machine state
     Given N1 is Leader for term 1 with high watermark 11 (offsets 0–10 committed)
-    And the application state machine has applied all committed command entries
+    And the StateMachine has applied all committed command entries (control records filtered)
     When a client calls read() on N1
-    Then read() routes through the log for safety (per tech spec §2.1.5)
-    And the result contains the application's committed state machine state
-    And the state reflects all applied command entries through offset 10
+    Then read() returns the StateMachine's current state (the result of all apply() calls through HW − 1 = offset 10)
+    And reads are NOT linearisable (per tech spec §2.2 — linearisable reads are out of scope)
+    And the initial implementation routes reads through the committed log for safety
     And consensus metadata (term, role, HW, voter_set) is accessible separately via metrics
-    And linearisable reads are out of scope for the initial implementation (per tech spec §2.2)
 
-  Scenario: Read on a follower returns locally committed state
+  Scenario: Read on a follower returns state based on local HW
     Given N2 is a Follower with currentTerm 1 and local HW 9
-    And the leader's HW is 11 (N2 has not yet received the latest HW)
+    And the leader's HW is 11 (N2 has not yet received the latest HW via Fetch)
+    And N2's StateMachine has applied all committed command entries through offset 8 (HW − 1 = 8)
     When a client calls read() on N2
-    Then the result contains the state machine state through N2's local HW (offset 8 = last committed)
-    And the state may lag behind the leader's because read() returns state based on local HW
-    And linearisable reads are out of scope (per tech spec §2.2)
+    Then read() returns N2's StateMachine state reflecting entries applied through offset 8
+    And the result may lag behind the leader because N2's local HW (9) is behind the leader's HW (11)
+    And this is expected: linearisable reads are out of scope (per tech spec §2.2)
+    And N2 will catch up on the next Fetch cycle
 
   Scenario: At-least-once semantics — duplicate proposal after leader failover
     Given a client proposes command "set x=1" to N1 (Leader)
