@@ -50,9 +50,10 @@
 11. [Feature: Dynamic Quorum — Add Voter](#feature-dynamic-quorum--add-voter)
 12. [Feature: Dynamic Quorum — Remove Voter](#feature-dynamic-quorum--remove-voter)
 13. [Feature: Dynamic Quorum — Observer Promotion](#feature-dynamic-quorum--observer-promotion)
-14. [Feature: Client Interaction](#feature-client-interaction)
-15. [Feature: Safety Invariants](#feature-safety-invariants)
-16. [Feature: Observability and Metrics](#feature-observability-and-metrics)
+14. [Feature: Identity and Fencing](#feature-identity-and-fencing)
+15. [Feature: Client Interaction](#feature-client-interaction)
+16. [Feature: Safety Invariants](#feature-safety-invariants)
+17. [Feature: Observability and Metrics](#feature-observability-and-metrics)
 
 ---
 
@@ -791,6 +792,26 @@ Feature: Dynamic Quorum — Add Voter
     Then N1 rejects the AddVoter because N4 is not caught up
     And the rejection prevents an availability gap where N4's vote
       would be needed but N4 cannot meaningfully participate
+
+  Scenario: Uncommitted AddVoter VotersRecord lost on leader crash
+    Given a client sends AddVoter for N4 to N1
+    And N1 appends a VotersRecord [N1, N2, N3, N4] at offset 20
+    And the VotersRecord has NOT yet been committed (HW < 21)
+    When N1 crashes before a majority replicates the VotersRecord
+    And N2 wins election for term 2
+    Then N2's log may or may not contain the uncommitted VotersRecord
+    And if present, N2 does not treat it as effective (uncommitted VotersRecords do not change the active voter set)
+    And elections and quorum calculations continue using the last committed voter set [N1, N2, N3]
+    And the membership change must be re-submitted to the new leader
+
+  Scenario: Single-change invariant holds after failover with uncommitted VotersRecord
+    Given an AddVoter for N4 was in progress on N1 (uncommitted VotersRecord in log)
+    And N1 crashes and N2 becomes Leader for term 2
+    And N2's log still contains the uncommitted VotersRecord from term 1
+    When a client sends another AddVoter for N5 to N2
+    Then N2 rejects the request because an uncommitted VotersRecord exists in its log
+    And the single-change invariant (architecture §5.5) is enforced even across leader transitions
+    And the original VotersRecord must be committed or truncated before a new change is accepted
 ```
 
 ---
@@ -842,6 +863,22 @@ Feature: Dynamic Quorum — Remove Voter
     When the VotersRecord is committed (by the current voter set)
     Then all nodes update N3's address in their voter configuration
     And N3 remains a voting member with unchanged voting rights
+
+  Scenario: Removed node transitions to Unattached after learning removal
+    Given N3 has been removed via a committed VotersRecord [N1, N2]
+    When N3 fetches and applies the VotersRecord that excludes it
+    Then N3 transitions to Unattached state (per architecture §5.6)
+    And N3 stops participating in elections
+    And N3 does not send Vote RPCs
+    And N3 is no longer counted for quorum calculations by any node
+
+  Scenario: RemoveVoter commits with the new voter set for quorum
+    When a client sends RemoveVoter for N3 to N1
+    And N1 appends a VotersRecord with voter set [N1, N2]
+    Then HW advancement for this VotersRecord requires a majority of the NEW voter set [N1, N2]
+    And N3's fetch_offset is NOT counted toward quorum for this record
+    And once both N1 and N2 have the VotersRecord at or past their fetch_offset, HW advances
+    And the VotersRecord is committed and N3 is removed
 ```
 
 ---
@@ -884,6 +921,68 @@ Feature: Dynamic Quorum — Observer Promotion
 
 ---
 
+## Feature: Identity and Fencing
+
+```gherkin
+Feature: Identity and Fencing
+  As a Raft cluster
+  I need every RPC envelope to carry cluster_id and leader_epoch
+  So that cross-cluster contamination and stale-leader messages are rejected
+  # Per architecture doc §6.2 and tech spec §2.1.4:
+  # Every RpcEnvelope carries { cluster_id, leader_epoch, source, payload }.
+  # Receivers reject messages with mismatched cluster_id or stale leader_epoch.
+
+  Background:
+    Given a 3-node cluster [N1, N2, N3] with cluster_id "cluster-abc-123"
+    And N1 is Leader for term 3 (leader_epoch = 3)
+
+  Scenario: Cluster ID mismatch rejects Fetch RPC
+    When a node from a different cluster sends a Fetch RPC to N1
+    And the RpcEnvelope carries cluster_id "cluster-xyz-999"
+    Then N1 rejects the Fetch due to cluster_id mismatch (per architecture §6.2)
+    And the rejection prevents cross-cluster contamination
+    And N1 does not update any replication state for the sender
+
+  Scenario: Cluster ID mismatch rejects Vote RPC
+    When a node from a different cluster sends a Vote RPC to N2
+    And the RpcEnvelope carries cluster_id "cluster-xyz-999"
+    Then N2 rejects the Vote due to cluster_id mismatch
+    And N2 does not update its currentTerm or votedFor
+    And no election is disrupted
+
+  Scenario: Stale leader_epoch fences messages from deposed leader
+    Given N1 was Leader for term 3 (leader_epoch = 3)
+    And N2 has been elected Leader for term 4 (leader_epoch = 4)
+    And N3 has received a Fetch response from N2 with leader_epoch = 4
+    When N1 (deposed, unaware of term 4) sends a Fetch response to N3
+    And the RpcEnvelope carries leader_epoch = 3
+    Then N3 rejects the message because leader_epoch 3 is stale (< N3's known epoch 4)
+    And N3 does not apply any entries from the stale response
+    And this prevents a deposed leader from corrupting follower state
+
+  Scenario: Newer leader_epoch supersedes older epoch on receiver
+    Given N3 has been communicating with N1 (leader_epoch = 3)
+    When N2 wins election for term 4 and sends a Fetch response to N3
+    And the RpcEnvelope carries leader_epoch = 4
+    Then N3 accepts the message (leader_epoch 4 > N3's known epoch 3)
+    And N3 updates its known leader_epoch to 4
+    And subsequent messages from N1 with leader_epoch = 3 are rejected
+
+  Scenario: Valid cluster_id and leader_epoch accepted normally
+    When N2 sends a Fetch RPC to N1 with matching cluster_id "cluster-abc-123"
+    And the RpcEnvelope carries leader_epoch = 3 (current epoch)
+    Then N1 accepts and processes the Fetch RPC normally
+    And no fencing rejection occurs
+
+  Scenario: FetchSnapshot with cluster_id mismatch rejected
+    Given N4 is a new node from a different cluster (cluster_id "cluster-other")
+    When N4 sends a FetchSnapshot RPC to N1 with cluster_id "cluster-other"
+    Then N1 rejects the FetchSnapshot due to cluster_id mismatch
+    And no snapshot data is transferred to N4
+```
+
+---
+
 ## Feature: Client Interaction
 
 ```gherkin
@@ -921,22 +1020,24 @@ Feature: Client Interaction
     When a client calls propose("set x=1") on N1
     Then N1 returns an error indicating no leader is available
 
-  Scenario: Read returns current committed state machine state (leader-only)
+  Scenario: Read returns node-local committed state on any node
     Given N1 is Leader for term 1 with high watermark 11 (offsets 0–10 committed)
     And the StateMachine has applied all committed command entries (control records filtered)
     When a client calls read() on N1
-    Then read() routes through the committed log for safety (per tech spec §2.1.5)
-    And read() returns the StateMachine's current state (the result of all apply() calls through HW − 1 = offset 10)
+    Then read() returns the node-local committed/applied state
+    And the returned state reflects all StateMachine::apply() calls through HW − 1 = offset 10
+    And read() is available on any RaftNode — not restricted to the leader (per tech spec §2.1.5)
     And reads are NOT linearisable (per tech spec §2.2 — linearisable reads are out of scope)
     And consensus metadata (term, role, HW, voter_set) is accessible separately via RaftMetrics
 
-  Scenario: Read rejected on follower (leader-only API)
-    Given N2 is a Follower with currentTerm 1
-    And N1 is the current Leader
+  Scenario: Read on follower returns potentially stale state
+    Given N1 is Leader for term 1 with high watermark 11 (offsets 0–10 committed)
+    And N2 is a Follower whose local HW is 8 (it has applied entries through offset 7)
     When a client calls read() on N2
-    Then N2 returns Err(NotLeader { leader_id: N1 })
-    And the client must redirect to the leader (N1) to perform the read
-    And this matches propose() semantics — both read() and propose() are leader-only
+    Then read() returns N2's node-local committed/applied state (through offset 7)
+    And this state may lag behind the leader's state (leader HW = 11, follower HW = 8)
+    And the read is still valid — it reflects a consistent prefix of committed entries
+    And to get more up-to-date state, the client may call read() on the leader instead
 
   Scenario: At-least-once semantics — duplicate proposal after leader failover
     Given a client proposes command "set x=1" to N1 (Leader)
@@ -1056,29 +1157,46 @@ Feature: Observability and Metrics
   I need access to key Raft metrics
   So that I can monitor cluster health and diagnose issues
 
+  # RaftMetrics struct fields (per architecture doc §6.4):
+  #   current_leader: Option<NodeId>    — exposes the tech spec "current-leader" metric
+  #   current_epoch: u64                — exposes "current-epoch"
+  #   election_latency_avg_ms: f64      — exposes "election-latency-avg"
+  #   append_records_rate: f64           — exposes "append-records-rate"
+  #   commit_latency_avg_ms: f64         — exposes "commit-latency-avg"
+  #   high_watermark, log_end_offset, log_start_offset, role, voter_count, observer_count
+
   Background:
     Given a 3-node cluster [N1, N2, N3]
     And N1 is Leader for term 2
 
-  Scenario: Current leader metric is accurate
-    When querying RaftMetrics on any node
-    Then the "current_leader" field returns Some(N1's node ID)
-    And the "current_epoch" field returns 2
+  Scenario: Current leader metric is accurate on leader
+    When querying RaftMetrics on N1 (the leader)
+    Then RaftMetrics.current_leader returns Some(N1's node ID)
+    And RaftMetrics.current_epoch returns 2
+
+  Scenario: Current leader metric on follower reflects last known leader
+    Given N2 has recently received a Fetch response from N1
+    When querying RaftMetrics on N2
+    Then RaftMetrics.current_leader returns Some(N1's node ID)
+    And RaftMetrics.current_epoch returns 2
+    # Note: a follower learns the leader identity from Fetch responses.
+    # A follower that has not yet received a Fetch response may return None.
 
   Scenario: Leader metric updates after election
     Given N1 crashes
     And N2 wins election for term 3
     When querying RaftMetrics on N2
-    Then "current_leader" returns Some(N2's node ID)
-    And "current_epoch" returns 3
-    When querying RaftMetrics on N3
-    Then "current_leader" returns Some(N2's node ID)
-    And "current_epoch" returns 3
+    Then RaftMetrics.current_leader returns Some(N2's node ID)
+    And RaftMetrics.current_epoch returns 3
+    When N3 receives a Fetch response from N2 (the new leader)
+    And querying RaftMetrics on N3
+    Then RaftMetrics.current_leader returns Some(N2's node ID)
+    And RaftMetrics.current_epoch returns 3
 
   Scenario: Unknown leader metric during election
     Given no leader exists (election in progress)
     When querying RaftMetrics on any node
-    Then "current_leader" returns None (per architecture doc §6.4: current_leader is Option<NodeId>)
+    Then RaftMetrics.current_leader returns None (per architecture doc §6.4: Option<NodeId>)
 
   Scenario: Election latency metric is recorded
     Given a leader election completes in 45ms
@@ -1114,13 +1232,13 @@ Feature: Observability and Metrics
 | §2.1.2 Snapshotting | Log Compaction and Snapshots | 4 |
 | §2.1.2 Snapshot transfer | Snapshot Transfer | 4 |
 | §2.1.2 Log truncation / Divergence | Log Divergence and Truncation | 4 |
-| §2.1.3 Single-node changes | Add Voter / Remove Voter / UpdateVoter | 9 |
+| §2.1.3 Single-node changes | Add Voter / Remove Voter / UpdateVoter | 13 |
 | §2.1.3 Non-voting members (observers) | Observer Promotion | 3 |
 | §2.1.3 Leader step-down | Remove Voter (scenario 2) | — |
-| §2.1.4 Identity & fencing | Pull-Based Log Replication (scenarios 5–7) | — |
+| §2.1.4 Identity & fencing | Identity and Fencing | 6 |
 | §2.1.4 Divergence detection | Log Divergence and Truncation | — |
 | §2.1.5 Library API | Client Interaction | 9 |
-| §2.1.6 Metrics | Observability and Metrics | 6 |
+| §2.1.6 Metrics | Observability and Metrics | 7 |
 | §2.1.6 Deterministic simulation | Safety Invariants (scenario 6) | — |
 | §2.1.7 Bootstrap & recovery | Cluster Bootstrap | 5 |
-| **Total** | **16 Features** | **87 Scenarios** |
+| **Total** | **17 Features** | **98 Scenarios** |

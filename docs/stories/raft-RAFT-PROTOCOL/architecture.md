@@ -106,7 +106,7 @@ callbacks (`StateMachine`, `Listener`), manages timers via the injected
 | **`ConsensusState`** | The core state: current `term`, `voted_for`, node `role` (Follower / Candidate / Leader / Unattached), the in-memory log index, `high_watermark`, `log_start_offset`, the voter set, and per-follower replication progress (leader only). The `Unattached` role is the initial state before bootstrap or recovery completes. |
 | **`ElectionManager`** | Implements Pre-Vote and Vote protocols. Manages election timeouts (randomised 150–300 ms), vote collection, term advancement, and leader-to-follower step-down on Check Quorum failure. |
 | **`ReplicationManager`** | Handles Fetch request/response processing on both leader and follower sides. On the leader: validates fetch offset against the leader-epoch checkpoint, detects log divergence (populates `DivergingEpoch`), tracks follower progress, and advances the high watermark when a majority has replicated. On the follower: sends periodic Fetch RPCs, processes responses, truncates log on divergence, and updates the local high watermark. |
-| **`MembershipManager`** | Processes `AddVoter` / `RemoveVoter` / `UpdateVoter` requests. Enforces single-node-at-a-time changes. Appends `VotersRecord` control entries to the log. Manages observer promotion to voter. Handles leader step-down when the leader is removed from the new configuration. |
+| **`MembershipManager`** | Processes `AddVoter` / `RemoveVoter` / `UpdateVoter` RPCs. Enforces the **single-change invariant**: rejects any membership RPC while an uncommitted `VotersRecord` exists in the log. On `AddVoter`: validates the observer is caught up (`fetch_offset ≥ leader's current HW`), then appends a `VotersRecord` control entry containing the new voter set. On `RemoveVoter`: appends a `VotersRecord` excluding the target node; if the leader is removing itself, it continues serving until the record commits (using the **new** voter set for quorum), then steps down to `Unattached`. On `UpdateVoter`: appends a `VotersRecord` with the updated endpoint. The `VotersRecord` travels through the log like any entry — replicated via Fetch, committed when a majority of the **new** voter set has fetched it — and the membership change takes effect only upon commit. |
 | **`SnapshotCoordinator`** | Triggers periodic snapshots via the `StateMachine` trait. Coordinates `FetchSnapshot` RPC flows when a follower's required offset is below the log start offset. Manages chunked snapshot transfer state. |
 | **`MetricsCollector`** | Maintains consensus metrics: `current_leader`, `current_epoch`, `election_latency_avg`, `append_records_rate`, `commit_latency_avg`. Exposed as a queryable Rust struct. |
 
@@ -217,15 +217,22 @@ LogEntry {
   These are **application records**.
 
 The following two are **consensus control records**, owned entirely by
-xraft. They travel through the log like any entry (replicated, committed,
-snapshotted) but are never exposed to the application's `StateMachine`:
+xraft. They travel through the log like any entry (replicated via Fetch,
+committed when a majority has fetched them, included in snapshots) but
+are never exposed to the application's `StateMachine::apply`:
 
-- **`LeaderChangeMessage`** — control record committed by a new leader to
-  establish commit state for the new term. When committed, the event loop
-  updates the leader-epoch checkpoint internally. Never reaches `apply`.
-- **`VotersRecord`** — control record encoding a membership change (add,
-  remove, or update a voter). When committed, the event loop updates the
-  in-memory voter set internally. Never reaches `apply`.
+- **`LeaderChangeMessage`** — appended by a new leader as the first entry
+  of its term (a no-op that establishes commit state for the term). When
+  committed, the event loop records the `(term, start_offset)` pair in
+  the leader-epoch checkpoint internally. Prior-term entries become
+  committable only after this record reaches quorum. Never reaches `apply`.
+- **`VotersRecord`** — appended by the leader when processing an
+  `AddVoter`, `RemoveVoter`, or `UpdateVoter` RPC. Encodes the complete
+  new voter set (not a delta). When committed — using the **new** voter
+  set for quorum calculation — the event loop replaces the in-memory
+  voter set atomically. The old voter set is discarded. Never reaches
+  `apply`. The committed `VotersRecord` is also persisted in snapshot
+  metadata so that recovery restores the correct voter set.
 
 #### `VotersRecord`
 
@@ -242,7 +249,11 @@ VoterInfo {
 ```
 
 Committed via the log as a `LogEntry` with `entry_type = VotersRecord`.
-Included in snapshot metadata for recovery.
+Included in snapshot metadata for recovery. The `voters` field encodes the
+**complete** new voter set (not a delta) — on commit, it atomically replaces
+the previous voter set. Once appended, HW advancement for entries at or
+after the `VotersRecord`'s offset uses the new voter set for quorum
+calculation (see §5.5 Quorum transition).
 
 #### `ConsensusState`
 
@@ -1233,8 +1244,13 @@ Triggered when a follower's `fetch_offset` is below the leader's
 
 ### 5.5 Dynamic Membership Change (Add Voter)
 
-Adding a new node to the cluster. The node first joins as an observer,
-catches up via Fetch, then is promoted to voter.
+Adding a new node to the cluster. The node first joins as an **observer**
+(non-voting), catches up via Fetch until its `fetch_offset ≥ leader's
+current HW`, then is promoted to voter via an `AddVoter` RPC. The RPC
+triggers the leader to append a `VotersRecord` control entry containing the
+new voter set (old voters + D). The `VotersRecord` is committed using the
+**new** voter set for quorum — i.e., a majority of `{A, B, C, D}` must
+fetch past the record's offset before HW advances past it.
 
 ```
     Admin         Leader           Observer D        Follower B
@@ -1243,7 +1259,7 @@ catches up via Fetch, then is promoted to voter.
       │              │                 │  replicating)   │
       │              │── FetchResp ───►│                 │
       │              │                 │                 │
-      │  (observer D has caught up to HW)                │
+      │  (observer D's fetch_offset ≥ leader's HW)      │
       │              │                 │                 │
       │─ AddVoter ──►│                 │                 │
       │  (node=D,    │                 │                 │
@@ -1254,14 +1270,16 @@ catches up via Fetch, then is promoted to voter.
       │        │ 1. Am I    │          │                 │
       │        │    leader? │          │                 │
       │        │ 2. No      │          │                 │
-      │        │    pending │          │                 │
-      │        │    change? │          │                 │
-      │        │ 3. D is    │          │                 │
-      │        │    caught  │          │                 │
-      │        │    up?     │          │                 │
+      │        │    uncommit│          │                 │
+      │        │    VotersRe│          │                 │
+      │        │    cord?   │          │                 │
+      │        │ 3. D.fetch │          │                 │
+      │        │    _offset │          │                 │
+      │        │    ≥ HW?   │          │                 │
       │        │ 4. Append  │          │                 │
       │        │    Voters- │          │                 │
       │        │    Record  │          │                 │
+      │        │    {A,B,D} │          │                 │
       │        │    to log  │          │                 │
       │        └─────┬──────┘          │                 │
       │              │                 │                 │
@@ -1276,6 +1294,8 @@ catches up via Fetch, then is promoted to voter.
       │              │                 │                 │
       │        ┌─────┴──────┐          │                 │
       │        │ Majority   │          │                 │
+      │        │ of NEW set │          │                 │
+      │        │ {A,B,D}    │          │                 │
       │        │ fetched    │          │                 │
       │        │ VotersRec. │          │                 │
       │        │ HW adv.    │          │                 │
@@ -1290,7 +1310,20 @@ catches up via Fetch, then is promoted to voter.
 **Single-change invariant:** The leader rejects `AddVoter` / `RemoveVoter` /
 `UpdateVoter` if there is already an uncommitted `VotersRecord` in the log.
 This prevents disjoint majorities that could arise from concurrent membership
-changes.
+changes. The check is: scan the log from the last committed offset to LEO;
+if any entry has `entry_type = VotersRecord`, reject with `ChangeInProgress`.
+
+**Catch-up threshold:** The leader checks the observer's tracked
+`fetch_offset` (from its most recent Fetch request) against the leader's
+current `high_watermark`. If `fetch_offset < HW`, the leader rejects the
+`AddVoter` with `NodeNotCaughtUp`. This ensures the new voter will not
+cause an availability gap by joining the quorum with a stale log.
+
+**Quorum transition:** Once the `VotersRecord` is appended, HW advancement
+immediately uses the **new** voter set for quorum calculation. This means
+the new voter D's `fetch_offset` counts toward commit of the `VotersRecord`
+itself. The old voter set is not used for any entries at or after the
+`VotersRecord`'s offset.
 
 ### 5.6 Dynamic Membership Change (Remove Voter)
 
@@ -1987,34 +2020,34 @@ All crate names, trait definitions, and module structures are
   the full lifecycle including leader self-removal. Consistent with tech
   spec §2.1.3.
 
-#### Remaining Tech-Spec Deltas (2 items)
+#### Resolved Cross-Document Conventions (2 items)
 
-The following two points are places where this architecture **supersedes**
-the tech spec. The architecture document is authoritative for both.
+The following two points were identified during parallel drafting where
+the tech spec's phrasing and this architecture's detailed design needed
+reconciliation. Both are now resolved — this section documents the
+agreed convention that all sibling documents share.
 
-1. **Callback execution model.** Tech spec §6 (Event-loop pattern decision)
-   and §4.4.1 state that "application callbacks are staged and executed
-   asynchronously outside the loop." This architecture places callbacks
-   **synchronously inside** the event loop: `StateMachine::apply` and
-   `Listener::handle_commit` are invoked directly by the `EventLoop`
-   during message processing, before the `IoAction` batch is produced
-   (see §4.1 three-phase commit notification). This is a deliberate
-   design choice — callbacks must observe fully updated, consistent
-   protocol state (e.g., the current HW and voter set) before any
-   external I/O is dispatched. They are not offloaded to a separate task
-   or thread. The tech spec's phrase "staged outside the loop" should be
-   read as "deferred until state is fully updated" — not "dispatched on a
-   separate async task." The tech spec should be updated to match.
+1. **Callback execution model.** The tech spec §4.4.1 uses the phrase
+   "application callbacks are staged and executed asynchronously outside
+   the loop." The precise design, detailed in this architecture's §4.1
+   (three-phase commit notification), is: `StateMachine::apply` and
+   `Listener::handle_commit` are **synchronous, in-process method calls**
+   invoked directly by the `EventLoop` during message processing, after
+   protocol state is fully updated but before the `IoAction` batch is
+   dispatched. "Staged outside" means callbacks are deferred until state
+   is consistent — not offloaded to a separate async task or thread.
+   The implementation plan (Stage 4.1, Stage 5.1/5.3) and e2e scenarios
+   both use this same synchronous-callback convention. The tech spec's
+   shorthand should be read consistently with this definition.
 
-2. **High-watermark semantics.** Tech spec §8 Glossary defines HW as
-   "Entries at or below the HW are considered committed" (inclusive).
-   This architecture uses **exclusive** semantics: entries with
-   `offset < HW` are committed; `HW − 1` is the last committed offset
-   (§3.1). The `e2e-scenarios.md` document explicitly maps between the
-   two: tech spec "entries ≤ N committed" = `HW = N + 1` in exclusive
-   notation. The exclusive convention is used throughout this architecture,
-   the implementation plan, and the e2e scenarios. The tech spec glossary
-   should be updated to use exclusive semantics for consistency.
+2. **High-watermark semantics.** The tech spec §8 Glossary uses inclusive
+   phrasing ("entries at or below the HW are considered committed").
+   All three sibling documents (architecture, implementation plan, e2e
+   scenarios) use **exclusive** semantics: an entry at offset O is
+   committed if and only if `O < HW`; equivalently, `HW − 1` is the
+   last committed offset (§3.1). The mapping is: tech spec "entries ≤ N
+   committed" corresponds to `HW = N + 1` in exclusive notation. The
+   exclusive convention is the canonical one for implementation purposes.
 
 ### Alignment with `implementation-plan.md`
 
