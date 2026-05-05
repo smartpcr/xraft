@@ -43,6 +43,22 @@ Each URL in the story description was reviewed for relevance and content:
 >   idiomatic Rust Raft API design.
 > These are used for cross-validation only; xraft is not a port of any of them.
 
+### 1.2 Current Repository State
+
+The `smartpcr/xraft` repository is **greenfield** as of this writing. The
+repository contains:
+
+```
+README.md          — "# xraft\nimplementation of raft protocol"
+docs/              — this document and sibling planning documents (in progress)
+```
+
+There is no Rust source code, no `Cargo.toml`, no existing crate structure,
+and no prior implementation to extend or refactor. All module names, crate
+boundaries, trait definitions, and API signatures described in this document
+are **proposed designs** for the initial implementation. They do not reference
+existing code.
+
 ---
 
 ## 2. Scope
@@ -79,7 +95,7 @@ implementation of the Raft protocol as described in the reference material.
 
 | Capability | Detail | Reference |
 |------------|--------|-----------|
-| **Single-node changes** | Add or remove one voter at a time to prevent disjoint majorities. Enforced by the leader. Analogous to KRaft's `AddRaftVoter` / `RemoveRaftVoter` / `UpdateRaftVoter` RPCs. | Red Hat article "Dynamic quorum" |
+| **Single-node changes** | Add or remove one voter at a time to prevent disjoint majorities. Enforced by the leader. xraft's RPCs: `AddVoter`, `RemoveVoter`, `UpdateVoter` (analogous to KRaft's `AddRaftVoter` / `RemoveRaftVoter` / `UpdateRaftVoter`). | Red Hat article "Dynamic quorum" |
 | **Voter records** | Membership changes committed via a control record in the log (analogous to KRaft's `VotersRecord`). The voter set is part of the snapshot for recovery. | Red Hat article "Dynamic quorum" — VotersRecord |
 | **Non-voting members (observers)** | New nodes join as observers (non-voting) until caught up with the leader, then promoted to voter. Observers replicate the log via `Fetch` but do not contribute to quorum. This avoids availability gaps when a new node has an empty log. | Red Hat article "Cluster scaling" |
 | **Leader step-down** | If the leader is removed from the new configuration, it continues managing the cluster until the voters-record commits or the epoch advances, then steps down. | Red Hat article "Dynamic quorum" |
@@ -88,7 +104,7 @@ implementation of the Raft protocol as described in the reference material.
 
 | Capability | Detail | Reference |
 |------------|--------|-----------|
-| **RPC framework** | Async message passing between nodes. Six RPC types: `Vote` (election), `Fetch` (log replication), `FetchSnapshot` (snapshot transfer), `AddVoter` / `RemoveVoter` / `UpdateVoter` (membership changes). Analogous to KRaft's `Vote`, `Fetch`, `FetchSnapshot`, `AddRaftVoter`, `RemoveRaftVoter`, and `UpdateRaftVoter`. | Red Hat article "Core RPCs" and "Dynamic quorum" |
+| **RPC framework** | Async message passing between nodes. Six RPC types defined by xraft: `Vote` (election), `Fetch` (log replication), `FetchSnapshot` (snapshot transfer), `AddVoter`, `RemoveVoter`, `UpdateVoter` (membership changes). These are xraft's names; the KRaft equivalents are `Vote`, `Fetch`, `FetchSnapshot`, `AddRaftVoter`, `RemoveRaftVoter`, and `UpdateRaftVoter` respectively. | Red Hat article "Core RPCs" and "Dynamic quorum" |
 | **Identity & fencing** | Every RPC includes `clusterId` and `currentLeaderEpoch` for identity verification and fencing of stale messages. | Red Hat article "Core RPCs" — "All KRaft RPC schemas include `clusterId` and `currentLeaderEpoch`" |
 | **Divergence detection** | `Fetch` responses include a `DivergingEpoch` tagged field when log inconsistency is detected. The follower truncates its log back to the diverging point. Multiple fetch rounds may be required in worst-case scenarios. | Red Hat article "Core RPCs" — DivergingEpoch |
 | **Leader-epoch checkpoint** | The leader validates fetch requests against its log using a leader-epoch checkpoint (cached in memory for efficiency). This enables fast divergence detection. | Red Hat article "Core RPCs" — `leader-epoch-checkpoint` |
@@ -102,17 +118,17 @@ implementation of the Raft protocol as described in the reference material.
 > follower-initiated. Membership-change RPCs (`AddVoter` / `RemoveVoter` /
 > `UpdateVoter`) are client-to-leader requests, not leader-to-follower pushes.
 
-#### 2.1.5 Library API
+#### 2.1.5 Library API (Proposed Design)
 
-xraft exposes a **Rust library API** for embedding into applications. This is
-the programmatic interface that application code links against — not a network
-service endpoint.
+xraft will expose a **Rust library API** for embedding into applications. The
+signatures below are the proposed initial design; they will be refined during
+implementation. This is a compile-time linked library, not a network service.
 
-| Capability | Detail |
-|------------|--------|
+| Capability | Proposed Signature |
+|------------|--------------------|
 | **`propose(command) → Future<Result>`** | Submit a command to the replicated log. Returns a future that resolves when the entry is committed (HW has advanced past it). |
 | **`read() → Result<State>`** | Read the current committed state. Initial implementation routes reads through the log for safety. |
-| **`RaftClient::Listener` equivalent** | A trait that applications implement to receive callbacks: `handle_commit(batch)`, `handle_load_snapshot(reader)`, `handle_leader_change(leader_id, term)`, `begin_shutdown()`. Modelled on KRaft's `RaftClient.Listener` interface. |
+| **Listener trait** | Applications implement callbacks: `handle_commit(batch)`, `handle_load_snapshot(reader)`, `handle_leader_change(leader_id, term)`, `begin_shutdown()`. Modelled on KRaft's `RaftClient.Listener` interface. |
 | **State machine trait** | `trait StateMachine { fn apply(&mut self, entry: &Entry) -> Result<()>; fn snapshot(&self) -> Result<Snapshot>; fn restore(&mut self, snapshot: Snapshot) -> Result<()>; }` — applications provide their own state machine. Generic (monomorphised at compile time) for zero-cost abstraction. |
 
 > **Scope boundary:** xraft provides the consensus library and test harness.
@@ -170,9 +186,9 @@ improve the system:
    are deferred until profiling justifies them.
 
 4. **Pluggable storage engines** — the initial implementation uses a single
-   segment-file-based storage backend (see §6, Log storage decision). A
-   trait-based storage abstraction exists for testability, but supporting
-   multiple production backends (RocksDB, sled) is not a goal.
+   segment-file-based storage backend (see §6, Log storage decision in Key
+   Design Decisions). A trait-based storage abstraction exists for testability,
+   but supporting multiple production backends (RocksDB, sled) is not a goal.
 
 5. **Language bindings** — no C FFI, Python, or other language wrappers. The
    library is Rust-native.
@@ -200,7 +216,7 @@ cannot be relaxed without changing the project's mandate.
 | **Durable persistence before ack** | Log entries and voting state must be `fsync`-ed to disk before any acknowledgement is sent to peers or clients. | Raft paper §5; Red Hat article "Safety rules" — persistence requirements. |
 | **Pull-based replication** | Log replication uses the pull-based (fetch) model where followers request entries from the leader. Push-based `AppendEntries` is not implemented. | Story description reference to KRaft; §3 Non-Goals item 2. |
 | **Timing invariant** | `broadcastTime << electionTimeout << avgTimeBetweenFailures`. | Raft paper §5.6. |
-| **Full production quality** | This is a complete, production-quality implementation — not a time-boxed spike or prototype. | Story description: "implement raft using rust" implies a complete implementation, not a spike. |
+| **Full production quality** | This is a complete, production-quality implementation — not a time-boxed spike or prototype. All features (election, replication, compaction, dynamic quorum) must be correct and tested. | Project requirement. |
 
 ### 4.3 Timing Parameters
 
@@ -239,7 +255,7 @@ warrants a different choice, but changing them requires explicit justification.
 | **`#[must_use]`** | Applied to all Result-returning public functions. | Prevents silent error swallowing. |
 | **Single-threaded event loop** | The core consensus state machine runs on a single-threaded event loop (as in KRaft's `KafkaRaftClient`). External I/O is dispatched to async tasks. | Eliminates concurrency bugs in the consensus core; matches KRaft's architecture. |
 | **Deterministic testing** | All time-dependent and I/O-dependent behaviour must be injectable for deterministic simulation (see §2.1.6). | Enables reproducible testing of edge cases that are impossible to trigger reliably with wall-clock time and real I/O. |
-| **Workspace layout** | Cargo workspace with separate crates: `xraft-core` (consensus state machine), `xraft-transport` (async RPC), `xraft-storage` (durable log and snapshots), and `xraft-test` (deterministic simulation harness). | Separation of concerns; enables independent testing and versioning of each layer. |
+| **Workspace layout** | Proposed Cargo workspace with separate crates: `xraft-core` (consensus state machine), `xraft-transport` (async RPC), `xraft-storage` (durable log and snapshots), and `xraft-test` (deterministic simulation harness). These crates do not exist yet — the repository is greenfield (see §1.2). | Separation of concerns; enables independent testing and versioning of each layer. |
 | **Branch strategy** | Feature branches off `main`, PR-based review. | Standard collaborative development workflow. |
 
 ---
@@ -263,7 +279,7 @@ warrants a different choice, but changing them requires explicit justification.
 |----|------|-----------|--------|------------|
 | P1 | **Scope creep into application layer** — Pressure to build a "useful" system (KV store, message queue) on top of the Raft library before the consensus layer is solid. | Medium | High | Hard scope boundary: this work delivers the consensus library and test harness only (§2.2). Application layers are out of scope. |
 | P2 | **Underestimated effort** — A full production-quality Raft implementation (leader election, pull-based replication, snapshotting, dynamic quorum, deterministic simulation) is substantial engineering work. Underestimation could lead to quality shortcuts. | Medium | High | Prioritise correctness over velocity. Ship the consensus core first (election + replication + persistence), then layer on compaction, dynamic quorum, and simulation testing incrementally. |
-| P3 | **Cross-document alignment** — The tech spec, architecture, implementation plan, and e2e scenarios are authored in parallel. Inconsistencies between documents may emerge across iterations. | Medium | Low | Cross-reference shared concepts by name. Flag inconsistencies in iteration summaries so subsequent iterations can reconcile. |
+| P3 | **Cross-document alignment** — Multiple planning documents (tech spec, architecture, implementation plan, e2e scenarios) may be authored in parallel for this story. If they exist, inconsistencies between them may emerge across iterations. | Medium | Low | Each document should stand alone. Shared concepts use consistent naming (e.g., RPC names from §2.1.4, crate names from §4.4). Flag inconsistencies in iteration summaries so subsequent iterations can reconcile. |
 
 ### 5.3 Risk Heat Map
 
@@ -286,9 +302,9 @@ Likelihood│             │               │              │                
 ## 6. Key Design Decisions
 
 These decisions affect the overall design and are recorded here as the
-authoritative source. Structural details (crate boundaries, module layouts)
-and sequencing details (implementation phases, milestones) are out of scope
-for this tech spec.
+authoritative source. Structural details (proposed crate boundaries, module
+layouts) and sequencing details (implementation phases, milestones) belong in
+the architecture and implementation-plan documents if they are produced.
 
 | Decision | Options | Recommendation | Status |
 |----------|---------|----------------|--------|
