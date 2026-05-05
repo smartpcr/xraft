@@ -631,7 +631,9 @@ before producing any `IoAction`:
 
 1. **`StateMachine::apply`** — called once per newly committed command entry.
    Mutates application state. Control records are filtered and processed
-   internally (e.g., updating the voter set).
+   internally (e.g., updating the voter set). **If `apply` returns `Err`,
+   the event loop halts the node (crash-stop) — see §6.3.** Committed
+   entries cannot be skipped; an apply failure is irrecoverable.
 2. **`Listener::handle_commit`** — called once with the full batch of newly
    committed `AppRecord` values. Used for external notification (metrics,
    indexing, replication to external systems). Receives only application
@@ -639,7 +641,8 @@ before producing any `IoAction`:
    for applications to build their own queryable read-side state** — the
    application processes committed records in the `Listener` callback and
    updates an application-owned data structure (e.g., an `Arc<RwLock<T>>`)
-   that can be queried outside of xraft. See §5.11.
+   that can be queried outside of xraft. See §5.11. **Infallible (returns
+   `()`); must not panic** — a panic aborts the event loop (see §6.3).
 3. **`DeferredCompletionQueue::complete`** — resolves the `oneshot` future
    for every committed entry whose offset is now `< HW`.
 
@@ -659,12 +662,31 @@ Snapshots are split into two parts:
 pub trait StateMachine: Send + 'static {
     /// Apply a committed application record to the state machine.
     /// Control records (NoOp, VotersRecord) are never passed here.
+    ///
+    /// **Error semantics:** If `apply` returns `Err`, the event loop treats
+    /// this as an irrecoverable failure — it logs the error, invokes
+    /// `Listener::begin_shutdown()`, and halts the node (crash-stop).
+    /// Committed entries cannot be skipped: an apply failure leaves the
+    /// state machine out of sync with the committed log, and there is no
+    /// rollback mechanism. Applications must ensure `apply` is infallible
+    /// for all well-formed committed records; use `Err` only for
+    /// catastrophic conditions (e.g., out-of-memory, corrupt internal
+    /// state) where halting is the correct response.
     fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>;
 
     /// Take a snapshot of the current application state.
+    ///
+    /// **Error semantics:** If `snapshot` returns `Err`, the snapshot
+    /// is skipped and will be retried at the next snapshot interval.
+    /// The node continues operating normally.
     fn snapshot(&self) -> Result<AppSnapshot>;
 
     /// Restore application state from a snapshot.
+    ///
+    /// **Error semantics:** If `restore` returns `Err`, the event loop
+    /// logs the error, invokes `Listener::begin_shutdown()`, and halts
+    /// the node. A failed restore means the state machine cannot be
+    /// initialised, making the node unable to participate correctly.
     fn restore(&mut self, snapshot: AppSnapshot) -> Result<()>;
 }
 ```
@@ -702,15 +724,28 @@ logic and avoid the safety pitfalls of linearizable-read claims (§5.11).
 pub trait Listener: Send + 'static {
     /// Called when a batch of application records is committed (HW advanced).
     /// Only application records appear here; control records are filtered.
+    ///
+    /// **Error semantics:** This method is infallible (no `Result` return).
+    /// Implementations must not panic — a panic aborts the event loop task
+    /// and halts the node. If the application cannot process a batch, it
+    /// should log the error internally and continue; or, if the failure is
+    /// truly irrecoverable, it should set an internal error flag and
+    /// coordinate shutdown via its own mechanisms.
     fn handle_commit(&mut self, batch: &[(u64, AppRecord)]);
 
     /// Called when a snapshot must be loaded (after FetchSnapshot completes).
+    ///
+    /// **Error semantics:** Infallible. Must not panic.
     fn handle_load_snapshot(&mut self, reader: SnapshotReader);
 
     /// Called on leadership change.
+    ///
+    /// **Error semantics:** Infallible. Must not panic.
     fn handle_leader_change(&mut self, leader_id: NodeId, term: Term);
 
     /// Called during graceful shutdown.
+    ///
+    /// **Error semantics:** Infallible. Must not panic.
     fn begin_shutdown(&mut self);
 }
 ```
@@ -2238,6 +2273,10 @@ or a stale `leader_epoch` (prevents acting on messages from a deposed leader).
 | **Network failure** | `TransportSender::send()` failures are logged and retried on next tick. The pull-based model is inherently tolerant — a missed Fetch is equivalent to a slow follower. |
 | **Deserialization failure** | Malformed RPC messages are dropped with a warning log. |
 | **Stale term** | Any RPC with a term higher than `current_term` triggers a step-down to follower and term update. RPCs with a lower term are rejected. |
+| **`StateMachine::apply` error** | If `apply()` returns `Err`, the event loop treats this as irrecoverable: it logs the error, invokes `Listener::begin_shutdown()`, and halts the node (crash-stop). Committed entries cannot be skipped — an apply failure leaves the state machine out of sync with the committed log. There is no retry or skip mechanism because doing so would violate state machine safety (invariant 5). Applications must ensure `apply` succeeds for all well-formed committed records. |
+| **`StateMachine::snapshot` error** | If `snapshot()` returns `Err`, the scheduled snapshot is skipped and will be retried at the next snapshot interval. The node continues operating normally; log compaction is deferred until a snapshot succeeds. |
+| **`StateMachine::restore` error** | If `restore()` returns `Err`, the event loop logs the error, invokes `Listener::begin_shutdown()`, and halts the node. A failed restore means the state machine cannot be initialised from the snapshot, making the node unable to participate correctly. |
+| **`Listener` callback failure** | `Listener` methods (`handle_commit`, `handle_load_snapshot`, `handle_leader_change`, `begin_shutdown`) are infallible — they return `()`, not `Result`. If a `Listener` implementation panics, the panic propagates through the event loop task, aborting it and halting the node. Applications must not panic in listener callbacks; they should log errors internally and continue, or set an internal flag to coordinate application-level shutdown. |
 
 ### 6.4 Metrics
 
@@ -2287,6 +2326,7 @@ exists, the canonical design is defined by this architecture document.
 | **Timing parameters** | 150–300 ms election timeout (randomised), 50 ms fetch interval. | tech spec §4.3 |
 | **Quorum math** | Majority = `⌊V/2⌋ + 1`; HW = descending-sorted voter offsets at index `⌊V/2⌋` (0-indexed). Only voters count. During a pending membership change, HW advancement uses the pending (new) voter set for entries at or after the VotersRecord's offset; elections and Check Quorum use the committed voter set. | all docs (HW math); architecture §5.5 and e2e quorum-transition (dual-quorum). Impl plan and tech spec describe the same behaviour without explicitly modelling `pending_membership_change` as a separate field — the e2e scenarios' phrasing "HW uses new voter set on append, elections on commit" confirms semantic agreement (§7.3 R7). |
 | **Callback execution model** | Application callbacks (`StateMachine::apply`, `Listener::handle_commit`) are synchronous, in-process calls invoked by the `EventLoop` during message processing, after state mutation but before `IoAction` dispatch. | tech spec §4.4.1, architecture §4.1, impl plan Stages 4.1/5.1, e2e Client Interaction |
+| **Callback error semantics** | `StateMachine::apply` returns `Result<()>`: `Err` → crash-stop (committed entries cannot be skipped). `snapshot()` returns `Result<AppSnapshot>`: `Err` → skip (retry at next interval). `restore()` returns `Result<()>`: `Err` → crash-stop. `Listener` methods are infallible (return `()`): panic → event loop task aborts (crash-stop). | architecture §4.1 (trait docs), §6.3 (error handling table). Sibling docs define signatures but leave error semantics unspecified (§7.3 R13). |
 | **High watermark (HW) semantics** | Exclusive upper bound: entry at offset O is committed ⟺ `O < HW`. `HW − 1` is the last committed offset. HW is never persisted. | tech spec §8 (glossary), architecture §3.1, impl plan Phase 5, e2e preamble. Tech spec §2.1.1 body uses inclusive phrasing ("entries ≤ N are committed"); this is a notational equivalence: inclusive HW_N maps to exclusive HW = N + 1, producing the same committed set (§7.3 R1). |
 | **Commit notification** | Three-phase: (1) `StateMachine::apply`, (2) `Listener::handle_commit`, (3) `DeferredCompletionQueue::complete`. No `DeferredReadQueue`. | architecture §4.1, impl plan Stages 5.1/5.3, e2e Client Interaction |
 | **`read()` semantics** | `read() → Result<ConsensusState>` — clones the latest value from a `tokio::sync::watch` channel updated by the event loop after each state mutation. Local, non-linearizable projected subset of protocol metadata (term, role, leader_id, HW, log_end_offset, voter set, node_id). Callable on any node. Does NOT read from `LogStore`, does NOT enter the event loop message queue. Does not read application state. No `StateMachine::query()` method. | tech spec §2.1.5, architecture §5.11, e2e Client Interaction. Sibling docs list 5 core fields (term, role, leader_id, HW, voter set); this architecture adds `log_end_offset` and `node_id` as supplementary fields — abbreviated, not contradictory (§7.3 R4). Impl plan's "routes reads through the log" describes the semantic guarantee (state reflects committed log position); the watch channel is the concrete mechanism (§7.3 R5). |
@@ -2313,10 +2353,12 @@ The following divergences have been confirmed resolved in sibling documents.
 ### 7.3 Cross-Document Reconciliation Notes
 
 The following items were identified as potential divergences between the four
-planning documents. Each has been analysed and reconciled — the documents
+planning documents. Most have been analysed and reconciled — the documents
 are **compatible** once the differing levels of abstraction and notation are
-accounted for. No unresolved conflicts remain. Implementors can follow
-any of the four documents without encountering contradictory requirements.
+accounted for. Items R11 and R12 identify **active divergences** in the tech
+spec that should be corrected in a future iteration. Item R13 identifies a
+**gap** (unspecified callback error semantics) filled by this architecture.
+Where a divergence remains, this architecture document is canonical.
 
 | ID | Area | This architecture's detail | Sibling-doc phrasing | Reconciliation |
 |----|------|---------------------------|---------------------|----------------|
@@ -2330,3 +2372,6 @@ any of the four documents without encountering contradictory requirements.
 | **R8** | **Recovery VotersRecord handling** | On recovery, uncommitted `VotersRecord` entries are stored as `pending_membership_change` — they do NOT replace the committed `voter_set` from the snapshot (§5.10 rule 3). | Impl plan Stage 6.1 step 5 says "VotersRecord → update voter set." Tech spec §2.1.7 step (3) says "replaying log entries." | **Terminology difference.** The impl plan's "update voter set" refers to recovery-time bookkeeping — storing the `VotersRecord` as `pending_membership_change` so that HW advancement can use it if/when the leader confirms it is committed. It does NOT mean replacing the committed `voter_set` used for elections. The impl plan Stage 8.1 and e2e quorum-transition scenario both confirm that uncommitted `VotersRecord` entries are not effective for elections. This architecture provides the precise semantics: "update" means "store as pending change for HW purposes." |
 | **R9** | **Quorum-state schema adaptation** | `QuorumState { current_term, voted_for, leader_id, leader_epoch }` — four fields (§3.2). | Tech spec §2.1.7 lists KRaft's persisted fields: `currentTerm`, `votedFor`, and `votedDirectoryId`. | **KRaft adaptation.** KRaft's `votedDirectoryId` is a Kafka-specific node identity concept. xraft adapts this to two Rust-native fields: `leader_id: Option<NodeId>` (the known leader) and `leader_epoch: Term` (the leader's term, used for fencing in `RpcEnvelope`). This is consistent with the tech spec §2.1.8 KRaft Adaptation Mapping — xraft renames and restructures KRaft mechanisms for its own design. The tech spec's `votedDirectoryId` reference describes the KRaft source material; the architecture's `leader_id` + `leader_epoch` is the adapted xraft design. |
 | **R10** | **IoStage inline scheduling and I/O pause** | The `IoStage` is called **inline** by the event loop via `io_stage.execute(&batch).await` — a direct async method call, not a message to a separate task (§2.1, §4.1). The event loop **does pause** during `execute()` and does not process the next queued message until the batch completes. Within a batch, actions run concurrently via `tokio::join!`, so total pause time is `max(storage_latency, network_latency)`, not the sum. The `ReceiverTask` (§4.4) continues receiving and queuing inbound RPCs during I/O, so no messages are lost. | Tech spec §4.4.1 says "This staging prevents slow I/O from delaying `Fetch` handling and triggering spurious elections." | **Precision correction.** The tech spec's claim is overstated for the inline-IoStage design: the event loop does pause during I/O, so slow I/O can delay processing of the next message. However, the concurrent-batch design keeps each pause to `max(fsync, network)` (typically 1–5 ms), which is well within the 150–300 ms election timeout. The `ReceiverTask` continues queuing RPCs, so messages accumulate but are not lost. The tech spec should be read as "this staging *mitigates* I/O-induced delays" rather than "prevents" them. |
+| **R11** | **Node role count** | This architecture defines **four** roles: `Unattached`, `Follower`, `Candidate`, `Leader` (§2.1, §3.2). `Unattached` is the initial state before bootstrap or recovery completes, and the terminal state for a node removed from the voter set (§5.6). | Tech spec §2.1.1 says "Three states: Follower, Candidate, Leader." E2e scenarios (line 17) correctly list all four roles. | **Omission in tech spec.** The tech spec describes the three *steady-state* roles from the original Raft paper but omits `Unattached`, which is a KRaft-specific addition for pre-bootstrap and post-removal states. The e2e scenarios correctly list all four. `Unattached` is not a synonym for any of the other three — it is a distinct state where the node does not participate in elections, does not accept proposals, and does not send Fetch requests. The tech spec should be updated to list four roles. This architecture is canonical. |
+| **R12** | **Callback dispatch model in tech-spec decision table** | Application callbacks (`StateMachine::apply`, `Listener::handle_commit`) are **synchronous, in-process calls** within the event loop — they are NOT offloaded to async tasks (§4.1). The event loop invokes them after mutating `NodeState` (step 2) but before producing the `IoAction` batch (step 3). | Tech spec §6 decision table (Event-loop pattern row) says "application callbacks are offloaded to async tasks." Tech spec §4.4.1 body (line 292) correctly says callbacks are invoked "synchronously within the loop (in-process calls, not external I/O)." | **Internal contradiction within tech spec.** The tech spec's §4.4.1 body correctly describes synchronous callbacks, but the §6 decision table row still says "offloaded to async tasks" — a stale remnant from an earlier design iteration. The §6 row contradicts the tech spec's own §4.4.1 and this architecture's §4.1. Callbacks MUST be synchronous: they observe fully-updated protocol state before any `IoAction` is dispatched, ensuring the three-phase commit notification ordering (§4.1). The tech spec §6 row should be corrected to match §4.4.1 and this architecture. This architecture is canonical. |
+| **R13** | **Callback error semantics** | `StateMachine::apply` returns `Result<()>`; `Err` triggers crash-stop (§6.3). `StateMachine::snapshot` returns `Result<AppSnapshot>`; `Err` skips the snapshot (retry at next interval). `StateMachine::restore` returns `Result<()>`; `Err` triggers crash-stop. `Listener` methods are infallible (return `()`); panics abort the event loop (§6.3). | Tech spec §2.1.5 defines `apply -> Result<()>` but does not specify error handling semantics. Impl plan Stage 1.4 defines the same signature without error handling. E2e scenarios do not cover callback error paths. | **Gap filled by this architecture.** The sibling docs define the callback signatures but leave error semantics unspecified. This architecture fills the gap with explicit rules: apply-error → crash-stop (committed entries cannot be skipped), snapshot-error → skip (retry later), restore-error → crash-stop (node cannot initialise), listener-panic → crash-stop (event loop task aborts). These rules are the canonical error semantics for callbacks. Implementors should follow §6.3. |
