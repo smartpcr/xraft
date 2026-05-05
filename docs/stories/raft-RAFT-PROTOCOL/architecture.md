@@ -80,9 +80,9 @@ loop `await`s trait methods but never opens files or sockets itself.
 |---------------|----------------|
 | **`RaftNode`** | Public API surface. Exposes `propose()`, `read()`, `bootstrap()`, and lifecycle methods. Owns the `EventLoop` and coordinates startup, shutdown, and crash recovery. Accepts a generic `StateMachine` type parameter (monomorphised at compile time). On construction, executes the recovery sequence (§5.10) before accepting any RPCs. |
 | **`EventLoop`** | Single-threaded async loop that processes protocol state transitions without blocking on I/O. The loop drains an inbound message queue (`tokio::sync::mpsc`) and dispatches to the appropriate handler. **I/O staging model:** The loop never directly awaits `LogStore::append()` or `Transport::send()` inline. Instead, handlers produce `IoAction` values (described below) collected into an `IoActionBatch`. After each message is processed, the loop hands the batch to the `IoStage`, which executes storage and network operations concurrently, then returns results. The loop then applies I/O results (e.g., advancing durable offsets, completing client futures) as synchronous state updates. This prevents slow `fsync` calls from delaying Fetch processing and triggering spurious elections. |
-| **`IoStage`** | Executes `IoAction` batches produced by the `EventLoop`. Each action is one of: `PersistQuorumState(QuorumState)`, `AppendLog(Vec<LogEntry>)`, `TruncateSuffix(u64)`, `TruncatePrefix(u64)`, `SendRpc(NodeId, RpcEnvelope)`, `SaveSnapshot(Snapshot)`, `NotifyListener(ListenerEvent)`. The `IoStage` calls the injected trait objects (`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`) concurrently via `tokio::join!` or `FuturesUnordered`. Storage operations complete with `fsync` before the loop processes the next message that depends on them. |
+| **`IoStage`** | Executes `IoAction` batches produced by the `EventLoop`. Each action is one of: `PersistQuorumState(QuorumState)`, `AppendLog(Vec<LogEntry>)`, `TruncateSuffix(u64)`, `TruncatePrefix(u64)`, `SendRpc(NodeId, RpcEnvelope)`, `SaveSnapshot(Snapshot)`. The `IoStage` calls the injected trait objects (`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`) concurrently via `tokio::join!` or `FuturesUnordered`. Storage operations complete with `fsync` before the loop processes the next message that depends on them. **Application callbacks** (`StateMachine::apply`, `Listener::handle_commit`, `Listener::handle_leader_change`) are NOT dispatched by the `IoStage` — they are invoked directly by the `EventLoop` after the `IoStage` returns and after state is updated (e.g., HW advanced). This ensures callbacks always see consistent, post-I/O state. |
 | **`BatchAccumulator`** | Stages incoming `propose()` calls into a batch buffer. On each event-loop tick (or when the batch is full), the accumulated entries are drained into a single `AppendLog` I/O action. This amortises `fsync` cost across multiple proposals (group commit). Analogous to KRaft's `BatchAccumulator`. |
-| **`DeferredCompletionQueue`** | Parks `tokio::sync::oneshot` senders keyed by log offset. When the high watermark advances, the queue completes all futures whose offset is now ≤ HW. Analogous to KRaft's `DeferredEventQueue` / purgatory. |
+| **`DeferredCompletionQueue`** | Parks `tokio::sync::oneshot` senders keyed by log offset. When the high watermark advances, the queue completes all futures whose offset is now **< HW** (strictly less than — see §3.2 canonical HW definition). Analogous to KRaft's `DeferredEventQueue` / purgatory. |
 | **`ConsensusState`** | The core state: current `term`, `voted_for`, node `role` (Follower / Candidate / Leader / Unattached), the in-memory log index, `high_watermark`, `log_start_offset`, the voter set, and per-follower replication progress (leader only). The `Unattached` role is the initial state before bootstrap or recovery completes. |
 | **`ElectionManager`** | Implements Pre-Vote and Vote protocols. Manages election timeouts (randomised 150–300 ms), vote collection, term advancement, and leader-to-follower step-down on Check Quorum failure. |
 | **`ReplicationManager`** | Handles Fetch request/response processing on both leader and follower sides. On the leader: validates fetch offset against the leader-epoch checkpoint, detects log divergence (populates `DivergingEpoch`), tracks follower progress, and advances the high watermark when a majority has replicated. On the follower: sends periodic Fetch RPCs, processes responses, truncates log on divergence, and updates the local high watermark. |
@@ -132,7 +132,29 @@ reliably with wall-clock time and real I/O.
 
 ## 3. Data Model
 
-### 3.1 Core Entities
+### 3.2 Canonical Offset and Commit Semantics
+
+These definitions are the single source of truth for commit-related
+semantics throughout this document and sibling planning documents.
+
+| Term | Definition |
+|------|------------|
+| **`fetch_offset`** | The next offset a follower wants to read, equal to the follower's `log_end_offset`. A follower reporting `fetch_offset = N` has replicated entries `[0, N)` — offsets 0 through N−1 inclusive. |
+| **High watermark (HW)** | An **exclusive upper bound** on committed offsets. An entry at offset O is committed if and only if `O < HW`. Equivalently, `HW − 1` is the last committed offset. HW is never persisted (see §5.10). |
+| **HW advancement rule** | The leader collects one value per voter: `fetch_offset` for each follower, `log_end_offset` for itself. Sort these V values in **descending** order. The new HW candidate is the value at index `⌊V/2⌋` (0-indexed). HW advances to `max(current_HW, candidate)` — it never decreases. At least `⌊V/2⌋ + 1` voters (a majority) have `fetch_offset ≥ HW`, meaning all entries in `[0, HW)` are replicated on a majority. |
+| **Commit test** | Entry at offset N is committed ⟺ `N < HW`. The `DeferredCompletionQueue` fires a client future when the entry's offset satisfies this test. |
+| **Two-round visibility** | A follower needs **two** Fetch rounds to observe a newly committed entry: round 1 delivers the entry (follower's `fetch_offset` has not yet been reported to the leader); round 2 carries the follower's updated `fetch_offset`, which the leader uses to advance HW, returning the new HW in the response. |
+
+*Examples (all use exclusive semantics):*
+
+- **V=3, values=[10, 8, 5]:** Sorted desc → [10, 8, 5]. Index ⌊3/2⌋=1 → HW=8.
+  Two voters have offset ≥ 8, so entries [0, 8) (offsets 0–7) are committed.
+- **V=5, values=[10, 8, 7, 5, 3]:** Index ⌊5/2⌋=2 → HW=7.
+  Three voters have offset ≥ 7, so entries [0, 7) committed.
+- **Commit test:** HW=6 → entry at offset 5 is committed (5 < 6 ✓);
+  entry at offset 6 is NOT committed (6 < 6 ✗).
+
+### 3.3 Core Entities
 
 #### `NodeId`
 
@@ -209,7 +231,10 @@ ConsensusState {
     // Log boundaries
     log_start_offset: u64           // first offset still in the log (after compaction)
     log_end_offset: u64             // next offset to be appended
-    high_watermark: u64             // highest committed offset
+    high_watermark: u64             // exclusive upper bound of committed offsets;
+                                    // entries with offset < HW are committed.
+                                    // HW − 1 is the last committed offset.
+                                    // (see §3.2 for canonical definition)
 
     // Voter set (from latest VotersRecord or snapshot)
     voters: HashSet<NodeId>
