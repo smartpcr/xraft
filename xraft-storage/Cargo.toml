@@ -1,0 +1,10 @@
+[package]
+name = "xraft-storage"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+xraft-core = { path = "../xraft-core" }
+
+[lints]
+workspace = true
