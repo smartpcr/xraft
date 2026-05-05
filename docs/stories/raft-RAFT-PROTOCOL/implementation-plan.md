@@ -83,12 +83,13 @@
 - [ ] Define `#[async_trait] trait SnapshotIO { async fn save(&self, snapshot: &Snapshot) -> Result<()>, async fn load_latest(&self) -> Result<Option<Snapshot>>, async fn read_chunk(&self, id: &SnapshotId, position: u64, max_bytes: u32) -> Result<(Bytes, bool)>, async fn begin_receive(&self, id: &SnapshotId) -> Result<SnapshotWriter> }` in `traits.rs` — matches architecture §4.1 method names exactly; uses `Snapshot`, `SnapshotId`, `SnapshotWriter` from Stage 1.2
 - [ ] Define `#[async_trait] trait TransportSender: Send + Sync + 'static { async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<()> }` in `traits.rs` — takes `&self` (shared reference) because `IoStage` may send to multiple peers concurrently; matches architecture §4.4 split design
 - [ ] Define `#[async_trait] trait TransportReceiver: Send + 'static { async fn recv(&mut self) -> Result<RpcEnvelope> }` in `traits.rs` — takes `&mut self` (exclusive access) because only the `ReceiverTask` reads from the network; matches architecture §4.4 split design
-- [ ] Define `trait Clock: Send + 'static { fn now(&self) -> Instant, async fn sleep_until(&self, deadline: Instant), fn random_election_timeout(&self) -> Duration }` in `traits.rs` — **Runtime** trait (not I/O), used directly by the `EventLoop` for timer management (election timeouts, check-quorum deadlines), NOT mediated by `IoAction` or the `IoStage` (architecture §4.1, §4.4); injected into `RaftNode` as `Box<dyn Clock>` and passed to the `EventLoop`, not the `IoStage`; does not require `Sync` because only the single-threaded event loop calls it; matches architecture §4.1 method names exactly
+- [ ] Define `#[async_trait] trait Clock: Send + 'static { fn now(&self) -> Instant; async fn sleep_until(&self, deadline: Instant); fn random_election_timeout(&self) -> Duration; }` in `traits.rs` — **Runtime** trait (not I/O), used directly by the `EventLoop` for timer management (election timeouts, check-quorum deadlines), NOT mediated by `IoAction` or the `IoStage` (architecture §4.1, §4.4); requires `#[async_trait]` because `sleep_until` is async and the trait is used as `Box<dyn Clock>` (trait object) — without `#[async_trait]`, native `async fn` in traits is not object-safe for `dyn Trait` dispatch; injected into `RaftNode` as `Box<dyn Clock>` and passed to the `EventLoop`, not the `IoStage`; does not require `Sync` because only the single-threaded event loop calls it; matches architecture §4.1 trait definition exactly (including `#[async_trait]` attribute and `Send + 'static` bounds)
 - [ ] Define `trait StateMachine: Send + 'static { fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>; fn snapshot(&self) -> Result<AppSnapshot>; fn restore(&mut self, snapshot: AppSnapshot) -> Result<()>; }` in `traits.rs` — synchronous trait (not `#[async_trait]`) per architecture §4.1; application callbacks are invoked synchronously by the `EventLoop`, not by the `IoStage`; uses `AppRecord` and `AppSnapshot` types from Stage 1.2
 - [ ] Add `async-trait` dependency to `xraft-core/Cargo.toml`
 
 #### Test Scenarios
 - [ ] Scenario: Trait object safety — Given the `LogStore` trait, When a `Box<dyn LogStore>` is constructed from a mock, Then it compiles and can be called
+- [ ] Scenario: Clock object safety — Given the `#[async_trait] Clock` trait with `async fn sleep_until`, When a `Box<dyn Clock>` is constructed from `SimulatedClock`, Then it compiles, is object-safe, and `sleep_until` can be called via dynamic dispatch
 - [ ] Scenario: StateMachine trait contract — Given a dummy `StateMachine` impl, When `apply` is called with an `AppRecord` (from Stage 1.2), Then it returns `Ok(())`
 
 ### Stage 1.5: Error Types and Configuration
@@ -145,7 +146,7 @@
 - [ ] Implement optional fault injection in `MemoryLogStore`: configurable `fsync` failure probability, write corruption injection
 - [ ] Create `xraft-test/src/memory_snapshot.rs` implementing `SnapshotIO` trait with in-memory snapshot storage — method names match architecture §4.1: `save`, `load_latest`, `read_chunk`, `begin_receive`
 - [ ] Create `xraft-test/src/memory_quorum_state.rs` implementing `QuorumStateStore` trait with in-memory state — `load()` returns `None` when no state has been saved (matching architecture §4.1 `Option<QuorumState>` contract)
-- [ ] Create `xraft-test/src/simulated_clock.rs` implementing `SimulatedClock` — deterministic clock implementing the `Clock` **Runtime** trait from `xraft-core` (methods: `now`, `sleep_until`, `random_election_timeout` matching architecture §4.1; `Clock` is used by the `EventLoop` for timer management, not by the `IoStage`), advances only when explicitly ticked via `advance(duration)`, allows precise control over election timeouts, fetch intervals, and Check Quorum deadlines
+- [ ] Create `xraft-test/src/simulated_clock.rs` implementing `SimulatedClock` — deterministic clock implementing the `#[async_trait] Clock` **Runtime** trait from `xraft-core` (methods: `now`, `sleep_until`, `random_election_timeout` matching architecture §4.1; `Clock` requires `#[async_trait]` for `Box<dyn Clock>` object safety; used by the `EventLoop` for timer management, not by the `IoStage`), advances only when explicitly ticked via `advance(duration)`, allows precise control over election timeouts, fetch intervals, and Check Quorum deadlines
 
 #### Test Scenarios
 - [ ] Scenario: Memory log store — Given a `MemoryLogStore`, When 1000 entries are appended and read back, Then all entries match with correct offsets
@@ -303,7 +304,7 @@
 - [ ] Create `xraft-core/src/event_loop.rs` with async event loop skeleton: inbound message channel (`tokio::sync::mpsc`), tick-based timer, and shutdown signal
 - [ ] Implement `IoAction` enum: `PersistQuorumState`, `AppendLog`, `TruncateSuffix`, `TruncatePrefix`, `SendRpc`, `SaveSnapshot` — per architecture §3.2, application callbacks (`StateMachine::apply`, `Listener::handle_commit`, `Listener::handle_leader_change`) are NOT `IoAction` variants; they are synchronous, in-process calls invoked directly by the `EventLoop` during message processing, before the `IoAction` batch is produced
 - [ ] Implement `IoActionBatch` collection and `IoStage` executor that dispatches actions to I/O trait objects (`LogStore`, `TransportSender`, `QuorumStateStore`, `SnapshotIO`) concurrently — the `IoStage` does NOT call `Clock` or `TransportReceiver` (architecture §3.2 note: Clock is used by the EventLoop, TransportReceiver by the ReceiverTask)
-- [ ] Create `xraft-core/src/clock.rs` with `WallClock` (production implementation using `tokio::time`) of the `Clock` trait — implements `now`, `sleep_until`, and `random_election_timeout` per architecture §4.1; `SimulatedClock` is defined in `xraft-test` (Stage 1.8), not in `xraft-core`, to keep test-only code out of the production crate
+- [ ] Create `xraft-core/src/clock.rs` with `WallClock` (production implementation using `tokio::time`) of the `#[async_trait] Clock` trait — implements `now`, `sleep_until`, and `random_election_timeout` per architecture §4.1; `WallClock` implements `#[async_trait] Clock` for object-safe `Box<dyn Clock>` dispatch; `SimulatedClock` is defined in `xraft-test` (Stage 1.8), not in `xraft-core`, to keep test-only code out of the production crate
 - [ ] Implement randomised election timeout generation using `Clock::random_election_timeout` with jitter in [min, max] range
 
 #### Test Scenarios
@@ -690,3 +691,63 @@
 #### Test Scenarios
 - [ ] Scenario: CI green — Given all code is committed, When CI runs, Then all build, test, clippy, fmt, and doc steps pass
 - [ ] Scenario: E2E coverage — Given the list of scenarios in `e2e-scenarios.md`, When cross-referenced with test implementations, Then every scenario has at least one corresponding test
+
+---
+
+## Cross-Document Consistency Notes
+
+> These notes document known semantic differences between sibling plan
+> documents and state which interpretation the implementation follows.
+> Resolving these discrepancies ensures the codebase is internally
+> consistent.
+
+### High Watermark (HW) Semantics
+
+The **tech-spec** (§2.1.1, §8 Glossary) defines HW with **inclusive** semantics:
+"Entries at or below the HW are considered committed" (entries ≤ HW are
+committed). The **architecture** (§3.1, §5.2) and **e2e-scenarios** (§1 Offset
+Conventions) define HW with **exclusive** semantics: "entries with `offset < HW`
+are committed; `HW − 1` is the last committed offset."
+
+**This implementation plan follows the architecture's exclusive semantics
+throughout.** The mapping is: tech-spec "entries ≤ N committed" corresponds to
+`HW = N + 1` in the exclusive notation used here. For example, if the tech-spec
+says "HW advances to 5 and entries ≤ 5 are committed", the implementation uses
+`HW = 6` (entries 0–5 are committed because `5 < 6`). The e2e-scenarios
+document (§1) already documents this mapping explicitly. The tech-spec §8
+Glossary should be updated to use exclusive semantics for cross-document
+consistency.
+
+### Clock Trait — `#[async_trait]` and Object Safety
+
+The **architecture** (§4.1, trait table §4.3) defines `Clock` as an
+`#[async_trait]` trait with bounds `Send + 'static`. The `#[async_trait]`
+attribute is required because `Clock` contains `async fn sleep_until` and is
+used as a trait object (`Box<dyn Clock>`). Without `#[async_trait]`, native
+`async fn` in traits (Rust 1.75+) does not support `dyn Trait` dispatch —
+the desugared return type includes an implicit lifetime that is not
+object-safe. This plan uses `#[async_trait]` on the `Clock` trait definition
+(Stage 1.4), the `WallClock` production implementation (Stage 4.1), and the
+`SimulatedClock` test implementation (Stage 1.8) to ensure object-safe
+`Box<dyn Clock>` dispatch everywhere.
+
+### Clock Is a Runtime Trait, Not an I/O Trait
+
+Per the architecture (§4.3 trait table), `Clock` is a **Runtime** trait — it
+is used directly by the `EventLoop` for timer management (election timeouts,
+check-quorum deadlines, fetch intervals). It is NOT mediated by `IoAction` and
+is NOT called by the `IoStage`. This plan reflects this distinction in every
+stage that references `Clock` (Stages 1.4, 1.7, 1.8, 4.1). The `IoStage`
+receives only I/O trait objects: `LogStore`, `TransportSender`,
+`QuorumStateStore`, `SnapshotIO`.
+
+### Transport: Split Traits (TransportSender / TransportReceiver)
+
+Per the architecture (§4.4), transport is split into two traits:
+`TransportSender` (`Send + Sync + 'static`, `&self`, called by `IoStage`) and
+`TransportReceiver` (`Send + 'static`, `&mut self`, called by `ReceiverTask`).
+This plan uses the split design throughout. Concrete transport types
+(`TcpTransport`, `ChannelTransport`) provide a `split()` method that yields
+`(Box<dyn TransportSender>, Box<dyn TransportReceiver>)`. The `RaftNode::new`
+constructor accepts separate `Box<dyn TransportSender>` and
+`Box<dyn TransportReceiver>` parameters.
