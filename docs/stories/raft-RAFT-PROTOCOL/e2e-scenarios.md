@@ -770,7 +770,7 @@ Feature: Dynamic Quorum — Add Voter
     When the VotersRecord is committed (majority of the NEW voter set [N1, N2, N3, N4] — i.e. 3 of 4)
     Then the active voter set becomes [N1, N2, N3, N4]
     And the quorum size increases to 3 (majority of 4)
-    And N4 participates in future elections and quorum calculations
+    And N4 participates in future elections and HW advancement calculations
 
   Scenario: Only one voter change at a time
     Given an AddVoter RPC for N4 is in progress (VotersRecord not yet committed)
@@ -811,8 +811,13 @@ Feature: Dynamic Quorum — Add Voter
     When N1 crashes before a majority replicates the VotersRecord
     And N2 wins election for term 2
     Then N2's log may or may not contain the uncommitted VotersRecord
-    And if present, N2 does not treat it as effective (uncommitted VotersRecords do not change the active voter set)
-    And elections and quorum calculations continue using the last committed voter set [N1, N2, N3]
+    And if present, N2 does not treat it as effective (uncommitted VotersRecords do not change the active voter set for elections)
+    And election quorum continues using the last committed voter set [N1, N2, N3]
+    And if N2 becomes leader and the uncommitted VotersRecord survives in its log,
+      HW advancement for entries at or after the VotersRecord's offset still uses
+      the new voter set [N1, N2, N3, N4] per architecture §5.5 quorum transition —
+      but the VotersRecord may be truncated during divergence handling if it conflicts
+      with the new leader's log
     And the membership change must be re-submitted to the new leader
 
   Scenario: Single-change invariant holds after failover with uncommitted VotersRecord
@@ -845,7 +850,7 @@ Feature: Dynamic Quorum — Add Voter
 Feature: Dynamic Quorum — Remove Voter
   As a cluster operator
   I need to remove a voting member from the cluster
-  So that failed or decommissioned nodes do not affect quorum calculations
+  So that failed or decommissioned nodes do not affect HW advancement or elections
 
   Background:
     Given a 3-node cluster [N1, N2, N3]
@@ -893,15 +898,29 @@ Feature: Dynamic Quorum — Remove Voter
     Then N3 transitions to Unattached state (per architecture §5.6)
     And N3 stops participating in elections
     And N3 does not send Vote RPCs
-    And N3 is no longer counted for quorum calculations by any node
+    And N3 is no longer counted for HW advancement or election quorum by any node
 
   Scenario: RemoveVoter commits with the new voter set for quorum
     When a client sends RemoveVoter for N3 to N1
     And N1 appends a VotersRecord with voter set [N1, N2]
     Then HW advancement for this VotersRecord requires a majority of the NEW voter set [N1, N2]
-    And N3's fetch_offset is NOT counted toward quorum for this record
+    And N3's fetch_offset is NOT counted toward HW advancement for this record
     And once both N1 and N2 have the VotersRecord at or past their fetch_offset, HW advances
     And the VotersRecord is committed and N3 is removed
+
+  Scenario: Quorum transition — HW uses new voter set on append, elections on commit
+    # Per architecture §5.5/§3.2: HW advancement switches to the new voter set
+    # immediately when the VotersRecord is appended. Election quorum (the active
+    # voter set for voting) only switches when the VotersRecord is committed.
+    Given N4 is an Observer caught up with the leader (fetch_offset ≥ HW)
+    When a client sends AddVoter for N4 to N1 and N1 appends VotersRecord [N1, N2, N3, N4]
+    Then HW advancement for entries at or after the VotersRecord's offset immediately uses
+      the new voter set [N1, N2, N3, N4] — N4's fetch_offset counts toward commit
+    And election quorum (e.g., if an election starts before the VotersRecord commits)
+      still uses the last committed voter set [N1, N2, N3]
+    When the VotersRecord is committed (majority of [N1, N2, N3, N4] = 3 of 4)
+    Then the active voter set for elections becomes [N1, N2, N3, N4]
+    And both HW advancement and election quorum now use [N1, N2, N3, N4]
 ```
 
 ---
@@ -1046,25 +1065,37 @@ Feature: Client Interaction
 
   Scenario: Read routes through the log on the leader
     # Per tech spec §2.1.5: "Initial implementation routes reads through the log
-    # for safety." The leader appends a read-marker to the log, waits for commit
-    # (HW advances past it), and then returns the current applied state.
-    # This is the simplest (but most expensive) approach to consistent reads.
+    # for safety." read() completes only after the leader has a committed
+    # current-term entry, confirming it is still the authoritative leader.
+    # A new leader always appends a LeaderChangeMessage (no-op) as its first
+    # entry (architecture doc §3.2); once this entry (or any subsequent
+    # current-term entry) is committed, the leader's authority is confirmed.
     # Optimised read paths (read-index, lease-based) are out of scope (tech spec §2.2).
-    Given N1 is Leader for term 1 with high watermark 11 (offsets 0–10 committed)
+    Given N1 is Leader for term 1
+    And N1's LeaderChangeMessage for term 1 has been committed (HW > its offset)
     And the StateMachine has applied all committed command entries (control records filtered)
     When a client calls read() on N1
-    Then N1 appends a read-marker entry to the log at offset 11
-    And N1 parks the read future in the DeferredCompletionQueue (keyed by offset 11)
-    When followers Fetch and replicate the read-marker and HW advances to 12
-    Then the read future resolves with the current StateMachine state
-    And the returned state reflects all StateMachine::apply() calls through offset 10
-    And the read-marker is a consensus control record — it is not passed to StateMachine::apply
+    Then the read() call confirms a current-term entry is committed (leadership proof)
+    And read() returns the current committed StateMachine state
+    And the returned state reflects all StateMachine::apply() calls up to the current HW
     And consensus metadata (term, role, HW, voter_set) is accessible separately via RaftMetrics
 
-  Scenario: Read rejected on follower — follower cannot append to the log
-    # Because read() routes through the log (appends a read-marker that must be
-    # committed), only the leader can service read() calls. Followers return an error.
-    Given N1 is Leader for term 1 with high watermark 11 (offsets 0–10 committed)
+  Scenario: Read waits when no current-term entry is committed yet
+    # A new leader must commit at least one entry from its term to confirm
+    # authority. read() waits until the LeaderChangeMessage (or any current-term
+    # entry) is committed before returning state.
+    Given N1 just won election for term 2 and appended a LeaderChangeMessage
+    And the LeaderChangeMessage has NOT yet been committed (followers have not fetched it)
+    When a client calls read() on N1
+    Then the read future is pending (waiting for a current-term entry to commit)
+    When followers Fetch the LeaderChangeMessage and HW advances past its offset
+    Then the read future resolves with the current committed StateMachine state
+
+  Scenario: Read rejected on follower — only leader can service reads
+    # Because read() routes through the log (requires a committed current-term
+    # entry as leadership proof — tech spec §2.1.5), only the leader can
+    # service read() calls. Followers return an error with leader redirection.
+    Given N1 is Leader for term 1
     And N2 is a Follower
     When a client calls read() on N2
     Then N2 returns an error indicating it is not the leader
@@ -1084,11 +1115,10 @@ Feature: Client Interaction
 
   Scenario: Read fails during leader failover
     Given a client calls read() on N1 (Leader for term 1)
-    And N1 appends a read-marker at offset 11
-    When N1 crashes before the read-marker is committed
+    And the read is pending (waiting for leadership confirmation via a committed current-term entry)
+    When N1 crashes before the read completes
     And N2 becomes the new Leader for term 2
     Then N1's read future never resolves (connection lost)
-    And N2 may truncate the uncommitted read-marker during log reconciliation
     And the client retries read() against the new leader N2
 
   Scenario: Application-level dedup via request IDs (out of xraft scope)
@@ -1273,13 +1303,13 @@ Feature: Observability and Metrics
 | §2.1.2 Snapshotting | Log Compaction and Snapshots | 4 |
 | §2.1.2 Snapshot transfer | Snapshot Transfer | 4 |
 | §2.1.2 Log truncation / Divergence | Log Divergence and Truncation | 4 |
-| §2.1.3 Single-node changes | Add Voter / Remove Voter / UpdateVoter | 14 |
+| §2.1.3 Single-node changes | Add Voter / Remove Voter / UpdateVoter | 15 |
 | §2.1.3 Non-voting members (observers) | Observer Promotion | 3 |
 | §2.1.3 Leader step-down | Remove Voter (scenario 2) | — |
 | §2.1.4 Identity & fencing | Identity and Fencing | 6 |
 | §2.1.4 Divergence detection | Log Divergence and Truncation | — |
-| §2.1.5 Library API | Client Interaction | 10 |
+| §2.1.5 Library API | Client Interaction | 11 |
 | §2.1.6 Metrics | Observability and Metrics | 7 |
 | §2.1.6 Deterministic simulation | Safety Invariants (scenario 6) | — |
 | §2.1.7 Bootstrap & recovery | Cluster Bootstrap | 5 |
-| **Total** | **17 Features** | **100 Scenarios** |
+| **Total** | **17 Features** | **102 Scenarios** |
