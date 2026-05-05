@@ -106,7 +106,7 @@ callbacks (`StateMachine`, `Listener`), manages timers via the injected
 | **`ConsensusState`** | The full internal protocol state, containing: current `term`, `voted_for`, node `role` (Follower / Candidate / Leader / Unattached), the in-memory log index, `high_watermark`, `log_start_offset`, `log_end_offset`, the `voter_set` (as `Vec<VoterInfo>`, consistent with `VotersRecord`), observers, and per-follower replication progress (leader only). The `Unattached` role is the initial state before bootstrap or recovery completes. Also the public return type of `RaftNode::read()` — callers receive a **projected subset** of these fields (term, role, leader_id, HW, log_end_offset, voter_set, node_id); internal-only fields (voted_for, cluster_id, log_start_offset, observers, follower_state, election/quorum deadlines, vote counters) are not exposed via `read()` (§5.11). |
 | **`ElectionManager`** | Implements Pre-Vote and Vote protocols. Manages election timeouts (randomised 150–300 ms), vote collection, term advancement, and leader-to-follower step-down on Check Quorum failure. |
 | **`ReplicationManager`** | Handles Fetch request/response processing on both leader and follower sides. On the leader: validates fetch offset against the leader-epoch checkpoint, detects log divergence (populates `DivergingEpoch`), tracks follower progress, and advances the high watermark when a majority has replicated. On the follower: sends periodic Fetch RPCs, processes responses, truncates log on divergence, and updates the local high watermark. |
-| **`MembershipManager`** | Processes `AddVoter` / `RemoveVoter` / `UpdateVoter` RPCs. Enforces the **single-change invariant**: rejects any membership RPC while an uncommitted `VotersRecord` exists in the log. On `AddVoter`: validates the observer is caught up (`fetch_offset ≥ leader's current HW`), then appends a `VotersRecord` control entry containing the new voter set. On `RemoveVoter`: appends a `VotersRecord` excluding the target node; if the leader is removing itself, it continues serving until the record commits (using the **new** voter set for quorum), then steps down to `Unattached`. On `UpdateVoter`: appends a `VotersRecord` with the updated endpoint. The `VotersRecord` travels through the log like any entry — replicated via Fetch, committed when a majority of the **new** voter set has fetched it — and the membership change takes effect only upon commit. |
+| **`MembershipManager`** | Processes `AddVoter` / `RemoveVoter` / `UpdateVoter` RPCs. Enforces the **single-change invariant**: rejects any membership RPC while an uncommitted `VotersRecord` exists in the log. On `AddVoter`: validates the observer is caught up (`fetch_offset ≥ leader's current HW`), then appends a `VotersRecord` control entry containing the new voter set and stores it as `pending_membership_change` in `ConsensusState`. On `RemoveVoter`: appends a `VotersRecord` excluding the target node; if the leader is removing itself, it continues serving until the record commits (using the **new** voter set for HW quorum), then steps down to `Unattached`. On `UpdateVoter`: appends a `VotersRecord` with the updated endpoint. The `VotersRecord` travels through the log like any entry — replicated via Fetch, committed when a majority of the **new** voter set has fetched it. **Dual quorum semantics:** Once appended, HW advancement for entries at or after the `VotersRecord`'s offset immediately uses the **new** (pending) voter set (§5.5 quorum transition). Elections, Check Quorum, and the `voter_set` returned by `read()` continue to use the **committed** voter set until the `VotersRecord` is committed. On commit, `voter_set` is atomically replaced by the new set and `pending_membership_change` is cleared. |
 | **`SnapshotCoordinator`** | Triggers periodic snapshots via the `StateMachine` trait. Coordinates `FetchSnapshot` RPC flows when a follower's required offset is below the log start offset. Manages chunked snapshot transfer state. |
 | **`MetricsCollector`** | Maintains consensus metrics: `current_leader`, `current_epoch`, `election_latency_avg`, `append_records_rate`, `commit_latency_avg`. Exposed as a queryable Rust struct. |
 
@@ -250,10 +250,14 @@ VoterInfo {
 
 Committed via the log as a `LogEntry` with `entry_type = VotersRecord`.
 Included in snapshot metadata for recovery. The `voters` field encodes the
-**complete** new voter set (not a delta) — on commit, it atomically replaces
-the previous voter set. Once appended, HW advancement for entries at or
-after the `VotersRecord`'s offset uses the new voter set for quorum
-calculation (see §5.5 Quorum transition).
+**complete** new voter set (not a delta). **Dual quorum semantics apply:**
+Once appended, HW advancement for entries at or after the `VotersRecord`'s
+offset uses the new voter set for quorum calculation (see §5.5 Quorum
+transition). Elections, Check Quorum, and the `voter_set` returned by
+`read()` continue to use the **committed** voter set until the `VotersRecord`
+itself is committed. On commit, `ConsensusState.voter_set` is atomically
+replaced by the new set and `pending_membership_change` is cleared; the old
+voter set is discarded.
 
 #### `ConsensusState`
 
@@ -274,11 +278,25 @@ ConsensusState {
                                     // HW − 1 is the last committed offset.
                                     // (see §3.1 for canonical definition)
 
-    // Voter set (from latest VotersRecord or snapshot)
-    voter_set: Vec<VoterInfo>           // complete voter set including endpoints;
-                                        // consistent with VotersRecord.voters
-                                        // and the read() return type (§5.11)
+    // Voter set (from latest COMMITTED VotersRecord or snapshot)
+    voter_set: Vec<VoterInfo>           // the committed voter set — used for
+                                        // elections, Check Quorum, and read().
+                                        // Replaced atomically when a VotersRecord
+                                        // commits. Consistent with snapshot
+                                        // metadata voters.
     observers: HashSet<NodeId>
+
+    // Pending membership change (leader-only, at most one)
+    pending_membership_change: Option<PendingMembershipChange>
+                                        // Set when a VotersRecord is appended but
+                                        // not yet committed. Contains the pending
+                                        // voter set and the offset of the VotersRecord.
+                                        // HW advancement for offsets ≥ this offset
+                                        // uses pending_membership_change.voters
+                                        // instead of voter_set. Cleared on commit
+                                        // (voter_set ← pending voters) or on
+                                        // truncation (log divergence discards the
+                                        // uncommitted VotersRecord).
 
     // Leader-only state
     follower_state: HashMap<NodeId, FollowerProgress>
@@ -294,9 +312,28 @@ ConsensusState {
 **Public projection via `read()`.** The `RaftNode::read()` method (§5.11)
 returns a projected subset of this struct containing only: `node_id`,
 `current_term`, `role`, `leader_id`, `log_end_offset`, `high_watermark`,
-and `voter_set`. Internal-only fields (`cluster_id`, `voted_for`,
-`log_start_offset`, `observers`, `follower_state`, election/quorum
-deadlines, vote counters) are not exposed through `read()`.
+and `voter_set` (the **committed** voter set). Internal-only fields
+(`cluster_id`, `voted_for`, `log_start_offset`, `observers`,
+`pending_membership_change`, `follower_state`, election/quorum deadlines,
+vote counters) are not exposed through `read()`.
+
+#### `PendingMembershipChange` (leader-only, at most one)
+
+```
+PendingMembershipChange {
+    offset: u64                     // log offset of the uncommitted VotersRecord
+    voters: Vec<VoterInfo>          // the proposed new voter set
+}
+```
+
+Tracks a `VotersRecord` that has been appended to the log but not yet
+committed. The leader uses `voters` for HW advancement (entries at offsets
+≥ `offset` require a majority of these voters). Elections, Check Quorum,
+and `read().voter_set` continue to use the committed `voter_set`. When the
+`VotersRecord` commits, `voter_set ← voters` and this field is cleared.
+When log truncation discards the uncommitted `VotersRecord` (divergence
+handling), this field is also cleared — the node reverts to the committed
+voter set.
 
 #### `FollowerProgress` (leader-side, per follower)
 
@@ -1329,8 +1366,11 @@ fetch past the record's offset before HW advances past it.
       │        │ 4. Append  │          │                 │
       │        │    Voters- │          │                 │
       │        │    Record  │          │                 │
-      │        │    {A,B,D} │          │                 │
+      │        │  {A,B,C,D} │          │                 │
       │        │    to log  │          │                 │
+      │        │ 5. Store   │          │                 │
+      │        │    pending │          │                 │
+      │        │    membshp │          │                 │
       │        └─────┬──────┘          │                 │
       │              │                 │                 │
       │              │  ◄── Fetch ─────│                 │
@@ -1345,10 +1385,15 @@ fetch past the record's offset before HW advances past it.
       │        ┌─────┴──────┐          │                 │
       │        │ Majority   │          │                 │
       │        │ of NEW set │          │                 │
-      │        │ {A,B,D}    │          │                 │
+      │        │ {A,B,C,D}  │          │                 │
       │        │ fetched    │          │                 │
       │        │ VotersRec. │          │                 │
       │        │ HW adv.    │          │                 │
+      │        │ Commit:    │          │                 │
+      │        │ voter_set  │          │                 │
+      │        │ ← {A,B,C,D}│          │                 │
+      │        │ Clear      │          │                 │
+      │        │ pending.   │          │                 │
       │        │ D is now   │          │                 │
       │        │ a voter.   │          │                 │
       │        └─────┬──────┘          │                 │
@@ -1369,11 +1414,18 @@ current `high_watermark`. If `fetch_offset < HW`, the leader rejects the
 `AddVoter` with `NodeNotCaughtUp`. This ensures the new voter will not
 cause an availability gap by joining the quorum with a stale log.
 
-**Quorum transition:** Once the `VotersRecord` is appended, HW advancement
-immediately uses the **new** voter set for quorum calculation. This means
-the new voter D's `fetch_offset` counts toward commit of the `VotersRecord`
-itself. The old voter set is not used for any entries at or after the
-`VotersRecord`'s offset.
+**Quorum transition (dual semantics).** Once the `VotersRecord` is appended,
+the leader stores it as `pending_membership_change` in `ConsensusState`.
+**HW advancement** for entries at or after the `VotersRecord`'s offset
+immediately uses the **pending** (new) voter set. This means the new voter
+D's `fetch_offset` counts toward commit of the `VotersRecord` itself.
+**Elections, Check Quorum, and `read().voter_set`** continue to use the
+**committed** `voter_set` until the `VotersRecord` is committed. On commit,
+`voter_set` is atomically replaced by the pending voter set, and
+`pending_membership_change` is cleared. If log truncation discards the
+uncommitted `VotersRecord` (divergence handling after failover),
+`pending_membership_change` is cleared and the node reverts to the
+committed `voter_set`.
 
 ### 5.6 Dynamic Membership Change (Remove Voter)
 
@@ -1839,7 +1891,14 @@ leader to provide the authoritative HW via subsequent Fetch responses.
    │    internal bookkeeping │        │
    │    only:                │        │
    │    - VotersRecord →     │        │
-   │      update voter set   │        │
+   │      store as pending   │        │
+   │      membership change  │        │
+   │      (do NOT replace    │        │
+   │      committed voter_   │        │
+   │      set — uncommitted  │        │
+   │      VotersRecords are  │        │
+   │      not effective for  │        │
+   │      elections)          │        │
    │    - LeaderChangeMes. → │        │
    │      update leader-     │        │
    │      epoch checkpoint   │        │
@@ -1926,11 +1985,20 @@ leader to provide the authoritative HW via subsequent Fetch responses.
    no rollback mechanism.
 
 3. **Control records are processed for bookkeeping.** `VotersRecord` and
-   `LeaderChangeMessage` entries in the recovered log are scanned to
-   rebuild the voter set and leader-epoch checkpoint. These are internal
-   consensus metadata — not state machine mutations — and are idempotent.
-   If the log is later truncated due to divergence, the leader's correct
-   entries will overwrite these values.
+   `LeaderChangeMessage` entries in the recovered log are scanned for
+   internal metadata. `LeaderChangeMessage` entries rebuild the leader-epoch
+   checkpoint. `VotersRecord` entries are stored as
+   `pending_membership_change` (not applied to the committed `voter_set`)
+   because their committed status is unknown — the committed `voter_set`
+   comes from the snapshot and must not be overwritten by an uncommitted
+   `VotersRecord` that may later be truncated on divergence. This is
+   consistent with the dual-quorum model (§5.5): uncommitted
+   `VotersRecords` affect HW advancement only, not elections or
+   `read().voter_set`. If the log is later truncated due to divergence,
+   `pending_membership_change` is cleared and the node reverts to the
+   committed voter set. If the leader's Fetch confirms the `VotersRecord`
+   is committed (HW advances past it), the three-phase commit notification
+   promotes it to the committed `voter_set`.
 
 4. **Leader provides the authoritative HW.** After resuming as follower,
    the node sends Fetch requests to the leader. The leader's Fetch
@@ -2022,10 +2090,11 @@ does NOT contact other nodes.
 
 The following struct is a **projected subset** of the full internal
 `ConsensusState` (§3.2). Internal-only fields (`voted_for`, `cluster_id`,
-`log_start_offset`, `observers`, `follower_state`, election/quorum
-deadlines, vote counters) are not exposed. The field names and types below
-match the corresponding fields in the §3.2 definition exactly (e.g.,
-`voter_set: Vec<VoterInfo>`, `current_term: Term`).
+`log_start_offset`, `observers`, `pending_membership_change`,
+`follower_state`, election/quorum deadlines, vote counters) are not
+exposed. The field names and types below match the corresponding fields in
+the §3.2 definition exactly (e.g., `voter_set: Vec<VoterInfo>`,
+`current_term: Term`).
 
 ```rust
 pub struct ConsensusState {
@@ -2034,7 +2103,8 @@ pub struct ConsensusState {
     pub leader_id: Option<NodeId>,
     pub high_watermark: u64,           // exclusive upper bound (§3.1)
     pub log_end_offset: u64,
-    pub voter_set: Vec<VoterInfo>,
+    pub voter_set: Vec<VoterInfo>,     // committed voter set (§3.2) — does NOT
+                                       // include pending membership changes
     pub node_id: NodeId,
 }
 ```
@@ -2145,14 +2215,14 @@ exists, the canonical design is defined by this architecture document.
 | **Transport split** | Separate `TransportSender` (`&self`, `Sync`) and `TransportReceiver` (`&mut self`, not `Sync`). `split()` on concrete transports. | impl plan Stage 1.4, architecture §4.4 |
 | **Clock placement** | `Clock` is a Runtime trait, passed to the `EventLoop` (not `IoStage`), not mediated by `IoAction`. | impl plan Stage 1.4/1.7 |
 | **Timing parameters** | 150–300 ms election timeout (randomised), 50 ms fetch interval. | tech spec §4.3 |
-| **Quorum math** | Majority = `⌊V/2⌋ + 1`; HW = descending-sorted voter offsets at index `⌊V/2⌋` (0-indexed). Only voters count. | all docs |
+| **Quorum math** | Majority = `⌊V/2⌋ + 1`; HW = descending-sorted voter offsets at index `⌊V/2⌋` (0-indexed). Only voters count. During a pending membership change, HW advancement uses the pending (new) voter set for entries at or after the VotersRecord's offset; elections and Check Quorum use the committed voter set. | all docs (HW math); architecture §5.5 and e2e quorum-transition (dual-quorum). **Active divergence D7:** impl plan and tech spec do not model `pending_membership_change` — see §7.3. |
 | **Callback execution model** | Application callbacks (`StateMachine::apply`, `Listener::handle_commit`) are synchronous, in-process calls invoked by the `EventLoop` during message processing, after state mutation but before `IoAction` dispatch. | tech spec §4.4.1, architecture §4.1, impl plan Stages 4.1/5.1, e2e Client Interaction |
 | **High watermark (HW) semantics** | Exclusive upper bound: entry at offset O is committed ⟺ `O < HW`. `HW − 1` is the last committed offset. HW is never persisted. | tech spec §8 (glossary), architecture §3.1, impl plan Phase 5, e2e preamble. **Active divergence D1:** tech spec §2.1.1 body still says "entries ≤ N are committed" (inclusive phrasing) — see §7.3. |
 | **Commit notification** | Three-phase: (1) `StateMachine::apply`, (2) `Listener::handle_commit`, (3) `DeferredCompletionQueue::complete`. No `DeferredReadQueue`. | architecture §4.1, impl plan Stages 5.1/5.3, e2e Client Interaction |
 | **`read()` semantics** | `read() → Result<ConsensusState>` — local, non-linearizable projected subset of protocol metadata (term, role, leader_id, HW, log_end_offset, voter set, node_id). Callable on any node. Does not read application state. No `StateMachine::query()` method. | tech spec §2.1.5, architecture §5.11, e2e Client Interaction. **Active divergences D4, D5:** sibling docs list only 5 fields (omit `log_end_offset`, `node_id`); impl-plan says "routes reads through the log" — see §7.3. |
 | **`StateMachine` trait shape** | `apply(offset, &AppRecord)`, `snapshot()`, `restore()` only. No `query()`, no `ReadResult` associated type. | tech spec §2.1.5, architecture §4.1, impl plan Stage 1.4 |
 | **`LogStore` method receivers** | All methods take `&self` with interior mutability and `Sync` bound. | architecture §4.1, impl plan Stage 1.4 |
-| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state (all 4 fields) → snapshot → log scan (metadata only — no SM replay) → resume as follower → learn HW from leader → apply entries via three-phase commit notification. | architecture §5.10, impl plan Phase 6, e2e Crash Recovery. **Active divergences D2, D3:** tech spec §2.1.7 says "replaying log entries"; impl-plan Phase 6 lists only 2 of 4 quorum-state fields — see §7.3. |
+| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state (all 4 fields) → snapshot (restores committed `voter_set`) → log scan (metadata only — no SM replay; uncommitted `VotersRecord` stored as `pending_membership_change`, not applied to committed `voter_set`) → resume as follower → learn HW from leader → apply entries via three-phase commit notification. | architecture §5.10, impl plan Phase 6, e2e Crash Recovery. **Active divergences D2, D3, D8:** tech spec §2.1.7 says "replaying log entries"; impl-plan Phase 6 lists only 2 of 4 quorum-state fields; neither doc distinguishes committed vs. pending voter set on recovery — see §7.3. |
 | **`ClusterId` generation** | Generated once by the operator, passed to `bootstrap()` as a parameter, shared by all nodes. | architecture §5.9, impl plan Stage 6.2. **Active divergence D6:** tech spec §2.1.7 says "generated at bootstrap time" without specifying operator vs. auto-generation — see §7.3. |
 | **Application read-side state** | Applications build their own queryable read-side state from committed records delivered via `Listener::handle_commit`. xraft does not mediate application state reads. | architecture §4.1, e2e Client Interaction |
 
@@ -2183,6 +2253,8 @@ the affected sibling documents should reconcile the text.
 | **D1** | **HW phrasing (tech spec §2.1.1)** | Exclusive upper bound: entry committed ⟺ `O < HW` (§3.1). Tech spec §8 glossary is correct. | Tech spec §2.1.1 body says "entries ≤ N are committed" — inclusive phrasing that contradicts the exclusive `O < HW` definition in tech spec's own §8 glossary. | Tech spec §2.1.1 should say "entries with offset < HW are committed" or "HW advances to N+1, committing entries through N." |
 | **D2** | **Recovery replay wording (tech spec §2.1.7)** | No state-machine replay during recovery. Log entries between snapshot and LEO are scanned for control-record metadata only — NOT applied to `StateMachine`. HW is learned from the leader via Fetch (§5.10). | Tech spec §2.1.7 step (3) says "replaying log entries after the snapshot offset." The word "replaying" implies `StateMachine::apply`, which this architecture explicitly prohibits during recovery (§5.10 rules 2–4). | Tech spec §2.1.7 step (3) should say "scanning log entries after the snapshot offset for consensus metadata (voter set, leader-epoch checkpoint) — without applying to the StateMachine." |
 | **D3** | **Quorum-state fields loaded on recovery (impl plan Stage 6.1)** | Recovery loads **all 4** `QuorumState` fields: `current_term`, `voted_for`, `leader_id`, `leader_epoch` (§5.10 rule 5). The `QuorumStateStore::load()` trait returns `Option<QuorumState>`, which is a struct containing all 4 fields (§4.1). | Impl plan Stage 6.1 step 2 says "load quorum-state file for `current_term` and `voted_for`" — listing only 2 of the 4 fields. | Impl plan Stage 6.1 step 2 should say "load quorum-state file for all 4 fields (`current_term`, `voted_for`, `leader_id`, `leader_epoch`) via `QuorumStateStore::load()`." |
-| **D4** | **`read()` field count** | `read()` returns 7 fields: `current_term` (as `Term`), `role`, `leader_id`, `high_watermark`, `log_end_offset`, `voter_set`, `node_id` (§5.11). These are a projected subset of the full internal `ConsensusState`. | Tech spec §2.1.5 and e2e scenarios list only 5 fields (term, role, leader_id, HW, voter_set) — omitting `log_end_offset` and `node_id`. | Sibling docs should add `log_end_offset` and `node_id` to the `ConsensusState` field list, or explicitly note they are abbreviated. |
+| **D4** | **`read()` field count** | `read()` returns 7 fields: `current_term` (as `Term`), `role`, `leader_id`, `high_watermark`, `log_end_offset`, `voter_set`, `node_id` (§5.11). These are a projected subset of the full internal `ConsensusState`. | Tech spec §2.1.5 lists 5 fields (term, role, leader ID, high watermark, voter set). E2e scenarios (read-semantics preamble) lists the same 5 fields. Impl plan Stages 1.7 and 5.3 also list only 5 fields. All three omit `log_end_offset` and `node_id`. | Sibling docs should add `log_end_offset` and `node_id` to the `ConsensusState` field list, or explicitly note they are abbreviated. |
 | **D5** | **`read()` implementation path (impl plan Stages 1.7, 5.3)** | `read()` returns a snapshot of protocol metadata accessed via a synchronisation primitive (`tokio::sync::watch` or `Arc<RwLock<...>>`) — it does NOT enter the event loop's message queue and does NOT route through the log (§5.11). | Impl plan Stages 1.7 and 5.3 say "routes reads through the log for safety." This misattributes the tech spec §2.2 out-of-scope item on linearizable reads (which mentions routing through the log) to the non-linearizable `read()` API. Tech spec §2.1.5 itself correctly says `read()` is "a local, non-linearizable snapshot." | Impl plan should say `read()` accesses a `watch`/`RwLock` snapshot of `ConsensusState` updated by the event loop — no log routing. |
 | **D6** | **`ClusterId` generation source (tech spec §2.1.7)** | `ClusterId` UUID is generated once by the operator, passed to `bootstrap()` as a parameter, and shared by all nodes via out-of-band distribution (§5.9). | Tech spec §2.1.7 says "generated at bootstrap time" — ambiguous about whether the operator or the code generates it. | Tech spec should clarify: "operator-generated UUID, passed to `bootstrap()` as a parameter." |
+| **D7** | **Voter-set dual-quorum semantics (e2e, impl plan)** | This architecture distinguishes **committed** `voter_set` (used for elections, Check Quorum, `read()`) from **pending** `pending_membership_change` (used for HW advancement only). `ConsensusState` tracks both explicitly (§3.2). Recovery stores uncommitted `VotersRecord` entries as `pending_membership_change`, not as the active voter set (§5.10 rule 3). | E2e scenarios (quorum-transition scenario) correctly describe the dual semantics: "HW uses new voter set on append, elections on commit." However, neither the impl plan nor the tech spec models `pending_membership_change` as a separate field — they refer only to a single `voter_set`. | Impl plan and tech spec should reference the `pending_membership_change` field and clarify that the committed `voter_set` is not overwritten until the `VotersRecord` commits. Recovery descriptions should specify that uncommitted `VotersRecord` entries are stored as pending, not as the active voter set. |
+| **D8** | **Recovery VotersRecord handling (tech spec §2.1.7, impl plan Stage 6.1)** | On recovery, uncommitted `VotersRecord` entries in the log are stored as `pending_membership_change` — they do NOT replace the committed `voter_set` (which comes from the snapshot). This is consistent with the rule that uncommitted VotersRecords are not effective for elections (§5.5, e2e quorum-transition scenario). | Tech spec §2.1.7 step (3) says "replaying log entries" which implies restoring the voter set from uncommitted records. Impl plan Stage 6.1 does not distinguish committed vs. uncommitted VotersRecord handling during recovery. | Both docs should specify: "Uncommitted `VotersRecord` entries found during log scan are stored as `pending_membership_change` — the committed `voter_set` (from snapshot) is not overwritten." |
