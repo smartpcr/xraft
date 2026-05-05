@@ -121,7 +121,7 @@
 - [ ] Create `xraft-core/src/raft_node.rs` defining the `RaftNode<S: StateMachine>` struct with fields: `config: RaftConfig`, `event_loop_handle`, `propose_tx: mpsc::Sender` — this is the public entry point from architecture §2.1
 - [ ] Define `RaftNode::new(config, storage, transport, state_machine) -> Result<Self>` constructor signature (body deferred to Phase 6 recovery/bootstrap)
 - [ ] Define `RaftNode::propose(command: AppRecord) -> Future<Result<Offset>>` method stub returning `NotLeader` until the event loop is wired (Phase 5)
-- [ ] Define `RaftNode::read() -> Result<ConsensusState>` method stub for reading current consensus state (current term, leader, high watermark, role) — note: linearisable reads are out of scope per tech-spec §2.2; this returns local committed state only
+- [ ] Define `RaftNode::read() -> Result<ConsensusState>` method stub for reading current consensus state (current term, leader, high watermark, role) — note: linearisable reads are out of scope per tech-spec §2.2; this returns local state only; the high_watermark is an exclusive upper bound per architecture §5.2 (entry at offset O is committed when O < HW)
 - [ ] Define `RaftNode::bootstrap(cluster_id: ClusterId, initial_voters: Vec<VoterInfo>) -> Result<()>` method stub (body implemented in Phase 6) — `ClusterId` is provided by the caller, not generated internally, to ensure all nodes share the same cluster identity
 - [ ] Define `RaftNode::shutdown() -> Result<()>` lifecycle method
 - [ ] Update `xraft-core/src/lib.rs` to re-export `RaftNode`
@@ -345,7 +345,7 @@
 #### Implementation Steps
 - [ ] Create `xraft-core/src/replication.rs` implementing `ReplicationManager` struct
 - [ ] Implement follower periodic Fetch: on each `fetch_interval` tick, send `FetchRequest` to known leader with current `fetch_offset` and `last_fetched_epoch`
-- [ ] Implement `handle_fetch_response` on follower: append received entries to local log, update local `high_watermark` from response, reset election timer
+- [ ] Implement `handle_fetch_response` on follower: append received entries to local log, advance local `high_watermark` to `min(leader_HW, local_log_end_offset)` (architecture §5.10 rule 4), apply entries between old HW and new HW to the state machine (only `Command` entries — skip control records), reset election timer
 - [ ] Implement divergence handling: if response contains `DivergingEpoch`, truncate local log to `end_offset` and re-fetch from the truncation point
 - [ ] Handle `snapshot_id` in Fetch response: if present, initiate snapshot transfer flow (delegate to SnapshotCoordinator, implemented in Phase 7)
 - [ ] Handle leader-not-known state: if no leader is known, do not send Fetch (wait for election)
@@ -374,18 +374,18 @@
 ### Stage 5.3: High Watermark Advancement and Commit Notification
 
 #### Implementation Steps
-- [ ] Implement high watermark calculation: after each Fetch, leader sorts all voter `fetch_offset` values and sets HW to the median (majority position)
+- [ ] Implement high watermark calculation per architecture §5.2: after each incoming Fetch, leader collects `fetch_offset` for every voter (including itself — using its own `log_end_offset`), sorts them in **descending** order, and sets HW to the value at index `⌊V/2⌋` (0-indexed, where V is the total number of voters); this is the highest offset at or above which at least a majority (`⌊V/2⌋ + 1`) of voters have replicated; HW is an **exclusive upper bound** — entry at offset O is committed when `O < HW`; HW can only advance forward (never decreases)
 - [ ] Create `xraft-core/src/batch_accumulator.rs` implementing `BatchAccumulator` — buffers incoming `propose()` calls, drains to log on tick or when batch is full
 - [ ] Create `xraft-core/src/deferred_completion.rs` implementing `DeferredCompletionQueue` — parks `oneshot::Sender` futures keyed by offset, completes them when HW advances past their offset
-- [ ] Wire HW advancement to `DeferredCompletionQueue`: when HW advances, complete all pending futures with offset ≤ new HW
+- [ ] Wire HW advancement to `DeferredCompletionQueue`: when HW advances, complete all pending futures with offset < new HW (HW is an exclusive upper bound — entry at offset O is committed when O < HW)
 - [ ] Implement `propose()` public API on `RaftNode`: accept command, push to `BatchAccumulator`, return a `Future<Result<Offset>>` from `DeferredCompletionQueue`
-- [ ] Implement `read()` public API on `RaftNode`: return a snapshot of the current `ConsensusState` (current term, role, leader_id, high_watermark, voter set) — this is a local read of committed state, not a linearisable read
+- [ ] Implement `read()` public API on `RaftNode`: return a snapshot of the current `ConsensusState` (current term, role, leader_id, high_watermark, voter set) — this is a local read of committed state per tech-spec §2.1.5; linearisable reads are out of scope per tech-spec §2.2; the high_watermark in the returned state reflects the exclusive upper bound of committed offsets (entry at offset O is committed when O < HW)
 - [ ] Reject `propose()` with `NotLeader` error if the node is not the current leader
 
 #### Test Scenarios
-- [ ] Scenario: HW advancement — Given a 3-node cluster where leader has entries 0–5 and both followers have fetched up to offset 5, When HW is calculated, Then HW = 5
+- [ ] Scenario: HW advancement — Given a 3-node cluster where leader has `log_end_offset=6` and both followers have `fetch_offset=6` (meaning they've fetched entries [0,6)), When HW is calculated by sorting [6,6,6] descending and taking index ⌊3/2⌋=1, Then HW = 6 (exclusive upper bound: entries 0–5 are committed because 5 < 6)
 - [ ] Scenario: Propose commit notification — Given a client calls `propose(cmd)`, When the entry is appended and HW advances past it after follower fetches, Then the returned Future resolves with the committed offset
-- [ ] Scenario: Two-round commit visibility — Given follower N2 fetches and replicates entry at offset 10, When N2 fetches again, Then the second response shows HW ≥ 10 and N2 updates its local HW
+- [ ] Scenario: Two-round commit visibility — Given follower N2 fetches and replicates entry at offset 10, When N2 fetches again (round 2), Then the second response shows HW ≥ 11 (exclusive upper bound: entry 10 is committed because 10 < 11) and N2 updates its local HW to `min(leader_HW, local_log_end_offset)` and applies the newly committed entry via `StateMachine::apply`
 - [ ] Scenario: Propose on non-leader — Given follower N2, When `propose()` is called, Then it returns `NotLeader` error immediately
 
 ---
@@ -401,14 +401,15 @@
 ### Stage 6.1: Crash Recovery Sequence
 
 #### Implementation Steps
-- [ ] Implement `RaftNode::recover()` — called on startup before accepting any RPCs: (1) load quorum-state for term/vote, (2) load latest snapshot (if any) — call `StateMachine::restore(app_snapshot)` and restore voter set from snapshot metadata, (3) set `log_start_offset` to `snapshot.last_included_offset + 1` (or 0 if no snapshot), (4) replay log entries from `log_start_offset` to `log_end_offset` via `StateMachine::apply` for `Command` entries only (skip control records), (5) rebuild leader-epoch checkpoint from log scan, (6) set `high_watermark` to `log_end_offset` (all persisted entries were committed pre-crash), (7) set role to Follower/Unattached
+- [ ] Implement `RaftNode::recover()` — called on startup before accepting any RPCs: (1) load quorum-state for term/vote, (2) load latest snapshot (if any) — call `StateMachine::restore(app_snapshot)` and restore voter set from snapshot metadata, (3) set `log_start_offset` to `snapshot.last_included_offset + 1` (or 0 if no snapshot), (4) set `high_watermark` to `snapshot.last_included_offset + 1` (or 0 if no snapshot) — HW is never persisted (architecture §5.10 rule 1); the snapshot captures only committed state so entries [0, HW) are known committed; entries beyond this point have unknown committed status, (5) scan log from `log_start_offset` to `log_end_offset` — validate CRCs, truncate at first corrupt/partial record; do NOT apply any entries to the `StateMachine` (architecture §5.10 rule 2 — committed status of post-snapshot entries is unknown; they may be uncommitted tail entries from a deposed leader that the current leader will truncate via divergence detection), (6) process control records in the recovered log for internal bookkeeping only: `VotersRecord` → update voter set, `LeaderChangeMessage` → update leader-epoch checkpoint (these are idempotent consensus metadata updates, not state machine mutations; if the log is later truncated due to divergence, the leader's correct entries will overwrite these values), (7) rebuild leader-epoch checkpoint from log scan, (8) set role to Follower — a recovering node never resumes as Leader regardless of prior role; it must win a new election
+- [ ] After recovery, the node sends Fetch requests to the leader; the leader's Fetch response includes the authoritative HW; the node advances local HW to `min(leader_HW, local_log_end_offset)` and applies entries between old HW and new HW to the state machine (only `Command` entries — control records were already processed for bookkeeping during recovery step 6)
 - [ ] Ensure log recovery scan (from Stage 2.2) truncates any partially-written entries before replay
-- [ ] Validate invariants after recovery: `log_start_offset ≤ high_watermark ≤ log_end_offset`, voter set non-empty (from snapshot or bootstrap VotersRecord), term ≥ snapshot term
+- [ ] Validate invariants after recovery: `log_start_offset ≤ high_watermark ≤ log_end_offset`, voter set non-empty (from snapshot or bootstrap VotersRecord), term ≥ snapshot term, HW = `snapshot.last_included_offset + 1` (not `log_end_offset`) — entries between HW and log_end_offset have unknown committed status and must not be applied to the state machine until the leader provides the authoritative HW
 
 #### Test Scenarios
-- [ ] Scenario: Clean recovery — Given a node with quorum-state(term=5, voted_for=N1), a snapshot at offset 100, and log entries 101–150, When the node restarts, Then it recovers to term 5 as Follower with entries 101–150 replayed via `StateMachine::apply` (only `Command` entries), `log_start_offset=101`, and voter set restored from snapshot
-- [ ] Scenario: Recovery after crash mid-write — Given a node that crashed while appending entry 151 (corrupt CRC), When it restarts, Then entries 0–150 are recovered and entry 151 is discarded
-- [ ] Scenario: Recovery with no snapshot — Given a node with log entries 0–50 and no snapshot, When it restarts, Then all 50 entries are replayed through `StateMachine::apply`
+- [ ] Scenario: Clean recovery — Given a node with quorum-state(term=5, voted_for=N1), a snapshot at offset 100, and log entries 101–150, When the node restarts, Then it recovers to term 5 as Follower with `high_watermark=101` (snapshot offset + 1, not log_end_offset), log entries 101–150 are present on disk but NOT applied to the state machine (committed status unknown), control records in 101–150 are processed for bookkeeping only (VotersRecord → voter set, LeaderChangeMessage → epoch checkpoint), and the node begins sending Fetch requests to learn the authoritative HW from the leader
+- [ ] Scenario: Recovery after crash mid-write — Given a node that crashed while appending entry 151 (corrupt CRC), When it restarts, Then entries 0–150 are recovered, entry 151 is discarded, and HW is set to `snapshot.last_included_offset + 1` (not 151)
+- [ ] Scenario: Recovery with no snapshot — Given a node with log entries 0–50 and no snapshot, When it restarts, Then HW is set to 0 (no snapshot → no entries known committed), entries 0–50 are present on disk but NOT applied to the state machine; the node resumes as Follower and learns the authoritative HW from the leader via Fetch, at which point entries up to the leader-provided HW are applied to the state machine
 
 ### Stage 6.2: Cluster Bootstrap
 
@@ -453,7 +454,7 @@
 #### Implementation Steps
 - [ ] Implement `FetchSnapshot` handling on leader: serve snapshot chunks via `SnapshotIO::read_chunk` with position tracking
 - [ ] Implement `FetchSnapshot` flow on follower: triggered when `Fetch` response contains `snapshot_id`, send `FetchSnapshotRequest` with position=0, accumulate chunks, finalize when `is_last_chunk=true`
-- [ ] After snapshot is fully received: call `StateMachine::restore`, update voter set from snapshot metadata, set `log_start_offset` to `snapshot.last_included_offset + 1`, set `fetch_offset` to `snapshot.last_included_offset + 1`, resume normal Fetch replication from the offset immediately after the snapshot (not the snapshot's last offset)
+- [ ] After snapshot is fully received: call `StateMachine::restore`, update voter set from snapshot metadata, set `log_start_offset` to `snapshot.last_included_offset + 1`, set `high_watermark` to `snapshot.last_included_offset + 1` (snapshot captures only committed state — consistent with recovery HW rule from architecture §5.10), set `fetch_offset` to `snapshot.last_included_offset + 1`, resume normal Fetch replication from the offset immediately after the snapshot (not the snapshot's last offset)
 - [ ] Handle interrupted transfer: if the follower restarts mid-transfer, detect partial snapshot and restart from position 0
 
 #### Test Scenarios
@@ -609,7 +610,7 @@
 - [ ] Implement test: snapshot transfer to a far-behind follower
 - [ ] Implement test: add voter to a running cluster and verify quorum change
 - [ ] Implement test: remove voter (including leader self-removal)
-- [ ] Implement test: crash recovery from snapshot + log replay
+- [ ] Implement test: crash recovery from snapshot — verify node recovers with HW = snapshot offset + 1, does NOT apply post-snapshot entries to SM during recovery, learns authoritative HW from leader via Fetch, then applies committed entries
 - [ ] Implement test: stress test — 5-node cluster, 1000 proposals, random node crashes and restarts, random partitions, assert all invariants hold
 
 #### Test Scenarios
