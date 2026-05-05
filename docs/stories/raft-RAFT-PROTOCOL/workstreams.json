@@ -30,7 +30,7 @@
     "title": "Trait Definitions (Storage, Transport, Runtime)",
     "description": "Trait Definitions (Storage, Transport, Runtime) (8 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-trait-definitions-storage-transport-runtime",
-    "contentHash": "a5e5bfd290b2609e6d898969e07009c7dcde84da08742baf13a84f1a2e8c694b",
+    "contentHash": "4d629dfa16680f262ab7733ecbdb1ea4688dbff07e93d438c434f5c4e2d383e6",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-runtime",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-runtime",
     "status": "planning"
@@ -66,7 +66,7 @@
     "title": "In-Memory Storage Backends and Simulated Clock (\u0060xraft-test\u0060)",
     "description": "In-Memory Storage Backends and Simulated Clock (\u0060xraft-test\u0060) (5 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-in-memory-storage-backends-and-simulated-clock-xraft-test",
-    "contentHash": "d271d1e5f3c27a121ee6a9cf747c22d59aca529973b4d1cedc33a350de3ae6de",
+    "contentHash": "34ad89702616f6b73680d5b1f3495316d65d65e40dfa70c7c2a34223acd673b7",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-in-memory-storage-backends-and-simulated-clock-xraft-test",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-in-memory-storage-backends-and-simulated-clock-xraft-test",
     "status": "planning"
@@ -147,7 +147,7 @@
     "title": "Event Loop Skeleton and Timer Infrastructure",
     "description": "Event Loop Skeleton and Timer Infrastructure (5 steps)",
     "anchor": "phase-election-and-leader-lifecycle-xraft-core/stage-event-loop-skeleton-and-timer-infrastructure",
-    "contentHash": "59c928ce5ea729312d7e7e815033041d2b7996e1bb9df2a378461605c0ac402c",
+    "contentHash": "f90025fc4ea475efeea99b688b98411d4ef76140f2f14e949412442dbf0263b1",
     "workstreamId": "ws-raft-raft-protocol-phase-election-and-leader-lifecycle-xraft-core-stage-event-loop-skeleton-and-timer-infrastructure",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-election-and-leader-lifecycle-xraft-core-stage-event-loop-skeleton-and-timer-infrastructure",
     "status": "planning"
