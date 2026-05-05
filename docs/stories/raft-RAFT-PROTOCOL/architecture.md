@@ -803,6 +803,89 @@ implementations in `xraft-transport` and `xraft-storage` will depend on
 `xraft-core` for those types. `xraft-test` will depend on all three to
 wire up simulation clusters.
 
+### 4.4 ReceiverTask and Transport Split Design
+
+The transport layer is split into two traits with different ownership
+semantics, and the inbound path uses a dedicated `ReceiverTask` that
+bridges the network to the `EventLoop`.
+
+#### Split Transport Traits
+
+`TransportSender` and `TransportReceiver` are separate traits (not a
+single `Transport`) to resolve ownership conflicts:
+
+- **`TransportSender`** — takes `&self` (shared reference), requires
+  `Send + Sync + 'static`. The `IoStage` holds a `Box<dyn TransportSender>`
+  and calls `send()` concurrently for multiple peers via `tokio::join!` or
+  `FuturesUnordered`. Because `&self` is shared, multiple concurrent sends
+  are safe without interior mutability at the trait level.
+
+- **`TransportReceiver`** — takes `&mut self` (exclusive access), requires
+  `Send + 'static` (NOT `Sync`). Only the `ReceiverTask` reads from the
+  network, so exclusive access is natural and avoids synchronisation overhead.
+
+Both `TcpTransport` (production) and `ChannelTransport` (test) implement
+a single struct with a `split()` method:
+
+```rust
+fn split(self) -> (Box<dyn TransportSender>, Box<dyn TransportReceiver>)
+```
+
+`RaftNode` calls `split()` at construction time and routes each half:
+- **Sender** → `IoStage` (for `SendRpc` actions)
+- **Receiver** → `ReceiverTask` (for inbound message delivery)
+
+#### ReceiverTask → EventLoop Flow
+
+The `ReceiverTask` is a dedicated async task that bridges network I/O to
+the consensus event loop:
+
+```
+   Network
+     │
+     ▼
+┌──────────────────┐
+│  ReceiverTask    │  async task, owns Box<dyn TransportReceiver>
+│  loop {          │
+│    msg = recv()  │  calls TransportReceiver::recv(&mut self)
+│    tx.send(msg)  │  pushes into tokio::sync::mpsc channel
+│  }               │
+└────────┬─────────┘
+         │ mpsc channel
+         ▼
+┌──────────────────┐
+│   EventLoop      │  drains mpsc, dispatches to handlers
+│   (single-       │  mutates ConsensusState
+│    threaded)     │  invokes callbacks
+│                  │  emits IoAction batch → IoStage
+└──────────────────┘
+```
+
+The `ReceiverTask` performs no protocol logic — it only deserialises and
+forwards. This keeps all consensus state mutation on the `EventLoop`'s
+single thread and avoids shared-state concurrency.
+
+#### What the ReceiverTask Does NOT Do
+
+- It does NOT call `Clock` (timer management is the `EventLoop`'s
+  responsibility).
+- It does NOT call `LogStore`, `QuorumStateStore`, `SnapshotIO`, or
+  `TransportSender` (all external I/O other than receive is dispatched
+  via `IoAction` through the `IoStage`).
+- It does NOT invoke application callbacks (`StateMachine`, `Listener`).
+
+#### Startup and Shutdown Sequencing
+
+- **Startup:** `RaftNode` completes recovery/bootstrap (§5.9, §5.10) before
+  spawning the `ReceiverTask`. This ensures the `EventLoop` has fully
+  restored `ConsensusState` (term, voter set, log bounds) before processing
+  any inbound RPCs.
+- **Shutdown:** `RaftNode::shutdown()` drops the `ReceiverTask`'s mpsc
+  sender (or sends a shutdown signal), causing the task to exit. The
+  `EventLoop` drains any remaining messages, invokes
+  `Listener::begin_shutdown()`, and then completes pending `IoAction`
+  batches before stopping.
+
 ---
 
 ## 5. End-to-End Sequence Flows
@@ -1852,11 +1935,11 @@ pub struct RaftMetrics {
 
 ### Consistency with `tech-spec.md`
 
-This architecture is designed to be fully consistent with the tech spec.
-All crate names, trait definitions, and module structures below are
+This architecture is designed to be consistent with the tech spec.
+All crate names, trait definitions, and module structures are
 **proposed designs** — no Rust source code exists in the repository yet.
 
-- **Proposed crate layout** matches §4.4 of the tech spec: `xraft-core`,
+- **Proposed crate layout** matches tech spec §4.4: `xraft-core`,
   `xraft-transport`, `xraft-storage`, `xraft-test`.
 - **RPC names** match §2.1.4: `Vote`, `Fetch`, `FetchSnapshot`, `AddVoter`,
   `RemoveVoter`, `UpdateVoter`.
@@ -1884,21 +1967,12 @@ All crate names, trait definitions, and module structures below are
   `EventLoop` for timer management (election timeouts, check-quorum
   deadlines). Neither is mediated by `IoAction`.
 - **Segment-file log storage** per §6.
-- **I/O staging** per §4.4.1 — the event loop produces `IoAction` values
-  and the `IoStage` executes them via injected trait objects for all
+- **I/O staging** per tech spec §4.4.1 — the event loop produces `IoAction`
+  values and the `IoStage` executes them via injected trait objects for all
   external I/O (disk, network). The loop never directly awaits external I/O
-  inline. Application callbacks (`StateMachine::apply`, `Listener`) are
-  synchronous in-process calls invoked by the event loop during message
-  processing — they are not external I/O and are not mediated by `IoAction`.
-  `BatchAccumulator` stages proposals before draining (group commit);
+  inline. `BatchAccumulator` stages proposals before draining (group commit);
   `DeferredCompletionQueue` parks client futures. This matches the tech
   spec's description of `BatchAccumulator` and `DeferredEventQueue` patterns.
-  **Note:** The tech spec §6 states that "application callbacks are staged
-  and executed asynchronously outside the loop." This architecture refines
-  that statement: callbacks execute within the event loop's single-threaded
-  context (not on a separate task) to ensure they always see consistent
-  protocol state. They are "staged" in the sense that they are deferred
-  until state is updated — not offloaded to another thread or task.
 - **Timing parameters** (150–300 ms election timeout, 50 ms fetch interval)
   per §4.3.
 - **Quorum math** — majority is `⌊V/2⌋ + 1`; HW advancement uses
@@ -1913,48 +1987,76 @@ All crate names, trait definitions, and module structures below are
   the full lifecycle including leader self-removal. Consistent with tech
   spec §2.1.3.
 
-### Open Items for Sibling Documents
+#### Remaining Tech-Spec Deltas (2 items)
 
-- `implementation-plan.md`: This architecture defines WHAT to build.
-  The implementation plan should sequence the work — likely core election →
-  log replication → persistence → snapshot → membership → simulation harness.
-  The `IoStage` and `BatchAccumulator` should be implemented in the core
-  replication phase (they are not optional add-ons).
+The following two points are places where this architecture **supersedes**
+the tech spec. The architecture document is authoritative for both.
 
-  **Transport trait discrepancy (requires reconciliation):**
-  The implementation plan (Stage 1.4, Stage 1.7, Stage 3.1, Stage 3.3)
-  defines a single `Transport` trait with both `send(&self, ...)` and
-  `recv(&mut self)` methods. This architecture defines **split traits**:
-  `TransportSender` (outbound, `&self`, `Send + Sync`, called by `IoStage`)
-  and `TransportReceiver` (inbound, `&mut self`, `Send`, called by
-  `ReceiverTask`). The split is necessary for ownership: the sender must
-  be `Sync` for concurrent sends from `IoStage`, while the receiver takes
-  exclusive access for the single `ReceiverTask`. The implementation plan
-  should adopt the split-trait design (`TransportSender` /
-  `TransportReceiver`) and update Stages 1.4, 1.7, 3.1, and 3.3
-  accordingly. A single `TcpTransport` (or `ChannelTransport`) struct
-  may implement both traits and provide a `split()` method to yield
-  `(Box<dyn TransportSender>, Box<dyn TransportReceiver>)`.
+1. **Callback execution model.** Tech spec §6 (Event-loop pattern decision)
+   and §4.4.1 state that "application callbacks are staged and executed
+   asynchronously outside the loop." This architecture places callbacks
+   **synchronously inside** the event loop: `StateMachine::apply` and
+   `Listener::handle_commit` are invoked directly by the `EventLoop`
+   during message processing, before the `IoAction` batch is produced
+   (see §4.1 three-phase commit notification). This is a deliberate
+   design choice — callbacks must observe fully updated, consistent
+   protocol state (e.g., the current HW and voter set) before any
+   external I/O is dispatched. They are not offloaded to a separate task
+   or thread. The tech spec's phrase "staged outside the loop" should be
+   read as "deferred until state is fully updated" — not "dispatched on a
+   separate async task." The tech spec should be updated to match.
 
-  **Clock / IoStage grouping (requires reconciliation):**
-  The implementation plan (Stage 1.7) groups `Clock` alongside I/O traits
-  as injected `Box<dyn ...>` trait objects called by the `IoStage`. This
-  architecture categorises `Clock` as a **Runtime** trait used directly by
-  the `EventLoop` for timer management — not mediated by `IoAction` or the
-  `IoStage`. The implementation plan should reflect this distinction: Clock
-  is injected into `RaftNode` but passed to the `EventLoop`, not the
-  `IoStage`.
+2. **High-watermark semantics.** Tech spec §8 Glossary defines HW as
+   "Entries at or below the HW are considered committed" (inclusive).
+   This architecture uses **exclusive** semantics: entries with
+   `offset < HW` are committed; `HW − 1` is the last committed offset
+   (§3.1). The `e2e-scenarios.md` document explicitly maps between the
+   two: tech spec "entries ≤ N committed" = `HW = N + 1` in exclusive
+   notation. The exclusive convention is used throughout this architecture,
+   the implementation plan, and the e2e scenarios. The tech spec glossary
+   should be updated to use exclusive semantics for consistency.
 
-- `e2e-scenarios.md`: Sequence flows §5.1–§5.10 here define the "happy
-  path" and key failure modes including bootstrap (§5.9), crash recovery
-  (§5.10), and remove-voter (§5.6). The E2E document should define concrete
-  test scenarios with expected assertions for each flow.
+### Alignment with `implementation-plan.md`
 
-- `tech-spec.md`: The tech spec §8 Glossary defines HW as "Entries at or
-  below the HW are considered committed" which uses **inclusive** semantics.
-  This architecture uses **exclusive** semantics: entries with `offset < HW`
-  are committed. The e2e-scenarios document correctly notes this mapping
-  (tech spec "entries ≤ N committed" = architecture `HW = N + 1`). The
-  tech spec glossary should be updated to use exclusive semantics for
-  consistency: "HW is an exclusive upper bound; entries with offset < HW
-  are committed."
+The implementation plan is aligned with this architecture on all structural
+points:
+
+- **Transport split traits:** Stage 1.4 defines separate `TransportSender`
+  and `TransportReceiver` traits with the correct `&self` / `&mut self`
+  ownership semantics. Stage 1.7 injects them separately into `RaftNode`.
+  Stages 3.1 and 3.3 implement `split()` on `ChannelTransport` and
+  `TcpTransport` respectively. No reconciliation needed.
+
+- **Clock placement:** Stage 1.4 defines `Clock` as a Runtime trait, and
+  Stage 1.7 explicitly passes it to the `EventLoop` (not the `IoStage`).
+  `Clock` is not mediated by `IoAction`. No reconciliation needed.
+
+- **Callback model:** Stage 4.1 explicitly states that application
+  callbacks are NOT `IoAction` variants and are invoked synchronously by
+  the `EventLoop`. Stage 5.1/5.3 implement the three-phase commit
+  notification in fixed order. Aligned.
+
+- **Phase sequencing:** The plan sequences work as: core types → storage →
+  transport → election → replication → persistence/recovery → snapshot →
+  membership → test harness → integration tests → polish. The `IoStage`
+  and `BatchAccumulator` are implemented in Phases 4–5 (core consensus),
+  not deferred as optional add-ons.
+
+### Alignment with `e2e-scenarios.md`
+
+The e2e scenarios document is aligned with this architecture:
+
+- **Offset conventions:** Uses exclusive HW semantics matching §3.1.
+  `fetch_offset` is exclusive (follower has `[0, fetch_offset)`). The
+  offset convention preamble explicitly maps tech-spec inclusive notation
+  to architecture exclusive notation.
+
+- **RPC and role names:** Uses `Vote` (with `is_pre_vote`), `Fetch`,
+  `FetchSnapshot`, `AddVoter`, `RemoveVoter`, `UpdateVoter`. Roles are
+  Unattached, Follower, Candidate, Leader. Observer is a membership
+  classification, not a role.
+
+- **Bootstrap HW math:** The bootstrap scenario (Feature: Cluster
+  Bootstrap) shows HW advancing when the second voter's round-2 Fetch
+  arrives: `sorted desc [N1=2, N2=2, N3=0] → index 1 → 2`. This matches
+  the architecture's §5.9 bootstrap flow exactly.
