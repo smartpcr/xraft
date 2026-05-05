@@ -81,7 +81,8 @@ implementation of the Raft protocol as described in the reference material.
 | **Safety invariants** | Five invariants enforced at all times: (1) Leader election safety — at most one leader per term. (2) Append-only leader — leader never overwrites/deletes its own entries. (3) Leader completeness — elected leader has all committed entries from prior terms. (4) Log matching — if two logs have an entry with the same index and term, they are identical up to that index. (5) State machine safety — no two nodes apply different entries at the same index. | Red Hat article "Safety rules"; Raft paper §5.4 |
 | **Persistence** | `currentTerm`, `votedFor`, and the log are durably persisted to stable storage (`fsync`) before any acknowledgement. Voting state is stored separately from the log for performance and bootstrapping reasons (as in KRaft's `quorum-state` file). | Red Hat article "Safety rules" — persistence requirements |
 | **Heartbeats (implicit)** | In the pull-based model, there are no explicit heartbeat messages from leader to follower. Instead, followers send periodic `Fetch` RPCs to the leader; the leader's response — even when there are no new entries — resets the follower's election timeout, serving as an implicit heartbeat. The leader tracks the recency of each follower's `Fetch` requests to detect liveness (this information feeds Check Quorum). If a follower's `Fetch` interval exceeds the election timeout, that follower starts a new election — the leader does not proactively contact it. | Red Hat article "Log replication"; KRaft pull-based model |
-| **No-op commit on leader start** | A new leader commits a blank entry (`LeaderChangeMessage` in KRaft) to establish commit state for the new term. This commits any uncommitted entries from the previous epoch and prevents indefinite delays when no client writes occur. | Red Hat article "Log replication"; "Core RPCs" — LeaderChangeMessage |
+| **No-op commit on leader start** | A new leader appends a blank entry (`LeaderChangeMessage` in KRaft) to establish commit state for the new term. Prior-term entries become committed only once this new-term record itself reaches quorum (HW advances past it). This prevents indefinite delays when no client writes occur. | Red Hat article "Log replication"; "Core RPCs" — LeaderChangeMessage |
+| **Control records vs application records** | The log contains two classes of entries: (1) **application records** — client-submitted commands forwarded to the `StateMachine`, and (2) **consensus control records** — protocol-internal entries such as `LeaderChangeMessage` and `VotersRecord`. Control records are owned by xraft and are never exposed to the application's `StateMachine::apply`. Snapshots separate consensus metadata (term, vote, voter set, log bounds) from the application state payload. | KRaft design — `VotersRecord`, `LeaderChangeMessage`; Raft paper §7 |
 
 #### 2.1.2 Log Compaction
 
@@ -126,10 +127,10 @@ implementation. This is a compile-time linked library, not a network service.
 
 | Capability | Proposed Signature |
 |------------|--------------------|
-| **`propose(command) → Future<Result>`** | Submit a command to the replicated log. Returns a future that resolves when the entry is committed (HW has advanced past it). |
+| **`propose(command) → Future<Result>`** | Submit a command to the replicated log. Returns a future that resolves when the entry is committed (HW has advanced past it). The API is **at-least-once**: after leader failover or client timeout, a retry may append the same logical command twice. Applications must ensure commands are idempotent (e.g., via application-level request IDs / dedup). xraft does not perform built-in deduplication. |
 | **`read() → Result<State>`** | Read the current committed state. Initial implementation routes reads through the log for safety. |
 | **Listener trait** | Applications implement callbacks: `handle_commit(batch)`, `handle_load_snapshot(reader)`, `handle_leader_change(leader_id, term)`, `begin_shutdown()`. Modelled on KRaft's `RaftClient.Listener` interface. |
-| **State machine trait** | `trait StateMachine { fn apply(&mut self, entry: &Entry) -> Result<()>; fn snapshot(&self) -> Result<Snapshot>; fn restore(&mut self, snapshot: Snapshot) -> Result<()>; }` — applications provide their own state machine. Generic (monomorphised at compile time) for zero-cost abstraction. |
+| **State machine trait** | `trait StateMachine { fn apply(&mut self, entry: &AppRecord) -> Result<()>; fn snapshot(&self) -> Result<AppSnapshot>; fn restore(&mut self, snapshot: AppSnapshot) -> Result<()>; }` — applications provide their own state machine. The trait receives only **application records** (`AppRecord`); consensus control records are handled internally by xraft and never reach `apply`. Snapshots are split: xraft owns consensus metadata (term, voter set, log bounds); the application owns its payload via `AppSnapshot`. Generic (monomorphised at compile time) for zero-cost abstraction. |
 
 > **Scope boundary:** xraft provides the consensus library and test harness.
 > Building a key-value store, message queue, or any application-layer service
@@ -142,6 +143,42 @@ implementation. This is a compile-time linked library, not a network service.
 | **Metrics** | Expose key metrics mirroring KRaft's `raft-metrics` group: `current-leader`, `current-epoch`, `election-latency-avg`, `append-records-rate`, `commit-latency-avg`. Exposed as Rust structs; integration with Prometheus/OpenTelemetry is an extension concern. | Red Hat article "KRaft protocol" — metrics list |
 | **Deterministic simulation** | Support deterministic testing with injectable clocks, network, and storage to verify correctness under adversarial conditions. | — |
 | **Integration test harness** | Multi-node in-process cluster for scenario-based testing. Scenarios cover leader failure, network partition, log divergence, snapshot transfer, and membership changes. | — |
+
+#### 2.1.7 Bootstrap & Recovery
+
+| Capability | Detail | Reference |
+|------------|--------|-----------|
+| **Cluster bootstrap** | Initial cluster formation from a static voter set. The first leader commits a `VotersRecord` control record during bootstrap. Nodes identify the cluster via a `clusterId` UUID generated at bootstrap time. | KRaft bootstrap — `VotersRecord`; Red Hat article "Metadata management" |
+| **Persistent quorum state** | Each node persists `currentTerm`, `votedFor`, and `votedDirectoryId` in a `quorum-state` file separate from the log, read at startup before any RPCs are processed. | Red Hat article "Metadata management" — `quorum-state` file |
+| **Crash recovery** | On restart, a node recovers by: (1) reading `quorum-state` for term/vote, (2) loading the most recent snapshot (if any) for state machine and voter set, (3) replaying log entries after the snapshot offset, (4) resuming as a follower. | Raft paper §5.2; KRaft recovery model |
+| **Empty/uninitialized node** | A new node with no log and no snapshot joins as an observer. If it is behind the leader's LSO, it receives a snapshot via `FetchSnapshot` before normal log replication can proceed. | Red Hat article "Core RPCs" — SnapshotId |
+
+#### 2.1.8 KRaft Adaptation Mapping
+
+The following table clarifies which KRaft mechanisms xraft adopts, adapts, or
+intentionally omits. This prevents ambiguity about the design's relationship
+to the reference material.
+
+| KRaft Mechanism | xraft Status | Notes |
+|-----------------|-------------|-------|
+| Pull-based `Fetch` replication | **Adopted** | Core replication model; see §2.1.1 |
+| `Vote` RPC (two-phase with Pre-Vote) | **Adopted** | Includes Pre-Vote and Check Quorum |
+| `FetchSnapshot` chunked transfer | **Adopted** | Follower-initiated; see §2.1.2 |
+| `DivergingEpoch` log truncation | **Adopted** | Fetch response field for divergence detection |
+| `LeaderChangeMessage` no-op | **Adopted** | Control record on leader start; prior-term entries commit once this record reaches quorum |
+| `VotersRecord` for membership | **Adopted** | Control record in log + snapshot |
+| `AddRaftVoter` / `RemoveRaftVoter` / `UpdateRaftVoter` | **Adopted** | Renamed `AddVoter` / `RemoveVoter` / `UpdateVoter` |
+| `leader-epoch-checkpoint` | **Adopted** | In-memory cache for fast divergence detection |
+| High watermark (HW) commit tracking | **Adopted** | Leader tracks follower fetch offsets |
+| `BatchAccumulator` staged append | **Adapted** | xraft uses a similar batching buffer; exact API differs |
+| `DeferredEventQueue` (purgatory) | **Adapted** | Client futures parked until HW advances past their offset |
+| Single-threaded `KafkaEventQueue` | **Adapted** | xraft consensus core uses single-threaded async event loop (§4.4) |
+| Three-layer architecture | **Adapted** | xraft maps to: Application API → Consensus Core (`xraft-core`) → State Machine apply pipeline |
+| `__cluster_metadata` topic | **Not adopted** | Kafka-specific; xraft uses a generic replicated log |
+| `metadata.version` / feature gates | **Not adopted** | Kafka versioning scheme; not needed for single-purpose library |
+| `BrokerRegistration` / `BrokerHeartbeat` | **Not adopted** | Kafka broker lifecycle; observers replicate via `Fetch` only |
+| Kafka wire protocol (binary format) | **Not adopted** | xraft uses `serde` + `bincode` (§6) |
+| `NO_OP_RECORD` (KIP-835) | **Not adopted** | Kafka internal; xraft uses `LeaderChangeMessage` equivalent only |
 
 ### 2.2 Out of Scope
 
@@ -240,22 +277,34 @@ broadcastTime  <<  electionTimeout  <<  avgTimeBetweenFailures
 > serving as an implicit heartbeat. The Raft timing invariant still applies:
 > `fetchInterval << electionTimeout << avgTimeBetweenFailures`.
 
-### 4.4 Design Recommendations
+### 4.4 Implementation Commitments
 
-The following are strong design recommendations that shape the implementation.
-They are not externally mandated but are adopted based on engineering judgment
-and alignment with the reference material. They may be revisited if evidence
-warrants a different choice, but changing them requires explicit justification.
+The following are engineering commitments adopted based on judgment and
+alignment with the reference material. They shape the implementation and may
+be revisited if evidence warrants, but changing them requires explicit
+justification.
 
-| Recommendation | Detail | Rationale |
-|----------------|--------|-----------|
+#### 4.4.1 Protocol & Correctness
+
+| Commitment | Detail | Rationale |
+|------------|--------|-----------|
 | **Async runtime: `tokio`** | All I/O (network, disk) is async, using the `tokio` runtime. | De facto standard for async Rust; broadest ecosystem support. |
+| **Single-threaded event loop (non-blocking)** | The core consensus state machine runs on a single-threaded event loop (as in KRaft's `KafkaRaftClient`). The consensus loop only mutates protocol state; disk I/O (`fsync`), snapshot streaming, batch accumulation, and application callbacks are staged and executed asynchronously outside the loop. This prevents slow I/O from delaying `Fetch` handling and triggering spurious elections. Follows the KRaft pattern of `BatchAccumulator` (stages records before draining) and `DeferredEventQueue` (parks client futures until commit). | Eliminates concurrency bugs in the consensus core; matches KRaft's architecture. Prevents election-timeout-triggered instability under I/O load. |
+| **Deterministic testing** | All time-dependent and I/O-dependent behaviour must be injectable for deterministic simulation (see §2.1.6). | Enables reproducible testing of edge cases that are impossible to trigger reliably with wall-clock time and real I/O. |
+| **Workspace layout** | Proposed Cargo workspace with separate crates: `xraft-core` (consensus state machine), `xraft-transport` (async RPC), `xraft-storage` (durable log and snapshots), and `xraft-test` (deterministic simulation harness). These crates do not exist yet — the repository is greenfield (see §1.2). | Separation of concerns; enables independent testing and versioning of each layer. |
+
+#### 4.4.2 Code Quality
+
+| Commitment | Detail | Rationale |
+|------------|--------|-----------|
 | **No `unsafe`** | Avoid `unsafe` blocks except where absolutely required for FFI or performance-critical paths, with documented justification and `// SAFETY:` comments. | Reduces the surface area for memory-safety bugs in a correctness-critical system. |
 | **`#![deny(clippy::all)]`** | All code must pass clippy with no warnings. | Catches common Rust pitfalls early. |
 | **`#[must_use]`** | Applied to all Result-returning public functions. | Prevents silent error swallowing. |
-| **Single-threaded event loop** | The core consensus state machine runs on a single-threaded event loop (as in KRaft's `KafkaRaftClient`). External I/O is dispatched to async tasks. | Eliminates concurrency bugs in the consensus core; matches KRaft's architecture. |
-| **Deterministic testing** | All time-dependent and I/O-dependent behaviour must be injectable for deterministic simulation (see §2.1.6). | Enables reproducible testing of edge cases that are impossible to trigger reliably with wall-clock time and real I/O. |
-| **Workspace layout** | Proposed Cargo workspace with separate crates: `xraft-core` (consensus state machine), `xraft-transport` (async RPC), `xraft-storage` (durable log and snapshots), and `xraft-test` (deterministic simulation harness). These crates do not exist yet — the repository is greenfield (see §1.2). | Separation of concerns; enables independent testing and versioning of each layer. |
+
+#### 4.4.3 Process
+
+| Commitment | Detail | Rationale |
+|------------|--------|-----------|
 | **Branch strategy** | Feature branches off `main`, PR-based review. | Standard collaborative development workflow. |
 
 ---
@@ -272,6 +321,9 @@ warrants a different choice, but changing them requires explicit justification.
 | R4 | **Snapshot transfer for large state** — Chunked snapshot transfer over the network can be slow and may block normal replication. | Low | Medium | Stream snapshots in chunks with progress tracking. Allow follower to continue fetching log entries that arrive after the snapshot offset while the transfer is in progress. |
 | R5 | **Dynamic quorum correctness** — Adding/removing nodes while elections and replication are in flight is the most error-prone part of Raft. | Medium | Critical | Enforce single-node changes only. Extensive scenario testing covering add-during-election, remove-leader, and add-while-partitioned cases. Consider formal verification of the membership-change state machine (TLA+ spec or Kani model checker for Rust). |
 | R6 | **Incomplete reference material** — The third reference URL (`dragotin/kraft`) is an unrelated invoicing application, reducing the available reference implementations to two articles (descriptive, not source code). No Rust reference implementation of KRaft-style Raft exists. | Low | Medium | Supplement with the original Raft paper (Ongaro & Ousterhout, 2014), the `etcd/raft` Go implementation, and the `openraft` Rust crate as cross-references. |
+| R7 | **Log/snapshot corruption and torn writes** — Crash during `fsync` can leave partial writes in the log or snapshot files. Recovery must handle truncated segments, partial records, and corrupt CRC checksums without data loss beyond the uncommitted tail. | Medium | Critical | Every log segment and snapshot chunk includes CRC-32C checksums. On recovery, scan forward and truncate at first corrupt/incomplete record. Use `O_DSYNC` or explicit `fsync` before advancing any durable offset. Write snapshot atomically via rename (write to temp file, `fsync`, rename). |
+| R8 | **Memory/backpressure under load** — Unbounded pending proposals, snapshot transfers in flight, or large fetch-lag deltas can exhaust memory. The pull-based model amplifies this: if followers are slow, the leader accumulates entries with no push-side backpressure. | Medium | High | Bound the proposal queue (reject with `Busy` if full). Cap in-flight snapshot transfers per node. Limit the batch size in `Fetch` responses. Monitor log-end-offset minus HW as a lag metric. |
+| R9 | **Two-round commit visibility latency** — In the pull-based model, a follower needs two `Fetch` rounds to see a newly committed entry: one to replicate it, and a second to receive the updated HW. Under low fetch rates this can add perceptible latency. | Low | Medium | Document the two-round property. Tune `fetchInterval` to be much smaller than `electionTimeout`. Consider adaptive fetch frequency (faster when writes are in flight). |
 
 ### 5.2 Project Risks
 
@@ -289,10 +341,10 @@ warrants a different choice, but changing them requires explicit justification.
 High      │             │               │              │ R1             │
 Likelihood│             │               │              │                │
           ├─────────────┼───────────────┼──────────────┼────────────────┤
-Medium    │ P3          │ R4            │ R2, R3, P1,  │ R5             │
-Likelihood│             │               │ P2           │                │
+Medium    │ P3          │ R4            │ R2, R3, R8,  │ R5, R7         │
+Likelihood│             │               │ P1, P2       │                │
           ├─────────────┼───────────────┼──────────────┼────────────────┤
-Low       │             │ R6            │              │                │
+Low       │             │ R6, R9        │              │                │
 Likelihood│             │               │              │                │
           └─────────────┴───────────────┴──────────────┴────────────────┘
 ```
@@ -313,6 +365,10 @@ the architecture and implementation-plan documents if they are produced.
 | **Serialisation format** | (A) protobuf, (B) flatbuffers, (C) custom binary, (D) serde + bincode | serde + bincode (D) — simplest for Rust-native use; protobuf if cross-language support is needed later. | **Decided** — Rust-native scope (§2.2) makes bincode the natural choice. |
 | **State machine interface** | (A) Trait object (`dyn StateMachine`), (B) Generic (`impl StateMachine`) | Generic (B) — zero-cost abstraction, monomorphised at compile time. | **Decided** |
 | **Log storage** | (A) Segment files (Kafka-style), (B) Single append-only file, (C) Embedded DB (sled/rocksdb) | Segment files (A) — natural fit for truncation and compaction. Each segment covers a range of offsets. | **Decided** — aligns with KRaft's segment-based log and §3 Non-Goals item 4 (single backend). |
+| **Event-loop pattern** | (A) Blocking single thread, (B) Non-blocking single-threaded async loop with staged I/O | Non-blocking async loop (B) — consensus state mutations are synchronous within the loop; disk I/O, snapshot streaming, and application callbacks are offloaded to async tasks. Follows KRaft's `KafkaEventQueue` / `BatchAccumulator` / `DeferredEventQueue` pattern. | **Decided** — see §4.4. |
+| **Proposal batching** | (A) One-at-a-time append, (B) Batched accumulator with drain | Batched accumulator (B) — proposals are staged in a `BatchAccumulator` and drained to the log on a configurable interval or when the batch is full. Improves throughput by amortising `fsync` cost (group commit). | **Decided** — adapted from KRaft's `BatchAccumulator`. |
+| **Client commit notification** | (A) Polling, (B) Future/channel per proposal, (C) Callback | Future per proposal (B) — each `propose()` call returns a `Future` that resolves when HW advances past the entry's offset. Internally implemented via a deferred-completion queue (adapted from KRaft's `DeferredEventQueue`). | **Decided** |
+| **Log integrity** | (A) No checksums, (B) CRC per record, (C) CRC per batch | CRC-32C per batch (C) — each batch written to a log segment includes a CRC-32C checksum. On recovery, the log is scanned forward; the first batch with a bad CRC triggers truncation of that batch and everything after it. | **Decided** — see risk R7 mitigation. |
 
 ---
 
@@ -321,21 +377,28 @@ the architecture and implementation-plan documents if they are produced.
 The implementation is complete when:
 
 1. A 3-node cluster can elect a leader, replicate entries, and survive the
-   failure of any single node without data loss.
-2. A 5-node cluster can survive the failure of any two nodes.
+   failure of any single node without data loss. Leader election completes
+   within 2× `electionTimeout` after a leader crash.
+2. A 5-node cluster can survive the failure of any two nodes while continuing
+   to commit entries.
 3. All five Raft safety invariants are verified by deterministic simulation
    tests covering: normal operation, leader failure, network partition,
-   log divergence, and snapshot transfer.
+   log divergence, snapshot transfer, and crash-recovery. Zero committed
+   entries are lost across any crash/restart matrix.
 4. Dynamic membership changes (add/remove one node) complete without
-   violating safety invariants.
+   violating safety invariants. Membership change takes effect within a
+   bounded number of fetch rounds after the `VotersRecord` is committed.
 5. Pre-Vote and Check Quorum mechanisms prevent disruptive elections by
-   isolated nodes.
-6. Log compaction via snapshots keeps disk usage bounded under sustained
-   write load.
+   isolated nodes. Verified by partition simulation tests.
+6. Log compaction via snapshots keeps disk usage bounded: at most one segment
+   beyond the latest snapshot offset is retained under sustained write load.
 7. Key metrics (leader ID, epoch, election latency, commit latency, append
-   rate) are exposed and observable.
+   rate) are exposed and validated by integration tests that assert on
+   metric values (not just existence).
 8. `cargo test` passes with zero failures. `cargo clippy` reports zero
    warnings. `cargo doc` generates complete API documentation.
+9. Crash recovery from log + snapshot + `quorum-state` file restores a node
+   to a consistent state and it rejoins the cluster as a follower.
 
 ---
 
@@ -347,9 +410,18 @@ The implementation is complete when:
 | **Epoch** | KRaft's name for a term. Used interchangeably in this document. |
 | **High watermark (HW)** | The highest log offset replicated by a majority of voters. Entries at or below the HW are considered committed. |
 | **Log start offset (LSO)** | The lowest offset still present in the log (entries before this have been compacted/snapshotted). |
+| **Log end offset (LEO)** | The offset of the next entry to be appended. `LEO - 1` is the last entry in the log. |
 | **Voter** | A node that participates in elections and contributes to quorum for commits. |
 | **Observer** | A node that replicates the log but does not vote. Analogous to a KRaft broker or a Raft learner. |
+| **Quorum** | A majority of voters (⌊N/2⌋ + 1 out of N voters). Required for election and commit. |
 | **Pre-Vote** | A two-phase election protocol where a candidate checks viability before incrementing the term. |
 | **Check Quorum** | Mechanism where the leader verifies it can reach a majority of voters, stepping down if it cannot. |
 | **Diverging epoch** | A fetch response field indicating the follower's log has diverged from the leader's, triggering truncation. |
-| **No-op entry** | A blank log entry committed by a new leader to establish its commit state for the new term. |
+| **Leader-epoch checkpoint** | An in-memory index mapping each epoch to its start offset, used for fast divergence detection during `Fetch` validation. |
+| **No-op entry** | A blank log entry appended by a new leader to establish its commit state for the new term. |
+| **Control record** | A log entry owned by the consensus layer (e.g., `LeaderChangeMessage`, `VotersRecord`), not exposed to the application state machine. |
+| **Application record** | A log entry containing a client-submitted command, forwarded to the application `StateMachine::apply`. |
+| **Cluster ID** | A UUID assigned at cluster bootstrap time, included in every RPC for identity verification. |
+| **Snapshot** | A point-in-time capture of the state machine plus consensus metadata (term, voter set, last-applied offset), used for log compaction and node catch-up. |
+| **BatchAccumulator** | A staging buffer that collects proposed entries before draining them to the log in a single batch (group commit). |
+| **DeferredEventQueue** | A completion queue that parks client futures until the HW advances past their entry's offset (adapted from KRaft's purgatory pattern). |
