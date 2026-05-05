@@ -2133,252 +2133,132 @@ pub struct RaftMetrics {
 
 ## 7. Alignment Notes
 
-### Consistency with `tech-spec.md`
+This section records the alignment status between this architecture and
+the three sibling planning documents, based on their content as of the
+current iteration. All four documents share a greenfield context — no
+Rust source code exists yet. Concepts listed as "aligned" have been
+verified against the sibling document's current text.
 
-This architecture is designed to be consistent with the tech spec.
-All crate names, trait definitions, and module structures are
-**proposed designs** — no Rust source code exists in the repository yet.
+### 7.1 Conventions Agreed Across All Four Documents
 
-- **Proposed crate layout** matches tech spec §4.4: `xraft-core`,
-  `xraft-transport`, `xraft-storage`, `xraft-test`.
-- **RPC names** match §2.1.4: `Vote`, `Fetch`, `FetchSnapshot`, `AddVoter`,
-  `RemoveVoter`, `UpdateVoter`.
-- **Pull-based replication** per §3 Non-Goals item 2 — no `AppendEntries`.
-- **Serialisation** uses `serde` + `bincode` per §6 Key Design Decisions.
-- **State machine interface** is generic (monomorphised) per §6:
-  `RaftNode<S: StateMachine, L: Listener>`. Both application traits use
-  synchronous methods (`fn`, not `async fn`) and are invoked directly by
-  the event loop — they are not external I/O. The `StateMachine` trait
-  receives only `AppRecord` values; control records (`LeaderChangeMessage`,
-  `VotersRecord`) are handled internally by xraft and never reach `apply`.
-  The `StateMachine::query()` method supports linearizable reads (§5.11).
-  This matches §2.1.1: "Control records are owned by xraft and are never
-  exposed to the application's `StateMachine::apply`." Snapshots are split:
-  `SnapshotMetadata` (consensus) and `AppSnapshot` (application).
-  I/O traits are separated into three categories (§4.1):
-  **Storage / Network-Send I/O** (`LogStore`, `TransportSender`,
-  `QuorumStateStore`, `SnapshotIO`) are injected as `Box<dyn ...>` trait
-  objects, use `#[async_trait]`, require `Send + Sync + 'static`, and all
-  methods take `&self` (implementations use interior mutability). They are
-  called exclusively by the `IoStage` when executing `IoAction` batches —
-  never directly by the event loop. The `IoStage` borrows them via `&self`
-  for concurrent dispatch; no `Arc` is needed because the `IoStage` is the
-  sole owner and the `Sync` bound enables safe shared borrowing.
-  **Runtime** traits (`TransportReceiver`, `Clock`) are also injected as
-  trait objects, but are NOT called by the `IoStage`:
-  `TransportReceiver` is called by the `ReceiverTask` (§4.4) which feeds
-  the event loop's mpsc channel; `Clock` is used directly by the
-  `EventLoop` for timer management (election timeouts, check-quorum
-  deadlines). Neither is mediated by `IoAction`.
-- **`read()` API** — tech spec §2.1.5 says `read() → Result<State>` and
-  "routes reads through the log for safety." This architecture implements
-  the log-routing as leadership proof: `read()` waits for a committed
-  current-term entry (the `LeaderChangeMessage`), then queries
-  `StateMachine::query()` synchronously inside the event loop (§5.11).
-  No per-read entry is appended to the log. The return type is
-  `S::ReadResult` (application state), not `ConsensusState` (protocol
-  metadata, available via `RaftNode::metrics()`). Tech spec §2.2
-  explicitly marks optimised read paths (read-index, lease-based) as out
-  of scope.
-- **Segment-file log storage** per §6.
-- **I/O staging** per tech spec §4.4.1 — the event loop produces `IoAction`
-  values and the `IoStage` executes them via injected trait objects for all
-  external I/O (disk, network). The loop never directly awaits external I/O
-  inline. `BatchAccumulator` stages proposals before draining (group commit);
-  `DeferredCompletionQueue` parks client futures. This matches the tech
-  spec's description of `BatchAccumulator` and `DeferredEventQueue` patterns.
-- **Timing parameters** (150–300 ms election timeout, 50 ms fetch interval)
-  per §4.3.
-- **Quorum math** — majority is `⌊V/2⌋ + 1`; HW advancement uses
-  descending-sorted voter `fetch_offset` values at index `⌊V/2⌋`. HW is
-  an exclusive upper bound (entry at offset O is committed when O < HW).
-  Consistent with §2.1.1 of the tech spec.
-- **Bootstrap & recovery** (§5.9, §5.10) align with tech spec §2.1.7.
-  Bootstrap uses static voter set → leader commits `VotersRecord`. Recovery
-  reads `quorum-state` → loads snapshot → scans log → resumes as follower
-  → learns HW from leader → applies committed entries.
-- **Membership changes** — §5.5 (AddVoter) and §5.6 (RemoveVoter) cover
-  the full lifecycle including leader self-removal. Consistent with tech
-  spec §2.1.3.
+The following conventions are consistent across architecture, tech spec,
+implementation plan, and e2e scenarios:
 
-#### Resolved Cross-Document Conventions (4 items)
+| Convention | Detail |
+|------------|--------|
+| **Proposed crate layout** | `xraft-core`, `xraft-transport`, `xraft-storage`, `xraft-test` (tech spec §4.4, impl plan Stage 1.1, e2e preamble). |
+| **RPC names** | `Vote`, `Fetch`, `FetchSnapshot`, `AddVoter`, `RemoveVoter`, `UpdateVoter` (tech spec §2.1.4, impl plan Stage 1.3, e2e preamble). |
+| **Pull-based replication** | Followers `Fetch` from leader; no push-based `AppendEntries` (tech spec §3, e2e preamble). |
+| **Serialisation** | `serde` + `bincode` (tech spec §6). |
+| **Control record filtering** | `StateMachine::apply` receives only `AppRecord`; `LeaderChangeMessage` and `VotersRecord` are handled internally by xraft (tech spec §2.1.5, impl plan Stage 1.4, e2e Feature: Client Interaction). |
+| **Snapshot split** | `SnapshotMetadata` (consensus) + `AppSnapshot` (application). |
+| **I/O trait object ownership** | All Storage / Network-Send I/O traits injected as `Box<dyn ...>` — no `Arc`. The `IoStage` borrows via `&self` with `Sync` bound (impl plan Stage 1.7). |
+| **Transport split** | Separate `TransportSender` (`&self`, `Sync`) and `TransportReceiver` (`&mut self`, not `Sync`). `split()` method on `TcpTransport` / `ChannelTransport` (impl plan Stage 1.4, §4.4). |
+| **Clock placement** | `Clock` is a Runtime trait, passed to the `EventLoop` (not the `IoStage`), not mediated by `IoAction` (impl plan Stage 1.4/1.7). |
+| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state → snapshot → log scan → resume as follower → learn HW from leader (tech spec §2.1.7, impl plan Phase 6). |
+| **Timing parameters** | 150–300 ms election timeout (randomised), 50 ms fetch interval (tech spec §4.3). |
+| **Quorum math** | Majority = `⌊V/2⌋ + 1`; HW = descending-sorted voter offsets at index `⌊V/2⌋` (0-indexed). Only voters count; observers do not contribute to quorum. |
+| **Exclusive HW semantics** | Entry at offset O is committed ⟺ `O < HW`. `HW − 1` is the last committed offset. All three implementation-facing documents (architecture, impl plan, e2e scenarios) use this convention (§3.1, e2e preamble). |
 
-The following points were identified during parallel drafting where
-sibling documents' phrasing and this architecture's detailed design needed
-reconciliation. Items 1–2 are agreed across all documents. Items 3–4 are
-active discrepancies where this architecture states the canonical design
-and the sibling documents require updates.
+### 7.2 Alignment with `e2e-scenarios.md` — Fully Aligned
 
-1. **Callback execution model.** The tech spec §4.4.1 uses the phrase
-   "application callbacks are staged and executed asynchronously outside
-   the loop." The precise design, detailed in this architecture's §4.1
-   (four-phase commit notification), is: `StateMachine::apply`,
-   `Listener::handle_commit`, `DeferredCompletionQueue::complete`, and
-   `DeferredReadQueue::drain` are **synchronous, in-process method calls**
-   invoked directly by the `EventLoop` during message processing, after
-   protocol state is fully updated but before the `IoAction` batch is
-   dispatched. "Staged outside" means callbacks are deferred until state
-   is consistent — not offloaded to a separate async task or thread.
-   The implementation plan (Stage 4.1, Stage 5.1/5.3) and e2e scenarios
-   both use this same synchronous-callback convention. The tech spec's
-   shorthand should be read consistently with this definition.
-
-2. **High-watermark semantics.** The tech spec §8 Glossary uses inclusive
-   phrasing ("entries at or below the HW are considered committed").
-   All three sibling documents (architecture, implementation plan, e2e
-   scenarios) use **exclusive** semantics: an entry at offset O is
-   committed if and only if `O < HW`; equivalently, `HW − 1` is the
-   last committed offset (§3.1). The mapping is: tech spec "entries ≤ N
-   committed" corresponds to `HW = N + 1` in exclusive notation. The
-   exclusive convention is the canonical one for implementation purposes.
-
-3. **`read()` semantics — ACTIVE DISCREPANCY.** This is the most
-   significant cross-document inconsistency. The four documents define
-   `read()` differently:
-
-   | Document | `read()` returns | Leader-only? | Mechanism |
-   |----------|-----------------|-------------|-----------|
-   | **Tech spec** §2.1.5 | `Result<State>` (ambiguous) | Unspecified | "routes reads through the log for safety" |
-   | **Architecture** §5.11 | `S::ReadResult` (application state via `StateMachine::query()`) | **Yes** — followers return `NotLeader` | Leadership proof: waits for committed current-term entry, then queries state machine synchronously |
-   | **Implementation plan** Stage 1.7 / 5.3 | `Result<ConsensusState>` (protocol metadata) | **No** — any node | Returns local protocol state snapshot |
-   | **E2e scenarios** Feature: Client Interaction | `ConsensusState` (protocol metadata) | **No** — any node | Returns local protocol state; "application reads its own StateMachine state directly (not via read())" |
-
-   **This architecture's §5.11 is the canonical design.** Rationale:
-
-   - The tech spec says "routes reads through the log for safety," which
-     implies linearizable application-state reads — not just returning
-     protocol metadata (which requires no log routing).
-   - Returning `ConsensusState` from `read()` is redundant with
-     `RaftNode::metrics() → RaftMetrics` (§6.4), which already exposes
-     non-linearizable protocol metadata on any node.
-   - The value of a `read()` API is linearizable access to application
-     state — the guarantee that the returned state reflects all prior
-     commits. Returning protocol metadata provides no such guarantee
-     and does not justify the complexity of leadership confirmation.
-
-   **Required sibling-doc updates:**
-
-   - **Implementation plan:** `read()` signature should change from
-     `Result<ConsensusState>` to `Result<S::ReadResult>`. The
-     `StateMachine` trait should gain `type ReadResult: Send + 'static`
-     and `fn query(&self) -> Result<Self::ReadResult>`. The `read()`
-     implementation should use the leadership-proof mechanism (§5.11):
-     confirm current-term entry committed, then invoke
-     `StateMachine::query()` synchronously within the event loop.
-     Add `DeferredReadQueue` as step 4 of commit notification.
-   - **E2e scenarios:** The five read-related scenarios should be
-     rewritten: `read()` returns application state on leader only;
-     followers return `NotLeader`. Protocol metadata access should
-     use `RaftNode::metrics()` (which is already tested in Feature:
-     Observability and Metrics).
-
-4. **I/O trait object ownership — `Box<dyn>` (not `Arc<dyn>`).** All
-   Storage / Network-Send I/O traits (`LogStore`, `TransportSender`,
-   `QuorumStateStore`, `SnapshotIO`) are injected as `Box<dyn ...>` trait
-   objects. The `IoStage` is the sole owner and borrows them via `&self`
-   for concurrent dispatch — the `Sync` bound enables safe shared
-   borrowing without `Arc`. This matches the implementation plan (Stage
-   1.7), which also uses `Box<dyn ...>` for all I/O trait objects.
-   Runtime traits (`TransportReceiver`, `Clock`) are likewise `Box<dyn>`.
-   The `split()` method on `TcpTransport` and `ChannelTransport` returns
-   `(Box<dyn TransportSender>, Box<dyn TransportReceiver>)`. All
-   documents are aligned on this convention.
-
-### Alignment with `implementation-plan.md`
-
-The implementation plan is aligned with this architecture on most structural
-points. Two items require updates in the implementation plan:
-
-- **Transport split traits:** Stage 1.4 defines separate `TransportSender`
-  and `TransportReceiver` traits with the correct `&self` / `&mut self`
-  ownership semantics. Stage 1.7 injects them separately into `RaftNode`
-  as `Box<dyn ...>` (matching this architecture's `Box<dyn ...>` convention).
-  Stages 3.1 and 3.3 implement `split()` on `ChannelTransport` and
-  `TcpTransport` respectively. **Aligned** — no reconciliation needed.
-
-- **I/O trait object ownership:** Stage 1.7 injects all I/O traits as
-  `Box<dyn ...>` trait objects, matching this architecture's convention
-  (§4.1). **Aligned** — no reconciliation needed.
-
-- **Clock placement:** Stage 1.4 defines `Clock` as a Runtime trait, and
-  Stage 1.7 explicitly passes it to the `EventLoop` (not the `IoStage`).
-  `Clock` is not mediated by `IoAction`. **Aligned** — no reconciliation
-  needed.
-
-- **Callback model:** Stage 4.1 explicitly states that application
-  callbacks are NOT `IoAction` variants and are invoked synchronously by
-  the `EventLoop`. Stage 5.1/5.3 implement the commit notification
-  in fixed order. **Aligned** on the synchronous-callback convention.
-  Note: this architecture extends the notification to four phases
-  (adding `DeferredReadQueue::drain` as step 4); the implementation
-  plan should adopt this addition when implementing `read()`.
-
-- **`read()` semantics — REQUIRES UPDATE.** Stage 1.7 defines
-  `read() → Result<ConsensusState>` (returns protocol metadata, available
-  on any node). Stage 5.3 implements it as a non-blocking local state
-  snapshot. This architecture defines `read()` as returning application
-  state (`S::ReadResult` via `StateMachine::query()`) with linearizable
-  leadership proof, leader-only (§5.11). Consensus metadata is available
-  separately via `RaftNode::metrics()`. **Action needed:** the
-  implementation plan's `read()` signature should change to return
-  `S::ReadResult`. The `StateMachine` trait should gain
-  `type ReadResult: Send + 'static` and `fn query(&self)`. The
-  implementation should use the leadership-proof mechanism described in
-  §5.11. See Resolved Cross-Document Conventions item 3 above for full
-  rationale.
-
-- **LogStore `&self` methods — REQUIRES UPDATE.** This architecture uses
-  `&self` for all `LogStore` methods (including `append`,
-  `truncate_suffix`, `truncate_prefix`) with interior mutability,
-  consistent with `SnapshotIO` and `QuorumStateStore`. The implementation
-  plan (Stage 1.4) defines `LogStore` with `&mut self` for write methods
-  (`append(&mut self, ...)`, `truncate_suffix(&mut self, ...)`,
-  `truncate_prefix(&mut self, ...)`). **Action needed:** write methods
-  should change to `&self` with interior mutability (e.g.,
-  `tokio::sync::Mutex<File>`) to match the `IoStage`'s concurrent
-  dispatch model. The `IoStage` holds all I/O trait objects as owned
-  `Box<dyn ...>` fields and borrows them via `&self` for `tokio::join!`
-  across trait objects — `&mut self` on `LogStore` would prevent this
-  concurrent borrowing.
-
-- **Phase sequencing:** The plan sequences work as: core types → storage →
-  transport → election → replication → persistence/recovery → snapshot →
-  membership → test harness → integration tests → polish. The `IoStage`
-  and `BatchAccumulator` are implemented in Phases 4–5 (core consensus),
-  not deferred as optional add-ons.
-
-### Alignment with `e2e-scenarios.md`
-
-The e2e scenarios document is aligned with this architecture on most
-points, with one significant discrepancy:
+The e2e scenarios document is consistent with this architecture on all
+points:
 
 - **Offset conventions:** Uses exclusive HW semantics matching §3.1.
-  `fetch_offset` is exclusive (follower has `[0, fetch_offset)`). The
-  offset convention preamble explicitly maps tech-spec inclusive notation
-  to architecture exclusive notation. **Aligned.**
-
-- **RPC and role names:** Uses `Vote` (with `is_pre_vote`), `Fetch`,
-  `FetchSnapshot`, `AddVoter`, `RemoveVoter`, `UpdateVoter`. Roles are
+  The offset convention preamble explicitly maps tech-spec inclusive
+  notation to architecture exclusive notation.
+- **RPC and role names:** `Vote` (with `is_pre_vote`), `Fetch`,
+  `FetchSnapshot`, `AddVoter`, `RemoveVoter`, `UpdateVoter`. Roles:
   Unattached, Follower, Candidate, Leader. Observer is a membership
-  classification, not a role. **Aligned.**
+  classification, not a role.
+- **Bootstrap HW math:** Bootstrap scenario shows HW advancing on
+  round-2 Fetch: `sorted desc [N1=2, N2=2, N3=0] → index 1 → 2`.
+  Matches §5.9.
+- **Client read semantics:** `read()` returns `S::ReadResult` via
+  `StateMachine::query()`, leader-only. Followers return `NotLeader`.
+  Protocol metadata is accessed via `RaftNode::metrics()`. Matches §5.11.
+- **Four-phase commit notification:** Scenarios use the four-phase
+  ordering (§4.1): (1) `StateMachine::apply`, (2) `Listener::handle_commit`,
+  (3) `DeferredCompletionQueue::complete`, (4) `DeferredReadQueue::drain`.
+  All callbacks are synchronous, in-process calls within the event loop.
 
-- **Bootstrap HW math:** The bootstrap scenario (Feature: Cluster
-  Bootstrap) shows HW advancing when the second voter's round-2 Fetch
-  arrives: `sorted desc [N1=2, N2=2, N3=0] → index 1 → 2`. This matches
-  the architecture's §5.9 bootstrap flow exactly. **Aligned.**
+### 7.3 Alignment with `tech-spec.md` — Aligned with Two Notation Differences
 
-- **Client read flow — REQUIRES UPDATE.** The e2e scenarios (Feature:
-  Client Interaction) define five read-related scenarios that use
-  `read() → ConsensusState` (protocol metadata) available on any node.
-  They explicitly state "the application reads its own StateMachine state
-  directly (not via read())." This conflicts with this architecture's
-  §5.11, which defines `read()` as returning application state
-  (`S::ReadResult` via `StateMachine::query()`) with linearizable
-  leadership proof, leader-only. **Action needed:** the five
-  read-related scenarios should be rewritten: (a) `read()` returns
-  application state on the leader only; followers return `NotLeader`.
-  (b) The current `read() → ConsensusState` scenarios should be migrated
-  to use `RaftNode::metrics() → RaftMetrics` (Feature: Observability
-  and Metrics), which already covers non-linearizable protocol metadata
-  on any node. See Resolved Cross-Document Conventions item 3 above for
-  full rationale.
+The tech spec is a higher-level document that defers implementation detail
+to the architecture and implementation plan. Two phrasing differences
+exist; neither represents a design conflict — they are notation
+conventions resolved below.
+
+**Agreed points:**
+- Crate layout, RPC names, pull-based replication, serialisation,
+  control-record filtering, snapshot split, timing parameters, bootstrap
+  and recovery model — all consistent (see §7.1 table).
+- `read() → Result<State>` (tech spec §2.1.5) is ambiguous by design;
+  this architecture resolves it as `S::ReadResult` via
+  `StateMachine::query()` (§5.11). The tech spec's phrase "routes reads
+  through the log for safety" aligns with the leadership-proof mechanism
+  (confirming a committed current-term entry) defined in §5.11. Tech spec
+  §2.2 marks "linearisable reads" (read-index, lease-based) as out of
+  scope; the leadership-proof mechanism in §5.11 is the initial safe
+  implementation that the tech spec defers to the architecture, not an
+  optimised read path.
+- I/O staging (tech spec §4.4.1): the event loop produces `IoAction`
+  values; the `IoStage` executes them. `BatchAccumulator` stages
+  proposals; `DeferredCompletionQueue` parks futures. Consistent.
+
+**Notation difference 1 — callback execution model.** Tech spec §4.4.1
+says "application callbacks are staged and executed asynchronously outside
+the loop." This is shorthand meaning callbacks are *deferred* until
+protocol state is consistent — not offloaded to a separate async task.
+The precise design (§4.1): `StateMachine::apply`,
+`Listener::handle_commit`, `DeferredCompletionQueue::complete`, and
+`DeferredReadQueue::drain` are synchronous, in-process method calls
+invoked by the `EventLoop` during message processing, *after* state is
+updated but *before* the `IoAction` batch is dispatched. The
+implementation plan (Stage 4.1) and e2e scenarios both use this
+synchronous-callback convention. No design conflict — the tech spec's
+phrasing is a summary, not a contradiction.
+
+**Notation difference 2 — HW inclusive vs exclusive.** Tech spec §8
+Glossary says "entries at or below the HW are considered committed"
+(inclusive). This architecture, the implementation plan, and the e2e
+scenarios all use exclusive semantics: `O < HW` (§3.1). The mapping is:
+tech spec "entries ≤ N committed" ↔ `HW = N + 1` in exclusive notation.
+The exclusive convention is canonical for implementation.
+
+### 7.4 Alignment with `implementation-plan.md` — Aligned on Structure, Two Pending Refinements
+
+The implementation plan is aligned with this architecture on all
+structural decisions. Two interface refinements in the implementation
+plan have not yet been updated to match the architecture's detailed
+design. These are narrowly scoped signature changes — not structural
+disagreements.
+
+**Aligned points (no changes needed):**
+- Transport split traits, `Box<dyn ...>` ownership, `Clock` placement,
+  callback synchronous execution model, `IoStage` dispatch, segment-file
+  log storage, bootstrap/recovery sequence, phase ordering — all
+  consistent (see §7.1 table and §7.3 above).
+
+**Pending refinement 1 — `LogStore` method signatures.** This architecture
+specifies `&self` for all `LogStore` methods (`append`, `truncate_suffix`,
+`truncate_prefix`) with interior mutability, consistent with `SnapshotIO`
+and `QuorumStateStore`. The implementation plan (Stage 1.4) currently uses
+`&mut self` for write methods. The `&self` signature is required by the
+`IoStage`'s concurrent dispatch model: the `IoStage` holds all I/O trait
+objects as owned `Box<dyn ...>` fields and borrows them via `&self` for
+`tokio::join!` across trait objects. `&mut self` on `LogStore` would
+prevent this concurrent borrowing. The implementation plan should adopt
+`&self` with interior mutability (e.g., `tokio::sync::Mutex<File>`).
+
+**Pending refinement 2 — `read()` signature and `StateMachine::query()`.** 
+This architecture defines `read()` as returning `S::ReadResult` via
+`StateMachine::query()` (§5.11), leader-only. The implementation plan
+(Stage 1.7, 5.3) currently defines `read() → Result<ConsensusState>`.
+Additionally, the implementation plan's `StateMachine` trait (Stage 1.4)
+does not yet include `type ReadResult` or `fn query(&self)`, and its
+commit notification (Stage 5.1) uses three phases instead of four (missing
+`DeferredReadQueue::drain` as step 4). These changes are required to
+support the linearizable read path. The e2e scenarios already use the
+four-phase, `S::ReadResult`-returning design.
