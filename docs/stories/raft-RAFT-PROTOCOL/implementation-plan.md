@@ -363,6 +363,24 @@
 >
 > **Sequencing:** Stages 5.1–5.2 are sequential. Stage 5.3 depends on
 > 5.2.
+>
+> **HW semantics resolution (cross-document):** The tech-spec (§2.1.1,
+> §8 Glossary) describes HW with inclusive phrasing: "entries ≤ HW are
+> committed." The architecture (§3.1) formally defines HW as an
+> **exclusive upper bound**: "entry at offset O is committed ⟺ O < HW."
+> These are two notations for the same protocol state, not a protocol
+> disagreement. The relationship is: tech-spec HW_inclusive + 1 =
+> architecture HW_exclusive. For example, when the tech-spec says "HW
+> advances to 5 and entries ≤ 5 are committed," the implementation
+> stores HW = 6 and entries [0, 6) are committed — identical committed
+> set. The exclusive notation is the natural fit because `fetch_offset`
+> and `log_end_offset` are already exclusive (next-to-write), so the
+> HW calculation (sort descending, take index ⌊V/2⌋) directly produces
+> an exclusive value. **This plan and all implementation steps use
+> exclusive HW semantics throughout.** No behavioural difference exists
+> between the two notations; only the numeric convention differs. The
+> e2e-scenarios document (§1 Offset Conventions) independently confirms
+> this mapping.
 
 ### Stage 5.1: Fetch RPC — Follower Side
 
@@ -692,62 +710,4 @@
 - [ ] Scenario: CI green — Given all code is committed, When CI runs, Then all build, test, clippy, fmt, and doc steps pass
 - [ ] Scenario: E2E coverage — Given the list of scenarios in `e2e-scenarios.md`, When cross-referenced with test implementations, Then every scenario has at least one corresponding test
 
----
 
-## Cross-Document Consistency Notes
-
-> These notes document known semantic differences between sibling plan
-> documents and state which interpretation the implementation follows.
-> Resolving these discrepancies ensures the codebase is internally
-> consistent.
-
-### High Watermark (HW) Semantics
-
-The **tech-spec** (§2.1.1, §8 Glossary) defines HW with **inclusive** semantics:
-"Entries at or below the HW are considered committed" (entries ≤ HW are
-committed). The **architecture** (§3.1, §5.2) and **e2e-scenarios** (§1 Offset
-Conventions) define HW with **exclusive** semantics: "entries with `offset < HW`
-are committed; `HW − 1` is the last committed offset."
-
-**This implementation plan follows the architecture's exclusive semantics
-throughout.** The mapping is: tech-spec "entries ≤ N committed" corresponds to
-`HW = N + 1` in the exclusive notation used here. For example, if the tech-spec
-says "HW advances to 5 and entries ≤ 5 are committed", the implementation uses
-`HW = 6` (entries 0–5 are committed because `5 < 6`). The e2e-scenarios
-document (§1) already documents this mapping explicitly. The tech-spec §8
-Glossary should be updated to use exclusive semantics for cross-document
-consistency.
-
-### Clock Trait — `#[async_trait]` and Object Safety
-
-The **architecture** (§4.1, trait table §4.3) defines `Clock` as an
-`#[async_trait]` trait with bounds `Send + 'static`. The `#[async_trait]`
-attribute is required because `Clock` contains `async fn sleep_until` and is
-used as a trait object (`Box<dyn Clock>`). Without `#[async_trait]`, native
-`async fn` in traits (Rust 1.75+) does not support `dyn Trait` dispatch —
-the desugared return type includes an implicit lifetime that is not
-object-safe. This plan uses `#[async_trait]` on the `Clock` trait definition
-(Stage 1.4), the `WallClock` production implementation (Stage 4.1), and the
-`SimulatedClock` test implementation (Stage 1.8) to ensure object-safe
-`Box<dyn Clock>` dispatch everywhere.
-
-### Clock Is a Runtime Trait, Not an I/O Trait
-
-Per the architecture (§4.3 trait table), `Clock` is a **Runtime** trait — it
-is used directly by the `EventLoop` for timer management (election timeouts,
-check-quorum deadlines, fetch intervals). It is NOT mediated by `IoAction` and
-is NOT called by the `IoStage`. This plan reflects this distinction in every
-stage that references `Clock` (Stages 1.4, 1.7, 1.8, 4.1). The `IoStage`
-receives only I/O trait objects: `LogStore`, `TransportSender`,
-`QuorumStateStore`, `SnapshotIO`.
-
-### Transport: Split Traits (TransportSender / TransportReceiver)
-
-Per the architecture (§4.4), transport is split into two traits:
-`TransportSender` (`Send + Sync + 'static`, `&self`, called by `IoStage`) and
-`TransportReceiver` (`Send + 'static`, `&mut self`, called by `ReceiverTask`).
-This plan uses the split design throughout. Concrete transport types
-(`TcpTransport`, `ChannelTransport`) provide a `split()` method that yields
-`(Box<dyn TransportSender>, Box<dyn TransportReceiver>)`. The `RaftNode::new`
-constructor accepts separate `Box<dyn TransportSender>` and
-`Box<dyn TransportReceiver>` parameters.
