@@ -98,9 +98,9 @@ callbacks (`StateMachine`, `Listener`), manages timers via the injected
 
 | Sub-component | Responsibility |
 |---------------|----------------|
-| **`RaftNode`** | Public API surface. Exposes `propose()`, `read()` (§5.11), `bootstrap()`, and lifecycle methods. `propose()` appends a command to the log and returns a future resolved on commit. `read()` returns `S::ReadResult` — the application state as queried via `StateMachine::query()` after the leader confirms its authority (a committed current-term entry); it does NOT append to the log (§5.11). Owns the `EventLoop`, `ReceiverTask`, and `IoStage`; coordinates startup, shutdown, and crash recovery. Generic over two application-provided types: `S: StateMachine` and `L: Listener` (both monomorphised at compile time for zero-cost dispatch). I/O and runtime traits (`LogStore`, `TransportSender`, `TransportReceiver`, `QuorumStateStore`, `SnapshotIO`, `Clock`) are injected as trait objects (`Arc<dyn ...>` for storage/network-send, `Box<dyn ...>` for runtime) at construction time. On construction, executes the recovery sequence (§5.10) before accepting any RPCs. |
+| **`RaftNode`** | Public API surface. Exposes `propose()`, `read()` (§5.11), `bootstrap()`, and lifecycle methods. `propose()` appends a command to the log and returns a future resolved on commit. `read()` returns `S::ReadResult` — the application state as queried via `StateMachine::query()` after the leader confirms its authority (a committed current-term entry); it does NOT append to the log (§5.11). Owns the `EventLoop`, `ReceiverTask`, and `IoStage`; coordinates startup, shutdown, and crash recovery. Generic over two application-provided types: `S: StateMachine` and `L: Listener` (both monomorphised at compile time for zero-cost dispatch). I/O and runtime traits (`LogStore`, `TransportSender`, `TransportReceiver`, `QuorumStateStore`, `SnapshotIO`, `Clock`) are injected as `Box<dyn ...>` trait objects at construction time. The `IoStage` borrows I/O trait objects via `&self` for concurrent dispatch — no `Arc` needed because all I/O methods take `&self` and require `Sync`. On construction, executes the recovery sequence (§5.10) before accepting any RPCs. |
 | **`EventLoop`** | Single-threaded async loop that processes protocol state transitions without blocking on I/O. The loop drains an inbound message queue (`tokio::sync::mpsc` — fed by the `ReceiverTask`, §4.4, and by `propose()`/`read()` calls) and dispatches to the appropriate handler. Uses the injected `Clock` directly for timer management (election timeouts, check-quorum deadlines, fetch intervals). **Processing order per message:** (1) The handler mutates `ConsensusState` (e.g., updating follower progress, recalculating HW on a Fetch request, or recording appended entries); (2) If the state change triggers application-visible effects — HW advancement, leadership change — the loop invokes callbacks in a fixed order: `StateMachine::apply` (one call per committed command entry), then `Listener::handle_commit` (one batch of committed `AppRecord` values), then `DeferredCompletionQueue::complete` (resolves client futures for committed offsets), then `DeferredReadQueue` drain (resolves pending reads via `StateMachine::query`, §5.11); (3) The handler collects `IoAction` values into an `IoActionBatch` (e.g., `SendRpc` for the Fetch response, `AppendLog` for newly staged entries); (4) The loop hands the batch to the `IoStage`, which executes storage and network-send operations concurrently; (5) The loop records I/O results (e.g., advancing the durable offset after `AppendLog` completes). Callbacks in step 2 are synchronous, in-process function calls — not external I/O — and always observe the fully updated protocol state before any IoAction is dispatched. Callbacks must be lightweight and non-blocking; applications that need heavy processing should hand off work to their own async tasks. This prevents slow `fsync` calls from delaying Fetch processing and triggering spurious elections. |
-| **`IoStage`** | Executes `IoAction` batches produced by the `EventLoop`. Each action is one of: `PersistQuorumState(QuorumState)`, `AppendLog(Vec<LogEntry>)`, `TruncateSuffix(u64)`, `TruncatePrefix(u64)`, `SendRpc(NodeId, RpcEnvelope)`, `SaveSnapshot(Snapshot)`. The `IoStage` holds shared references (`Arc<dyn ...>`) to the injected I/O trait objects (`LogStore`, `TransportSender`, `QuorumStateStore`, `SnapshotIO`). **Concurrency model:** Within a batch, the `IoStage` partitions actions by trait object and executes *across* trait objects concurrently via `tokio::join!` (e.g., `LogStore::append` runs concurrently with `TransportSender::send` and `QuorumStateStore::save`). Operations on the *same* trait object within one batch are serialised — at most one log-write action (`AppendLog`, `TruncateSuffix`, or `TruncatePrefix`) appears per batch, so no concurrent mutation of a single `LogStore` occurs. All I/O trait methods take `&self` and implementations use interior mutability (e.g., async mutex) for write serialisation. Multiple `SendRpc` actions target different peers and use `TransportSender::send(&self)` concurrently — safe because `TransportSender: Sync`. Storage operations complete with `fsync` before the loop processes the next message that depends on them. **Application callbacks** (`StateMachine::apply`, `Listener::handle_commit`, `Listener::handle_leader_change`) are NOT dispatched by the `IoStage` — they are invoked directly by the `EventLoop` during message processing, immediately after a state change triggers them (e.g., HW advancement during Fetch handling). This ensures callbacks execute synchronously within the event loop's single-threaded context and always see consistent, up-to-date protocol state. The event loop produces the `IoAction` batch *after* callbacks have been invoked, so the Fetch response sent via `IoStage` reflects the same HW that callbacks observed. **Note:** The `IoStage` does NOT call `TransportReceiver` or `Clock` — those are used by the `ReceiverTask` (§4.4) and `EventLoop` respectively. |
+| **`IoStage`** | Executes `IoAction` batches produced by the `EventLoop`. Each action is one of: `PersistQuorumState(QuorumState)`, `AppendLog(Vec<LogEntry>)`, `TruncateSuffix(u64)`, `TruncatePrefix(u64)`, `SendRpc(NodeId, RpcEnvelope)`, `SaveSnapshot(Snapshot)`. The `IoStage` holds owned trait objects (`Box<dyn ...>`) for the injected I/O implementations (`LogStore`, `TransportSender`, `QuorumStateStore`, `SnapshotIO`). No `Arc` wrapping is needed — the `IoStage` is the sole owner, and concurrent access within a batch uses shared `&self` borrows (safe because all I/O traits require `Sync`). **Concurrency model:** Within a batch, the `IoStage` partitions actions by trait object and executes *across* trait objects concurrently via `tokio::join!` (e.g., `LogStore::append` runs concurrently with `TransportSender::send` and `QuorumStateStore::save`). Operations on the *same* trait object within one batch are serialised — at most one log-write action (`AppendLog`, `TruncateSuffix`, or `TruncatePrefix`) appears per batch, so no concurrent mutation of a single `LogStore` occurs. All I/O trait methods take `&self` and implementations use interior mutability (e.g., async mutex) for write serialisation. Multiple `SendRpc` actions target different peers and use `TransportSender::send(&self)` concurrently — safe because `TransportSender: Sync`. Storage operations complete with `fsync` before the loop processes the next message that depends on them. **Application callbacks** (`StateMachine::apply`, `Listener::handle_commit`, `Listener::handle_leader_change`) are NOT dispatched by the `IoStage` — they are invoked directly by the `EventLoop` during message processing, immediately after a state change triggers them (e.g., HW advancement during Fetch handling). This ensures callbacks execute synchronously within the event loop's single-threaded context and always see consistent, up-to-date protocol state. The event loop produces the `IoAction` batch *after* callbacks have been invoked, so the Fetch response sent via `IoStage` reflects the same HW that callbacks observed. **Note:** The `IoStage` does NOT call `TransportReceiver` or `Clock` — those are used by the `ReceiverTask` (§4.4) and `EventLoop` respectively. |
 | **`BatchAccumulator`** | Stages incoming `propose()` calls into a batch buffer. On each event-loop tick (or when the batch is full), the accumulated entries are drained into a single `AppendLog` I/O action. This amortises `fsync` cost across multiple proposals (group commit). Analogous to KRaft's `BatchAccumulator`. |
 | **`DeferredCompletionQueue`** | Parks `tokio::sync::oneshot` senders keyed by log offset. When the high watermark advances, the queue completes all futures whose offset is now **< HW** (strictly less than — see §3.1 canonical HW definition). Analogous to KRaft's `DeferredEventQueue` / purgatory. |
 | **`DeferredReadQueue`** | Parks `tokio::sync::oneshot` senders for pending `read()` requests that are waiting for leadership confirmation (§5.11). When the first current-term entry commits (HW advances past the `LeaderChangeMessage` offset), the event loop drains this queue: for each entry, it calls `StateMachine::query()` and resolves the oneshot with the result. On step-down or shutdown, all entries are resolved with an error. |
@@ -535,7 +535,7 @@ Each trait has a single, unambiguous caller — there is no overlap.
 | Category | Traits | Dispatch | Bounds | Caller |
 |----------|--------|----------|--------|--------|
 | **Application** (synchronous) | `StateMachine`, `Listener` | Static (generic type parameters on `RaftNode<S, L>`, monomorphised) | `Send + 'static` | `EventLoop` — invoked synchronously during message processing, before `IoAction` batch is produced. Must be lightweight and non-blocking. |
-| **Storage / Network-Send I/O** (asynchronous) | `LogStore`, `SnapshotIO`, `QuorumStateStore`, `TransportSender` | Dynamic (injected as `Arc<dyn ...>` trait objects) | `Send + Sync + 'static`, `#[async_trait]`, all methods take `&self` | `IoStage` — invoked concurrently across trait objects when executing `IoAction` batches (`AppendLog`, `SaveSnapshot`, `PersistQuorumState`, `TruncateSuffix`, `TruncatePrefix`, `SendRpc`). Implementations use interior mutability for write serialisation. |
+| **Storage / Network-Send I/O** (asynchronous) | `LogStore`, `SnapshotIO`, `QuorumStateStore`, `TransportSender` | Dynamic (injected as `Box<dyn ...>` trait objects at construction; the `IoStage` borrows them via `&self` for concurrent dispatch) | `Send + Sync + 'static`, `#[async_trait]`, all methods take `&self` | `IoStage` — invoked concurrently across trait objects when executing `IoAction` batches (`AppendLog`, `SaveSnapshot`, `PersistQuorumState`, `TruncateSuffix`, `TruncatePrefix`, `SendRpc`). Implementations use interior mutability for write serialisation. `Box<dyn T>` suffices (no `Arc` needed) because the `IoStage` is the sole owner and concurrent access within a batch uses shared `&self` borrows (safe due to `Sync` bound). |
 | **Runtime** (asynchronous) | `TransportReceiver`, `Clock` | Dynamic (injected as `Box<dyn ...>` trait objects) | `Send + 'static`, `#[async_trait]` | `TransportReceiver`: called by `ReceiverTask` (§4.4) which feeds the `EventLoop`'s mpsc channel. `Clock`: used directly by the `EventLoop` for timer management (election timeouts, check-quorum deadlines). Neither is mediated by `IoAction`. |
 
 This separation ensures that application callbacks always see consistent,
@@ -669,13 +669,15 @@ pub trait LogStore: Send + Sync + 'static {
 
 All `LogStore` mutating methods take `&self` (not `&mut self`), matching
 `SnapshotIO::save(&self)` and `QuorumStateStore::save(&self)`. The `IoStage`
-holds a shared reference (`Arc<dyn LogStore>`) and may call `LogStore` methods
-concurrently with `TransportSender::send` calls. The `LogStore` implementation
-serialises its own write operations internally (e.g., via an async mutex). The
-`IoStage` guarantees it will never issue two `LogStore` write operations
-(`append`, `truncate_suffix`, `truncate_prefix`) concurrently within the same
-`IoActionBatch` — at most one log-write action appears per batch, and truncation
-is never combined with append in a single batch.
+holds an owned trait object (`Box<dyn LogStore>`) and borrows it via `&self`
+concurrently with `TransportSender::send` calls — safe because `LogStore:
+Sync`. No `Arc` wrapping is needed; the `IoStage` is the sole owner. The
+`LogStore` implementation serialises its own write operations internally
+(e.g., via an async mutex). The `IoStage` guarantees it will never issue two
+`LogStore` write operations (`append`, `truncate_suffix`, `truncate_prefix`)
+concurrently within the same `IoActionBatch` — at most one log-write action
+appears per batch, and truncation is never combined with append in a single
+batch.
 
 #### `TransportSender` (core → network, outbound RPCs)
 
@@ -2155,11 +2157,13 @@ All crate names, trait definitions, and module structures are
   `SnapshotMetadata` (consensus) and `AppSnapshot` (application).
   I/O traits are separated into three categories (§4.1):
   **Storage / Network-Send I/O** (`LogStore`, `TransportSender`,
-  `QuorumStateStore`, `SnapshotIO`) are injected as `Arc<dyn ...>` trait
+  `QuorumStateStore`, `SnapshotIO`) are injected as `Box<dyn ...>` trait
   objects, use `#[async_trait]`, require `Send + Sync + 'static`, and all
   methods take `&self` (implementations use interior mutability). They are
   called exclusively by the `IoStage` when executing `IoAction` batches —
-  never directly by the event loop.
+  never directly by the event loop. The `IoStage` borrows them via `&self`
+  for concurrent dispatch; no `Arc` is needed because the `IoStage` is the
+  sole owner and the `Sync` bound enables safe shared borrowing.
   **Runtime** traits (`TransportReceiver`, `Clock`) are also injected as
   trait objects, but are NOT called by the `IoStage`:
   `TransportReceiver` is called by the `ReceiverTask` (§4.4) which feeds
@@ -2197,12 +2201,13 @@ All crate names, trait definitions, and module structures are
   the full lifecycle including leader self-removal. Consistent with tech
   spec §2.1.3.
 
-#### Resolved Cross-Document Conventions (3 items)
+#### Resolved Cross-Document Conventions (4 items)
 
 The following points were identified during parallel drafting where
-the tech spec's phrasing and this architecture's detailed design needed
-reconciliation. All are now resolved — this section documents the
-agreed convention that all sibling documents share.
+sibling documents' phrasing and this architecture's detailed design needed
+reconciliation. Items 1–2 are agreed across all documents. Items 3–4 are
+active discrepancies where this architecture states the canonical design
+and the sibling documents require updates.
 
 1. **Callback execution model.** The tech spec §4.4.1 uses the phrase
    "application callbacks are staged and executed asynchronously outside
@@ -2227,52 +2232,114 @@ agreed convention that all sibling documents share.
    committed" corresponds to `HW = N + 1` in exclusive notation. The
    exclusive convention is the canonical one for implementation purposes.
 
-3. **`read()` return type.** The tech spec §2.1.5 uses `read() → Result<State>`
-   (ambiguous). The implementation plan defines `read() → Result<ConsensusState>`
-   (protocol metadata). The e2e scenarios say `read()` "returns the current
-   committed StateMachine state" with consensus metadata available separately
-   via `RaftMetrics`. This architecture adopts the e2e-scenarios convention:
-   `read()` returns **application state** (`S::ReadResult` via
-   `StateMachine::query()`), and consensus metadata is accessed via
-   `RaftNode::metrics() → RaftMetrics` (§6.4). The implementation plan's
-   `read() → Result<ConsensusState>` should be updated to align.
+3. **`read()` semantics — ACTIVE DISCREPANCY.** This is the most
+   significant cross-document inconsistency. The four documents define
+   `read()` differently:
+
+   | Document | `read()` returns | Leader-only? | Mechanism |
+   |----------|-----------------|-------------|-----------|
+   | **Tech spec** §2.1.5 | `Result<State>` (ambiguous) | Unspecified | "routes reads through the log for safety" |
+   | **Architecture** §5.11 | `S::ReadResult` (application state via `StateMachine::query()`) | **Yes** — followers return `NotLeader` | Leadership proof: waits for committed current-term entry, then queries state machine synchronously |
+   | **Implementation plan** Stage 1.7 / 5.3 | `Result<ConsensusState>` (protocol metadata) | **No** — any node | Returns local protocol state snapshot |
+   | **E2e scenarios** Feature: Client Interaction | `ConsensusState` (protocol metadata) | **No** — any node | Returns local protocol state; "application reads its own StateMachine state directly (not via read())" |
+
+   **This architecture's §5.11 is the canonical design.** Rationale:
+
+   - The tech spec says "routes reads through the log for safety," which
+     implies linearizable application-state reads — not just returning
+     protocol metadata (which requires no log routing).
+   - Returning `ConsensusState` from `read()` is redundant with
+     `RaftNode::metrics() → RaftMetrics` (§6.4), which already exposes
+     non-linearizable protocol metadata on any node.
+   - The value of a `read()` API is linearizable access to application
+     state — the guarantee that the returned state reflects all prior
+     commits. Returning protocol metadata provides no such guarantee
+     and does not justify the complexity of leadership confirmation.
+
+   **Required sibling-doc updates:**
+
+   - **Implementation plan:** `read()` signature should change from
+     `Result<ConsensusState>` to `Result<S::ReadResult>`. The
+     `StateMachine` trait should gain `type ReadResult: Send + 'static`
+     and `fn query(&self) -> Result<Self::ReadResult>`. The `read()`
+     implementation should use the leadership-proof mechanism (§5.11):
+     confirm current-term entry committed, then invoke
+     `StateMachine::query()` synchronously within the event loop.
+     Add `DeferredReadQueue` as step 4 of commit notification.
+   - **E2e scenarios:** The five read-related scenarios should be
+     rewritten: `read()` returns application state on leader only;
+     followers return `NotLeader`. Protocol metadata access should
+     use `RaftNode::metrics()` (which is already tested in Feature:
+     Observability and Metrics).
+
+4. **I/O trait object ownership — `Box<dyn>` (not `Arc<dyn>`).** All
+   Storage / Network-Send I/O traits (`LogStore`, `TransportSender`,
+   `QuorumStateStore`, `SnapshotIO`) are injected as `Box<dyn ...>` trait
+   objects. The `IoStage` is the sole owner and borrows them via `&self`
+   for concurrent dispatch — the `Sync` bound enables safe shared
+   borrowing without `Arc`. This matches the implementation plan (Stage
+   1.7), which also uses `Box<dyn ...>` for all I/O trait objects.
+   Runtime traits (`TransportReceiver`, `Clock`) are likewise `Box<dyn>`.
+   The `split()` method on `TcpTransport` and `ChannelTransport` returns
+   `(Box<dyn TransportSender>, Box<dyn TransportReceiver>)`. All
+   documents are aligned on this convention.
 
 ### Alignment with `implementation-plan.md`
 
-The implementation plan is aligned with this architecture on all structural
-points:
+The implementation plan is aligned with this architecture on most structural
+points. Two items require updates in the implementation plan:
 
 - **Transport split traits:** Stage 1.4 defines separate `TransportSender`
   and `TransportReceiver` traits with the correct `&self` / `&mut self`
-  ownership semantics. Stage 1.7 injects them separately into `RaftNode`.
+  ownership semantics. Stage 1.7 injects them separately into `RaftNode`
+  as `Box<dyn ...>` (matching this architecture's `Box<dyn ...>` convention).
   Stages 3.1 and 3.3 implement `split()` on `ChannelTransport` and
-  `TcpTransport` respectively. No reconciliation needed.
+  `TcpTransport` respectively. **Aligned** — no reconciliation needed.
+
+- **I/O trait object ownership:** Stage 1.7 injects all I/O traits as
+  `Box<dyn ...>` trait objects, matching this architecture's convention
+  (§4.1). **Aligned** — no reconciliation needed.
 
 - **Clock placement:** Stage 1.4 defines `Clock` as a Runtime trait, and
   Stage 1.7 explicitly passes it to the `EventLoop` (not the `IoStage`).
-  `Clock` is not mediated by `IoAction`. No reconciliation needed.
+  `Clock` is not mediated by `IoAction`. **Aligned** — no reconciliation
+  needed.
 
 - **Callback model:** Stage 4.1 explicitly states that application
   callbacks are NOT `IoAction` variants and are invoked synchronously by
   the `EventLoop`. Stage 5.1/5.3 implement the commit notification
-  in fixed order. Aligned on the synchronous-callback convention.
+  in fixed order. **Aligned** on the synchronous-callback convention.
   Note: this architecture extends the notification to four phases
   (adding `DeferredReadQueue::drain` as step 4); the implementation
   plan should adopt this addition when implementing `read()`.
 
-- **`read()` return type:** Stage 1.7 defines `read() → Result<ConsensusState>`.
-  This architecture defines `read()` as returning application state
-  (`S::ReadResult` via `StateMachine::query()`) per the e2e-scenarios
-  convention. Consensus metadata is available via `RaftNode::metrics()`.
-  **Action needed:** the implementation plan's `read()` signature should
-  be updated to return `S::ReadResult` and to use the leadership-proof
-  mechanism described in §5.11.
+- **`read()` semantics — REQUIRES UPDATE.** Stage 1.7 defines
+  `read() → Result<ConsensusState>` (returns protocol metadata, available
+  on any node). Stage 5.3 implements it as a non-blocking local state
+  snapshot. This architecture defines `read()` as returning application
+  state (`S::ReadResult` via `StateMachine::query()`) with linearizable
+  leadership proof, leader-only (§5.11). Consensus metadata is available
+  separately via `RaftNode::metrics()`. **Action needed:** the
+  implementation plan's `read()` signature should change to return
+  `S::ReadResult`. The `StateMachine` trait should gain
+  `type ReadResult: Send + 'static` and `fn query(&self)`. The
+  implementation should use the leadership-proof mechanism described in
+  §5.11. See Resolved Cross-Document Conventions item 3 above for full
+  rationale.
 
-- **LogStore `&self` methods:** This architecture uses `&self` for all
-  `LogStore` methods (including `append`, `truncate_suffix`, `truncate_prefix`)
-  with interior mutability, consistent with `SnapshotIO` and
-  `QuorumStateStore`. If the implementation plan uses `&mut self` for
-  `LogStore` write methods, it should be updated to match.
+- **LogStore `&self` methods — REQUIRES UPDATE.** This architecture uses
+  `&self` for all `LogStore` methods (including `append`,
+  `truncate_suffix`, `truncate_prefix`) with interior mutability,
+  consistent with `SnapshotIO` and `QuorumStateStore`. The implementation
+  plan (Stage 1.4) defines `LogStore` with `&mut self` for write methods
+  (`append(&mut self, ...)`, `truncate_suffix(&mut self, ...)`,
+  `truncate_prefix(&mut self, ...)`). **Action needed:** write methods
+  should change to `&self` with interior mutability (e.g.,
+  `tokio::sync::Mutex<File>`) to match the `IoStage`'s concurrent
+  dispatch model. The `IoStage` holds all I/O trait objects as owned
+  `Box<dyn ...>` fields and borrows them via `&self` for `tokio::join!`
+  across trait objects — `&mut self` on `LogStore` would prevent this
+  concurrent borrowing.
 
 - **Phase sequencing:** The plan sequences work as: core types → storage →
   transport → election → replication → persistence/recovery → snapshot →
@@ -2282,28 +2349,36 @@ points:
 
 ### Alignment with `e2e-scenarios.md`
 
-The e2e scenarios document is aligned with this architecture:
+The e2e scenarios document is aligned with this architecture on most
+points, with one significant discrepancy:
 
 - **Offset conventions:** Uses exclusive HW semantics matching §3.1.
   `fetch_offset` is exclusive (follower has `[0, fetch_offset)`). The
   offset convention preamble explicitly maps tech-spec inclusive notation
-  to architecture exclusive notation.
+  to architecture exclusive notation. **Aligned.**
 
 - **RPC and role names:** Uses `Vote` (with `is_pre_vote`), `Fetch`,
   `FetchSnapshot`, `AddVoter`, `RemoveVoter`, `UpdateVoter`. Roles are
   Unattached, Follower, Candidate, Leader. Observer is a membership
-  classification, not a role.
+  classification, not a role. **Aligned.**
 
 - **Bootstrap HW math:** The bootstrap scenario (Feature: Cluster
   Bootstrap) shows HW advancing when the second voter's round-2 Fetch
   arrives: `sorted desc [N1=2, N2=2, N3=0] → index 1 → 2`. This matches
-  the architecture's §5.9 bootstrap flow exactly.
+  the architecture's §5.9 bootstrap flow exactly. **Aligned.**
 
-- **Client read flow:** The e2e scenarios (Feature: Client Interaction)
-  define five read-related scenarios that align exactly with this
-  architecture's §5.11: read routes through leadership confirmation (not
-  per-read log entries), waits for committed current-term entry, returns
-  application state via `StateMachine::query()`, and fails with
-  `NotLeader` on followers or during leader failover. The e2e scenarios
-  explicitly state consensus metadata is accessed separately via
-  `RaftMetrics`, matching this architecture's `RaftNode::metrics()` API.
+- **Client read flow — REQUIRES UPDATE.** The e2e scenarios (Feature:
+  Client Interaction) define five read-related scenarios that use
+  `read() → ConsensusState` (protocol metadata) available on any node.
+  They explicitly state "the application reads its own StateMachine state
+  directly (not via read())." This conflicts with this architecture's
+  §5.11, which defines `read()` as returning application state
+  (`S::ReadResult` via `StateMachine::query()`) with linearizable
+  leadership proof, leader-only. **Action needed:** the five
+  read-related scenarios should be rewritten: (a) `read()` returns
+  application state on the leader only; followers return `NotLeader`.
+  (b) The current `read() → ConsensusState` scenarios should be migrated
+  to use `RaftNode::metrics() → RaftMetrics` (Feature: Observability
+  and Metrics), which already covers non-linearizable protocol metadata
+  on any node. See Resolved Cross-Document Conventions item 3 above for
+  full rationale.
