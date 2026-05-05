@@ -1,4 +1,4 @@
-# Implementation Plan — Raft Protocol
+# Implementation Plan — raft protocol
 
 > **Story:** `raft:RAFT-PROTOCOL`
 >
@@ -75,7 +75,7 @@
 - [ ] Scenario: RPC envelope serialisation — Given an `RpcEnvelope` wrapping a `VoteRequest`, When serialised to bincode and deserialised, Then all fields match the original
 - [ ] Scenario: MembershipError variants — Given each `MembershipError` variant (`NotLeader`, `ChangeInProgress`, `NodeAlreadyVoter`, `NodeNotFound`, `NodeNotCaughtUp`), When pattern-matched, Then all five variants are covered exhaustively
 
-### Stage 1.4: Trait Definitions (Storage, Transport, Clock)
+### Stage 1.4: Trait Definitions (Storage, Transport, Runtime)
 
 #### Implementation Steps
 - [ ] Create `xraft-core/src/traits.rs` defining `#[async_trait] trait LogStore { async fn append(&mut self, entries: &[LogEntry]) -> Result<()>, async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>>, async fn truncate_suffix(&mut self, from_offset: u64) -> Result<()>, async fn truncate_prefix(&mut self, up_to_offset: u64) -> Result<()>, fn log_start_offset(&self) -> u64, fn log_end_offset(&self) -> u64, async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>> }` — matches architecture §4.1 trait definition
@@ -83,7 +83,7 @@
 - [ ] Define `#[async_trait] trait SnapshotIO { async fn save(&self, snapshot: &Snapshot) -> Result<()>, async fn load_latest(&self) -> Result<Option<Snapshot>>, async fn read_chunk(&self, id: &SnapshotId, position: u64, max_bytes: u32) -> Result<(Bytes, bool)>, async fn begin_receive(&self, id: &SnapshotId) -> Result<SnapshotWriter> }` in `traits.rs` — matches architecture §4.1 method names exactly; uses `Snapshot`, `SnapshotId`, `SnapshotWriter` from Stage 1.2
 - [ ] Define `#[async_trait] trait TransportSender: Send + Sync + 'static { async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<()> }` in `traits.rs` — takes `&self` (shared reference) because `IoStage` may send to multiple peers concurrently; matches architecture §4.4 split design
 - [ ] Define `#[async_trait] trait TransportReceiver: Send + 'static { async fn recv(&mut self) -> Result<RpcEnvelope> }` in `traits.rs` — takes `&mut self` (exclusive access) because only the `ReceiverTask` reads from the network; matches architecture §4.4 split design
-- [ ] Define `trait Clock: Send + 'static { fn now(&self) -> Instant, async fn sleep_until(&self, deadline: Instant), fn random_election_timeout(&self) -> Duration }` in `traits.rs` — matches architecture §4.1 method names exactly
+- [ ] Define `trait Clock: Send + 'static { fn now(&self) -> Instant, async fn sleep_until(&self, deadline: Instant), fn random_election_timeout(&self) -> Duration }` in `traits.rs` — **Runtime** trait (not I/O), used directly by the `EventLoop` for timer management (election timeouts, check-quorum deadlines), NOT mediated by `IoAction` or the `IoStage` (architecture §4.1, §4.4); injected into `RaftNode` as `Box<dyn Clock>` and passed to the `EventLoop`, not the `IoStage`; does not require `Sync` because only the single-threaded event loop calls it; matches architecture §4.1 method names exactly
 - [ ] Define `trait StateMachine: Send + 'static { fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>; fn snapshot(&self) -> Result<AppSnapshot>; fn restore(&mut self, snapshot: AppSnapshot) -> Result<()>; }` in `traits.rs` — synchronous trait (not `#[async_trait]`) per architecture §4.1; application callbacks are invoked synchronously by the `EventLoop`, not by the `IoStage`; uses `AppRecord` and `AppSnapshot` types from Stage 1.2
 - [ ] Add `async-trait` dependency to `xraft-core/Cargo.toml`
 
@@ -120,8 +120,8 @@
 ### Stage 1.7: `RaftNode` Public API Skeleton
 
 #### Implementation Steps
-- [ ] Create `xraft-core/src/raft_node.rs` defining the `RaftNode<S: StateMachine, L: Listener>` struct with fields: `config: RaftConfig`, `event_loop_handle`, `propose_tx: mpsc::Sender` — this is the public entry point from architecture §2.1; generic over both application-provided types `S` and `L` (monomorphised at compile time per architecture §4.1); I/O traits (`LogStore`, `TransportSender`, `TransportReceiver`, `QuorumStateStore`, `SnapshotIO`, `Clock`) are injected as `Box<dyn ...>` trait objects at construction time — `TransportSender` is passed to the `IoStage` for outbound RPCs, `TransportReceiver` is passed to the `ReceiverTask` for inbound RPCs (per architecture §4.4)
-- [ ] Define `RaftNode::new(config, log_store, quorum_state_store, snapshot_io, transport_sender, transport_receiver, clock, state_machine, listener) -> Result<Self>` constructor that accepts I/O trait objects (including separate `Box<dyn TransportSender>` and `Box<dyn TransportReceiver>`) and application-provided `S` / `L` instances; initialises struct fields and event-loop channel; does not start the event loop (started in Phase 4) or run recovery (completed in Phase 6)
+- [ ] Create `xraft-core/src/raft_node.rs` defining the `RaftNode<S: StateMachine, L: Listener>` struct with fields: `config: RaftConfig`, `event_loop_handle`, `propose_tx: mpsc::Sender` — this is the public entry point from architecture §2.1; generic over both application-provided types `S` and `L` (monomorphised at compile time per architecture §4.1); I/O traits (`LogStore`, `TransportSender`, `TransportReceiver`, `QuorumStateStore`, `SnapshotIO`) are injected as `Box<dyn ...>` trait objects at construction time — `TransportSender` is passed to the `IoStage` for outbound RPCs, `TransportReceiver` is passed to the `ReceiverTask` for inbound RPCs (per architecture §4.4); the `Clock` **Runtime** trait is also injected as `Box<dyn Clock>` but is passed to the `EventLoop` for timer management, not the `IoStage` (architecture §4.1 — Clock is not mediated by `IoAction`)
+- [ ] Define `RaftNode::new(config, log_store, quorum_state_store, snapshot_io, transport_sender, transport_receiver, clock, state_machine, listener) -> Result<Self>` constructor that accepts I/O trait objects (separate `Box<dyn TransportSender>` and `Box<dyn TransportReceiver>` — callers use `TcpTransport::split()` or `ChannelTransport::split()` to obtain the halves per architecture §4.4), the `Clock` Runtime trait object (`Box<dyn Clock>` — passed to the `EventLoop`, not the `IoStage`), and application-provided `S` / `L` instances; initialises struct fields and event-loop channel; does not start the event loop (started in Phase 4) or run recovery (completed in Phase 6)
 - [ ] Define `RaftNode::propose(command: AppRecord) -> Future<Result<Offset>>` method that sends the command to the event-loop channel and returns a future; returns `NotLeader` when no leader is active (consensus path completed in Phase 5)
 - [ ] Define `RaftNode::read() -> Result<ConsensusState>` method returning the current committed protocol state (current term, leader, high_watermark, role, voter set) — per tech-spec §2.1.5 the initial implementation routes reads through the log for safety, meaning the returned state reflects the latest HW-committed position in the log; the high_watermark in the returned state is an exclusive upper bound (entry at offset O is committed when O < HW, per architecture §3.1); linearisable reads (read-index, lease-based) are out of scope per tech-spec §2.2
 - [ ] Define `RaftNode::bootstrap(cluster_id: ClusterId, initial_voters: Vec<VoterInfo>) -> Result<()>` method that validates preconditions (empty log, no quorum-state file, no existing snapshot) and stores configuration; bootstrap logic completed in Phase 6 — `ClusterId` is provided by the caller, not generated internally, to ensure all nodes share the same cluster identity
@@ -144,8 +144,8 @@
 - [ ] Create `xraft-test/src/memory_log.rs` implementing `LogStore` trait with `Vec<LogEntry>` backend — supports append, read `[start_offset, end_offset)`, truncate_suffix, truncate_prefix, offset tracking
 - [ ] Implement optional fault injection in `MemoryLogStore`: configurable `fsync` failure probability, write corruption injection
 - [ ] Create `xraft-test/src/memory_snapshot.rs` implementing `SnapshotIO` trait with in-memory snapshot storage — method names match architecture §4.1: `save`, `load_latest`, `read_chunk`, `begin_receive`
-- [ ] Create `xraft-test/src/memory_quorum_state.rs` implementing `QuorumStateStore` trait with in-memory state
-- [ ] Create `xraft-test/src/simulated_clock.rs` implementing `SimulatedClock` — deterministic clock implementing the `Clock` trait from `xraft-core` (methods: `now`, `sleep_until`, `random_election_timeout` matching architecture §4.1), advances only when explicitly ticked via `advance(duration)`, allows precise control over election timeouts, fetch intervals, and Check Quorum deadlines
+- [ ] Create `xraft-test/src/memory_quorum_state.rs` implementing `QuorumStateStore` trait with in-memory state — `load()` returns `None` when no state has been saved (matching architecture §4.1 `Option<QuorumState>` contract)
+- [ ] Create `xraft-test/src/simulated_clock.rs` implementing `SimulatedClock` — deterministic clock implementing the `Clock` **Runtime** trait from `xraft-core` (methods: `now`, `sleep_until`, `random_election_timeout` matching architecture §4.1; `Clock` is used by the `EventLoop` for timer management, not by the `IoStage`), advances only when explicitly ticked via `advance(duration)`, allows precise control over election timeouts, fetch intervals, and Check Quorum deadlines
 
 #### Test Scenarios
 - [ ] Scenario: Memory log store — Given a `MemoryLogStore`, When 1000 entries are appended and read back, Then all entries match with correct offsets
@@ -196,14 +196,14 @@
 
 #### Implementation Steps
 - [ ] Create `xraft-storage/src/quorum_state_file.rs` implementing `QuorumStateStore` — write JSON to temp file, fsync, atomic rename to `quorum-state`
-- [ ] Implement `QuorumStateStore::load` — read and parse `quorum-state` file on startup; return default if file does not exist
+- [ ] Implement `QuorumStateStore::load` — read and parse `quorum-state` file on startup; return `None` if file does not exist (per architecture §4.1 `Option<QuorumState>` return type — the recovery code in Phase 6 interprets `None` as initial state with term=0 and no vote)
 - [ ] Create `xraft-storage/src/leader_epoch_checkpoint.rs` — persist and cache mapping of `leader_epoch → start_offset`
 - [ ] Implement checkpoint append (new epoch entry) and lookup (find start offset for a given epoch) with binary search
 
 #### Test Scenarios
 - [ ] Scenario: Atomic quorum-state write — Given an existing `quorum-state` file, When a new state is persisted and the process crashes mid-write, Then the old file is still readable (atomic rename guarantees)
 - [ ] Scenario: Leader epoch lookup — Given epochs {1→0, 3→50, 5→120}, When looking up epoch 3, Then `start_offset = 50` is returned
-- [ ] Scenario: Missing quorum-state — Given no `quorum-state` file exists, When `load()` is called, Then a default `QuorumState` with term 0 and no vote is returned
+- [ ] Scenario: Missing quorum-state — Given no `quorum-state` file exists, When `load()` is called, Then `None` is returned (per architecture §4.1 `Option<QuorumState>` contract); the recovery code (Phase 6) interprets `None` as initial state with term=0 and no vote
 
 ### Stage 2.4: Snapshot Store
 
@@ -302,13 +302,13 @@
 #### Implementation Steps
 - [ ] Create `xraft-core/src/event_loop.rs` with async event loop skeleton: inbound message channel (`tokio::sync::mpsc`), tick-based timer, and shutdown signal
 - [ ] Implement `IoAction` enum: `PersistQuorumState`, `AppendLog`, `TruncateSuffix`, `TruncatePrefix`, `SendRpc`, `SaveSnapshot` — per architecture §3.2, application callbacks (`StateMachine::apply`, `Listener::handle_commit`, `Listener::handle_leader_change`) are NOT `IoAction` variants; they are synchronous, in-process calls invoked directly by the `EventLoop` during message processing, before the `IoAction` batch is produced
-- [ ] Implement `IoActionBatch` collection and `IoStage` executor that dispatches actions to trait objects concurrently
+- [ ] Implement `IoActionBatch` collection and `IoStage` executor that dispatches actions to I/O trait objects (`LogStore`, `TransportSender`, `QuorumStateStore`, `SnapshotIO`) concurrently — the `IoStage` does NOT call `Clock` or `TransportReceiver` (architecture §3.2 note: Clock is used by the EventLoop, TransportReceiver by the ReceiverTask)
 - [ ] Create `xraft-core/src/clock.rs` with `WallClock` (production implementation using `tokio::time`) of the `Clock` trait — implements `now`, `sleep_until`, and `random_election_timeout` per architecture §4.1; `SimulatedClock` is defined in `xraft-test` (Stage 1.8), not in `xraft-core`, to keep test-only code out of the production crate
 - [ ] Implement randomised election timeout generation using `Clock::random_election_timeout` with jitter in [min, max] range
 
 #### Test Scenarios
 - [ ] Scenario: Simulated clock — Given a `SimulatedClock` (from `xraft-test`, Stage 1.8) at time 0, When advanced by 150 ms, Then `now()` returns 150 ms and no wall-clock time has passed
-- [ ] Scenario: IoStage dispatch — Given an `IoActionBatch` with a `PersistQuorumState` and a `SendRpc`, When executed by `IoStage`, Then both the quorum-state store and transport receive the respective calls
+- [ ] Scenario: IoStage dispatch — Given an `IoActionBatch` with a `PersistQuorumState` and a `SendRpc`, When executed by `IoStage`, Then both the quorum-state store and transport sender receive the respective calls; `Clock` and `TransportReceiver` are NOT invoked by the `IoStage`
 
 ### Stage 4.2: Election Manager — Vote Request/Response
 
@@ -446,7 +446,7 @@
 - [ ] Implement `RaftNode::bootstrap(cluster_id: ClusterId, initial_voters: Vec<VoterInfo>)` — for first-time cluster formation per architecture §5.9: accept a shared `ClusterId` (generated once by the operator and distributed out-of-band to all nodes), store `cluster_id` and voter set in memory, set term=0 with no vote, transition role from `Unattached` to `Follower`, start election timer — the initial `VotersRecord` is NOT written to the log during bootstrap; the leader appends `LeaderChangeMessage` and `VotersRecord` to the log after winning the first election (architecture §5.9 bootstrap flow); the quorum-state file is first persisted when the node votes during the first election (via `QuorumStateStore::save` in Stage 4.2's fsync-before-ack rule)
 - [ ] Implement bootstrap guard: reject `bootstrap()` if log is non-empty OR quorum-state file already exists OR a snapshot already exists — all three conditions indicate prior initialisation and must prevent re-bootstrap
 - [ ] Implement single-node bootstrap for development/testing: a 1-node cluster follows the same election path — bootstrap to `Follower`, election timeout fires, node self-votes (persisting quorum-state), wins election as the only voter, becomes Leader, and appends `LeaderChangeMessage` + `VotersRecord` — this preserves the persistence contract that quorum-state is first written during the first election
-- [ ] Connect `RaftNode::new(config, log_store, quorum_state_store, snapshot_io, transport, clock, state_machine, listener)` constructor that starts the node in `Unattached` role, calls `recover()` if data exists, or waits for `bootstrap()` if data directory is empty
+- [ ] Connect `RaftNode::new(config, log_store, quorum_state_store, snapshot_io, transport_sender, transport_receiver, clock, state_machine, listener)` constructor that starts the node in `Unattached` role, calls `recover()` if data exists, or waits for `bootstrap()` if data directory is empty
 
 #### Test Scenarios
 - [ ] Scenario: Fresh bootstrap — Given a 3-node cluster with empty data directories and a shared `ClusterId` generated once, When each node calls `bootstrap(cluster_id, [N1, N2, N3])` with the same `ClusterId`, Then all nodes transition from `Unattached` to `Follower` with matching `ClusterId` and in-memory voter set {N1, N2, N3}; the log is empty and no quorum-state file exists until the first election occurs and the winning leader appends LeaderChangeMessage + VotersRecord
