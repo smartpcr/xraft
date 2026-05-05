@@ -375,17 +375,19 @@ Feature: Log Divergence and Truncation
 
   Scenario: Follower truncates divergent entries on DivergingEpoch
     Given N1 was Leader for term 1 and appended entries at offsets 0–5
-    And N2 replicated entries 0–3 but N1 crashed before entries 4–5 were committed
+    And N2 replicated entries 0–4 from N1 (N2's log_end_offset is 5, last entry term 1)
+    And N1 crashed before entry at offset 4 was committed
     And N3 becomes Leader for term 2 and appends new entries at offsets 4–6
-    And N3's leader-epoch-checkpoint maps term 1 → start 0 and term 2 → start 4
-    When N2 sends a Fetch RPC to N3 with last_fetched_epoch=1 and fetch_offset=4
+    And N3's leader-epoch-checkpoint maps term 1 → start 0, term 2 → start 4
+    When N2 sends a Fetch RPC to N3 with last_fetched_epoch=1 and fetch_offset=5
     Then N3 checks its leader-epoch-checkpoint for epoch 1
-    And N3 sees epoch 1 ended at offset 4 (term 2 starts at 4)
-    And N2's fetch_offset (4) does not exceed the epoch boundary so no divergence on epoch
-    And N3 responds with entries starting at offset 4 from term 2
-    And N2 receives entries at offsets 4–6 from term 2
-    And N2 truncates its divergent entry at offset 4 (term 1) via suffix truncation
-    And N2 appends the leader's entries at offsets 4–6 (term 2)
+    And N3 finds epoch 1 ended at offset 4 (term 2 starts at 4)
+    And N2's fetch_offset (5) > epoch 1 end (4) → divergence detected
+    And N3 responds with DivergingEpoch { epoch: 1, end_offset: 4 }
+    And N2 truncates its log from offset 4 onward (via LogStore::truncate_suffix(4))
+    When N2 sends another Fetch RPC with last_fetched_epoch=1 and fetch_offset=4
+    Then N3 responds with entries at offsets 4–6 from term 2
+    And N2 appends the leader's entries and its log now matches N3's
 
   Scenario: Multiple Fetch rounds to resolve deep divergence
     Given N2 has entries at offsets 0–10 from terms [1,1,1,1,2,2,2,3,3,3,3]
