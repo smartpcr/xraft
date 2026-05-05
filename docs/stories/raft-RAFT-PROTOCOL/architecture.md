@@ -58,14 +58,20 @@ synchronous in-process calls whenever a commit-visible event occurs (e.g.,
 HW advancement). It then produces `IoAction` values that describe external
 I/O to perform (append log, send RPC, persist quorum state). An `IoStage`
 executes those actions concurrently via the injected async trait objects
-(`LogStore`, `Transport`, `SnapshotIO`, `QuorumStateStore`, `Clock`). The
+(`LogStore`, `TransportSender`, `SnapshotIO`, `QuorumStateStore`). The
 event loop never opens files or sockets directly; all concrete external I/O
 is provided by the transport and storage crates at construction time.
-Application callbacks are not external I/O — they are synchronous,
-in-process method calls (statically dispatched when the generic type
-parameters are monomorphised) that execute within the event loop's thread
-and always observe fully updated protocol state before any `IoAction` is
-dispatched. Incoming
+Inbound messages arrive via an mpsc channel fed by a dedicated
+`ReceiverTask` that calls `TransportReceiver::recv()` (see §4.4). The
+event loop uses the injected `Clock` directly for timer management
+(election timeouts, check-quorum deadlines) — `Clock` is not mediated by
+`IoAction`. Application callbacks are not external I/O — they are
+synchronous, in-process method calls (statically dispatched when the
+generic type parameters are monomorphised) that execute within the event
+loop's thread and always observe fully updated protocol state before any
+`IoAction` is dispatched. Callbacks must be lightweight and non-blocking;
+applications that need heavy processing should hand off work to their own
+async tasks. Incoming
 proposals are staged in a `BatchAccumulator` and drained on each tick;
 client futures are parked in a `DeferredCompletionQueue` until the high
 watermark advances past their offset. This mirrors KRaft's
@@ -81,18 +87,20 @@ spurious elections.
 ### 2.1 Proposed `xraft-core` — Consensus Engine
 
 The central crate. Contains no direct I/O code — all storage and network
-operations are expressed as `IoAction` values produced by the event loop
-and executed by the `IoStage`, which calls the injected async trait objects
-(`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`, `Clock`). The
-event loop itself never opens files or sockets; it only mutates in-memory
-`ConsensusState`, invokes synchronous application callbacks (`StateMachine`,
-`Listener`), and emits `IoAction` batches.
+send operations are expressed as `IoAction` values produced by the event
+loop and executed by the `IoStage`, which calls the injected async trait
+objects (`LogStore`, `TransportSender`, `SnapshotIO`, `QuorumStateStore`).
+Inbound messages arrive via an mpsc channel fed by the `ReceiverTask`
+(§4.4). The event loop itself never opens files or sockets; it only
+mutates in-memory `ConsensusState`, invokes synchronous application
+callbacks (`StateMachine`, `Listener`), manages timers via the injected
+`Clock`, and emits `IoAction` batches.
 
 | Sub-component | Responsibility |
 |---------------|----------------|
-| **`RaftNode`** | Public API surface. Exposes `propose()`, `read()`, `bootstrap()`, and lifecycle methods. Owns the `EventLoop` and coordinates startup, shutdown, and crash recovery. Generic over two application-provided types: `S: StateMachine` and `L: Listener` (both monomorphised at compile time for zero-cost dispatch). I/O traits (`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`, `Clock`) are injected as trait objects (`Box<dyn ...>`) at construction time. On construction, executes the recovery sequence (§5.10) before accepting any RPCs. |
-| **`EventLoop`** | Single-threaded async loop that processes protocol state transitions without blocking on I/O. The loop drains an inbound message queue (`tokio::sync::mpsc`) and dispatches to the appropriate handler. **Processing order per message:** (1) The handler mutates `ConsensusState` (e.g., updating follower progress, recalculating HW on a Fetch request, or recording appended entries); (2) If the state change triggers application-visible effects — HW advancement, leadership change — the loop invokes callbacks in a fixed order: `StateMachine::apply` (one call per committed command entry), then `Listener::handle_commit` (one batch of committed `AppRecord` values), then `DeferredCompletionQueue::complete` (resolves client futures for committed offsets); (3) The handler collects `IoAction` values into an `IoActionBatch` (e.g., `SendRpc` for the Fetch response, `AppendLog` for newly staged entries); (4) The loop hands the batch to the `IoStage`, which executes storage and network operations concurrently; (5) The loop records I/O results (e.g., advancing the durable offset after `AppendLog` completes). Callbacks in step 2 are synchronous, in-process function calls — not external I/O — and always observe the fully updated protocol state before any IoAction is dispatched. This prevents slow `fsync` calls from delaying Fetch processing and triggering spurious elections. |
-| **`IoStage`** | Executes `IoAction` batches produced by the `EventLoop`. Each action is one of: `PersistQuorumState(QuorumState)`, `AppendLog(Vec<LogEntry>)`, `TruncateSuffix(u64)`, `TruncatePrefix(u64)`, `SendRpc(NodeId, RpcEnvelope)`, `SaveSnapshot(Snapshot)`. The `IoStage` calls the injected trait objects (`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`) concurrently via `tokio::join!` or `FuturesUnordered`. Storage operations complete with `fsync` before the loop processes the next message that depends on them. **Application callbacks** (`StateMachine::apply`, `Listener::handle_commit`, `Listener::handle_leader_change`) are NOT dispatched by the `IoStage` — they are invoked directly by the `EventLoop` during message processing, immediately after a state change triggers them (e.g., HW advancement during Fetch handling). This ensures callbacks execute synchronously within the event loop's single-threaded context and always see consistent, up-to-date protocol state. The event loop produces the `IoAction` batch *after* callbacks have been invoked, so the Fetch response sent via `IoStage` reflects the same HW that callbacks observed. |
+| **`RaftNode`** | Public API surface. Exposes `propose()`, `read()`, `bootstrap()`, and lifecycle methods. Owns the `EventLoop`, `ReceiverTask`, and `IoStage`; coordinates startup, shutdown, and crash recovery. Generic over two application-provided types: `S: StateMachine` and `L: Listener` (both monomorphised at compile time for zero-cost dispatch). I/O and runtime traits (`LogStore`, `TransportSender`, `TransportReceiver`, `QuorumStateStore`, `SnapshotIO`, `Clock`) are injected as trait objects (`Box<dyn ...>`) at construction time. On construction, executes the recovery sequence (§5.10) before accepting any RPCs. |
+| **`EventLoop`** | Single-threaded async loop that processes protocol state transitions without blocking on I/O. The loop drains an inbound message queue (`tokio::sync::mpsc` — fed by the `ReceiverTask`, §4.4) and dispatches to the appropriate handler. Uses the injected `Clock` directly for timer management (election timeouts, check-quorum deadlines, fetch intervals). **Processing order per message:** (1) The handler mutates `ConsensusState` (e.g., updating follower progress, recalculating HW on a Fetch request, or recording appended entries); (2) If the state change triggers application-visible effects — HW advancement, leadership change — the loop invokes callbacks in a fixed order: `StateMachine::apply` (one call per committed command entry), then `Listener::handle_commit` (one batch of committed `AppRecord` values), then `DeferredCompletionQueue::complete` (resolves client futures for committed offsets); (3) The handler collects `IoAction` values into an `IoActionBatch` (e.g., `SendRpc` for the Fetch response, `AppendLog` for newly staged entries); (4) The loop hands the batch to the `IoStage`, which executes storage and network-send operations concurrently; (5) The loop records I/O results (e.g., advancing the durable offset after `AppendLog` completes). Callbacks in step 2 are synchronous, in-process function calls — not external I/O — and always observe the fully updated protocol state before any IoAction is dispatched. Callbacks must be lightweight and non-blocking; applications that need heavy processing should hand off work to their own async tasks. This prevents slow `fsync` calls from delaying Fetch processing and triggering spurious elections. |
+| **`IoStage`** | Executes `IoAction` batches produced by the `EventLoop`. Each action is one of: `PersistQuorumState(QuorumState)`, `AppendLog(Vec<LogEntry>)`, `TruncateSuffix(u64)`, `TruncatePrefix(u64)`, `SendRpc(NodeId, RpcEnvelope)`, `SaveSnapshot(Snapshot)`. The `IoStage` calls the injected I/O trait objects (`LogStore`, `TransportSender`, `QuorumStateStore`, `SnapshotIO`) concurrently via `tokio::join!` or `FuturesUnordered`. Storage operations complete with `fsync` before the loop processes the next message that depends on them. **Application callbacks** (`StateMachine::apply`, `Listener::handle_commit`, `Listener::handle_leader_change`) are NOT dispatched by the `IoStage` — they are invoked directly by the `EventLoop` during message processing, immediately after a state change triggers them (e.g., HW advancement during Fetch handling). This ensures callbacks execute synchronously within the event loop's single-threaded context and always see consistent, up-to-date protocol state. The event loop produces the `IoAction` batch *after* callbacks have been invoked, so the Fetch response sent via `IoStage` reflects the same HW that callbacks observed. **Note:** The `IoStage` does NOT call `TransportReceiver` or `Clock` — those are used by the `ReceiverTask` (§4.4) and `EventLoop` respectively. |
 | **`BatchAccumulator`** | Stages incoming `propose()` calls into a batch buffer. On each event-loop tick (or when the batch is full), the accumulated entries are drained into a single `AppendLog` I/O action. This amortises `fsync` cost across multiple proposals (group commit). Analogous to KRaft's `BatchAccumulator`. |
 | **`DeferredCompletionQueue`** | Parks `tokio::sync::oneshot` senders keyed by log offset. When the high watermark advances, the queue completes all futures whose offset is now **< HW** (strictly less than — see §3.1 canonical HW definition). Analogous to KRaft's `DeferredEventQueue` / purgatory. |
 | **`ConsensusState`** | The core state: current `term`, `voted_for`, node `role` (Follower / Candidate / Leader / Unattached), the in-memory log index, `high_watermark`, `log_start_offset`, the voter set, and per-follower replication progress (leader only). The `Unattached` role is the initial state before bootstrap or recovery completes. |
@@ -116,15 +124,22 @@ Owns all persistent state. Every write is `fsync`-ed before acknowledgement.
 
 ### 2.3 Proposed `xraft-transport` — Async RPC Layer
 
-Abstracts network communication behind a trait so the core never touches
-sockets directly. The proposed production implementation uses `tokio` TCP;
-the proposed test implementation uses in-process channels.
+Abstracts network communication behind two split traits so the core never
+touches sockets directly. `TransportSender` handles outbound RPCs (called
+by the `IoStage` via `SendRpc` actions). `TransportReceiver` handles
+inbound RPCs (called by the `ReceiverTask`, §4.4, which feeds the
+`EventLoop`'s mpsc channel). The split avoids ownership conflicts — the
+sender must be `Sync` for concurrent sends, while the receiver takes
+`&mut self` for exclusive read access. The proposed production
+implementation uses `tokio` TCP; the proposed test implementation uses
+in-process channels.
 
 | Sub-component | Responsibility |
 |---------------|----------------|
-| **`Transport` trait** | Defines `send(node_id, message) → Future<Result>` and `recv() → Stream<Message>`. Parameterised by message type. |
-| **`TcpTransport`** | Production transport using `tokio::net::TcpStream`. Connections are pooled per peer. Messages are length-prefixed, serialised with `serde` + `bincode`. Each connection is multiplexed by RPC type. |
-| **`ChannelTransport`** | In-process transport for integration tests. Uses `tokio::sync::mpsc` channels. Supports fault injection: message delay, drop, reorder, partition. |
+| **`TransportSender` trait** | Defines `async fn send(&self, target: NodeId, message: RpcEnvelope) → Result<()>`. Takes `&self` (shared reference) because the `IoStage` may send to multiple peers concurrently. Requires `Send + Sync + 'static`. |
+| **`TransportReceiver` trait** | Defines `async fn recv(&mut self) → Result<RpcEnvelope>`. Takes `&mut self` (exclusive access) because only the `ReceiverTask` reads from the network. Requires `Send + 'static`. |
+| **`TcpTransport`** | Production transport using `tokio::net::TcpStream`. Implements both `TransportSender` and `TransportReceiver`. On construction, `RaftNode` calls `split()` to obtain separate sender and receiver handles. Connections are pooled per peer. Messages are length-prefixed, serialised with `serde` + `bincode`. Each connection is multiplexed by RPC type. |
+| **`ChannelTransport`** | In-process transport for integration tests. Uses `tokio::sync::mpsc` channels. Provides `split()` for sender/receiver separation. Supports fault injection: message delay, drop, reorder, partition. |
 | **`RpcCodec`** | Serialisation/deserialisation of RPC messages. Uses `serde` + `bincode`. Every message includes `cluster_id` and `leader_epoch` for identity verification and fencing. |
 
 ### 2.4 Proposed `xraft-test` — Deterministic Simulation Harness
@@ -502,12 +517,14 @@ default 256) to the byte position in the `.log` file for fast seeks.
 
 ### 4.1 Trait Definitions
 
-xraft defines two categories of traits with different dispatch models:
+xraft defines three categories of traits with different dispatch models.
+Each trait has a single, unambiguous caller — there is no overlap.
 
 | Category | Traits | Dispatch | Bounds | Caller |
 |----------|--------|----------|--------|--------|
-| **Application** (synchronous) | `StateMachine`, `Listener` | Static (generic type parameters on `RaftNode`, monomorphised) | `Send + 'static` | `EventLoop` — invoked synchronously during message processing, before `IoAction` batch is produced |
-| **I/O** (asynchronous) | `LogStore`, `Transport`, `SnapshotIO`, `QuorumStateStore`, `Clock` | Dynamic (injected as `Box<dyn ...>` trait objects) | `Send + Sync + 'static`, `#[async_trait]` | `IoStage` — invoked concurrently after the event loop produces an `IoAction` batch |
+| **Application** (synchronous) | `StateMachine`, `Listener` | Static (generic type parameters on `RaftNode<S, L>`, monomorphised) | `Send + 'static` | `EventLoop` — invoked synchronously during message processing, before `IoAction` batch is produced. Must be lightweight and non-blocking. |
+| **Storage / Network-Send I/O** (asynchronous) | `LogStore`, `SnapshotIO`, `QuorumStateStore`, `TransportSender` | Dynamic (injected as `Box<dyn ...>` trait objects) | `Send + Sync + 'static`, `#[async_trait]` | `IoStage` — invoked concurrently when executing `IoAction` batches (`AppendLog`, `SaveSnapshot`, `PersistQuorumState`, `TruncateSuffix`, `TruncatePrefix`, `SendRpc`) |
+| **Runtime** (asynchronous) | `TransportReceiver`, `Clock` | Dynamic (injected as `Box<dyn ...>` trait objects) | `Send + 'static`, `#[async_trait]` | `TransportReceiver`: called by `ReceiverTask` (§4.4) which feeds the `EventLoop`'s mpsc channel. `Clock`: used directly by the `EventLoop` for timer management (election timeouts, check-quorum deadlines). Neither is mediated by `IoAction`. |
 
 This separation ensures that application callbacks always see consistent,
 fully-updated protocol state (they run inside the event loop before any I/O
@@ -616,22 +633,44 @@ pub trait LogStore: Send + Sync + 'static {
 }
 ```
 
-#### `Transport` (core ↔ network)
+#### `TransportSender` (core → network, outbound RPCs)
 
 ```rust
 #[async_trait]
-pub trait Transport: Send + Sync + 'static {
-    /// Send a message to a specific node.
+pub trait TransportSender: Send + Sync + 'static {
+    /// Send a message to a specific node. Called by IoStage via SendRpc action.
     async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<()>;
+}
+```
 
-    /// Receive the next inbound message.
+`TransportSender` requires `Sync` because the `IoStage` may send to
+multiple peers concurrently from the same trait object.
+
+#### `TransportReceiver` (network → core, inbound RPCs)
+
+```rust
+#[async_trait]
+pub trait TransportReceiver: Send + 'static {
+    /// Receive the next inbound message. Called exclusively by ReceiverTask (§4.4).
     async fn recv(&mut self) -> Result<RpcEnvelope>;
 }
 ```
 
+`TransportReceiver` takes `&mut self` because only one task (`ReceiverTask`)
+reads from the network. It does NOT require `Sync`.
+
+Production: `TcpTransport` implements both traits and exposes a `split()`
+method that returns `(Box<dyn TransportSender>, Box<dyn TransportReceiver>)`.
+`RaftNode` calls `split()` at construction time and passes the sender half
+to the `IoStage` and the receiver half to the `ReceiverTask`.
+
+Test: `ChannelTransport` provides the same `split()` interface, returning
+in-process channel halves with optional fault injection.
+
 #### `Clock` (core ↔ time)
 
 ```rust
+#[async_trait]
 pub trait Clock: Send + 'static {
     /// Current instant.
     fn now(&self) -> Instant;
@@ -643,6 +682,10 @@ pub trait Clock: Send + 'static {
     fn random_election_timeout(&self) -> Duration;
 }
 ```
+
+`Clock` is used directly by the `EventLoop` — not mediated by `IoAction`.
+It does not require `Sync` because only the single-threaded event loop
+accesses it.
 
 Production: wraps `tokio::time`. Test: `SimulatedClock` with manual tick.
 
