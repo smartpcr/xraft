@@ -6,7 +6,7 @@
     "contentHash": "ca02a67d471a8c1825df416ee1044cebd5440a1ade39698c9fd00a908a26e6e0",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-cargo-workspace-and-root-configuration",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-cargo-workspace-and-root-configuration",
-    "status": "planning"
+    "status": "active"
   },
   {
     "title": "Core Domain Types in \u0060xraft-core\u0060",
