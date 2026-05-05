@@ -2035,9 +2035,9 @@ lease-based) are out of scope (tech-spec §2.2).
    entry is committed yet, the event loop parks the `ReadRequest` in a
    `DeferredReadQueue` (analogous to `DeferredCompletionQueue` but for
    reads). When the `LeaderChangeMessage` commits (HW advances past its
-   offset), the three-phase commit notification runs first (§4.1), then
-   the event loop drains the `DeferredReadQueue`: for each parked read,
-   it calls `StateMachine::query()` and resolves the oneshot.
+   offset), the four-phase commit notification (§4.1) runs — step 4
+   of that notification drains the `DeferredReadQueue`: for each parked
+   read, it calls `StateMachine::query()` and resolves the oneshot.
 
 6. **Cancellation.** If the leader steps down (via Check Quorum failure,
    higher-term RPC, or `RemoveVoter` self-removal), all pending reads in
@@ -2131,134 +2131,145 @@ pub struct RaftMetrics {
 
 ---
 
-## 7. Alignment Notes
+## 7. Cross-Document Alignment
 
 This section records the alignment status between this architecture and
-the three sibling planning documents, based on their content as of the
-current iteration. All four documents share a greenfield context — no
-Rust source code exists yet. Concepts listed as "aligned" have been
-verified against the sibling document's current text.
+the three sibling planning documents. All four documents share a
+greenfield context — no Rust source code exists yet. §7.1 lists
+conventions that are consistent across all documents. §7.2 lists every
+known divergence with the canonical resolution that governs
+implementation. §7.3 confirms which sibling documents are fully aligned.
 
-### 7.1 Conventions Agreed Across All Four Documents
+### 7.1 Shared Conventions (All Four Documents)
 
-The following conventions are consistent across architecture, tech spec,
-implementation plan, and e2e scenarios:
+| Convention | Detail | Sources |
+|------------|--------|---------|
+| **Proposed crate layout** | `xraft-core`, `xraft-transport`, `xraft-storage`, `xraft-test`. | tech spec §4.4, impl plan Stage 1.1, e2e preamble |
+| **RPC names** | `Vote`, `Fetch`, `FetchSnapshot`, `AddVoter`, `RemoveVoter`, `UpdateVoter`. | tech spec §2.1.4, impl plan Stage 1.3, e2e preamble |
+| **Pull-based replication** | Followers `Fetch` from leader; no push-based `AppendEntries`. | tech spec §3, e2e preamble |
+| **Serialisation** | `serde` + `bincode`. | tech spec §6 |
+| **Control record filtering** | `StateMachine::apply` receives only `AppRecord`; `LeaderChangeMessage` and `VotersRecord` are handled internally. | tech spec §2.1.5, impl plan Stage 1.4, e2e Client Interaction |
+| **Snapshot split** | `SnapshotMetadata` (consensus) + `AppSnapshot` (application). | all docs |
+| **I/O trait objects** | Storage / Network-Send I/O traits injected as `Box<dyn ...>` — no `Arc`. `IoStage` borrows via `&self` with `Sync` bound. | impl plan Stage 1.7 |
+| **Transport split** | Separate `TransportSender` (`&self`, `Sync`) and `TransportReceiver` (`&mut self`, not `Sync`). `split()` on concrete transports. | impl plan Stage 1.4, architecture §4.4 |
+| **Clock placement** | `Clock` is a Runtime trait, passed to the `EventLoop` (not `IoStage`), not mediated by `IoAction`. | impl plan Stage 1.4/1.7 |
+| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state → snapshot → log scan → resume as follower → learn HW from leader. | tech spec §2.1.7, impl plan Phase 6 |
+| **Timing parameters** | 150–300 ms election timeout (randomised), 50 ms fetch interval. | tech spec §4.3 |
+| **Quorum math** | Majority = `⌊V/2⌋ + 1`; HW = descending-sorted voter offsets at index `⌊V/2⌋` (0-indexed). Only voters count. | all docs |
 
-| Convention | Detail |
-|------------|--------|
-| **Proposed crate layout** | `xraft-core`, `xraft-transport`, `xraft-storage`, `xraft-test` (tech spec §4.4, impl plan Stage 1.1, e2e preamble). |
-| **RPC names** | `Vote`, `Fetch`, `FetchSnapshot`, `AddVoter`, `RemoveVoter`, `UpdateVoter` (tech spec §2.1.4, impl plan Stage 1.3, e2e preamble). |
-| **Pull-based replication** | Followers `Fetch` from leader; no push-based `AppendEntries` (tech spec §3, e2e preamble). |
-| **Serialisation** | `serde` + `bincode` (tech spec §6). |
-| **Control record filtering** | `StateMachine::apply` receives only `AppRecord`; `LeaderChangeMessage` and `VotersRecord` are handled internally by xraft (tech spec §2.1.5, impl plan Stage 1.4, e2e Feature: Client Interaction). |
-| **Snapshot split** | `SnapshotMetadata` (consensus) + `AppSnapshot` (application). |
-| **I/O trait object ownership** | All Storage / Network-Send I/O traits injected as `Box<dyn ...>` — no `Arc`. The `IoStage` borrows via `&self` with `Sync` bound (impl plan Stage 1.7). |
-| **Transport split** | Separate `TransportSender` (`&self`, `Sync`) and `TransportReceiver` (`&mut self`, not `Sync`). `split()` method on `TcpTransport` / `ChannelTransport` (impl plan Stage 1.4, §4.4). |
-| **Clock placement** | `Clock` is a Runtime trait, passed to the `EventLoop` (not the `IoStage`), not mediated by `IoAction` (impl plan Stage 1.4/1.7). |
-| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state → snapshot → log scan → resume as follower → learn HW from leader (tech spec §2.1.7, impl plan Phase 6). |
-| **Timing parameters** | 150–300 ms election timeout (randomised), 50 ms fetch interval (tech spec §4.3). |
-| **Quorum math** | Majority = `⌊V/2⌋ + 1`; HW = descending-sorted voter offsets at index `⌊V/2⌋` (0-indexed). Only voters count; observers do not contribute to quorum. |
-| **Exclusive HW semantics** | Entry at offset O is committed ⟺ `O < HW`. `HW − 1` is the last committed offset. All three implementation-facing documents (architecture, impl plan, e2e scenarios) use this convention (§3.1, e2e preamble). |
+### 7.2 Known Divergences and Canonical Resolutions
 
-### 7.2 Alignment with `e2e-scenarios.md` — Fully Aligned
+Each entry names the specific sections that conflict, states both
+positions, and declares which interpretation governs implementation.
+
+#### Divergence 1 — Callback execution model
+
+| Document | Statement | Section |
+|----------|-----------|---------|
+| **Tech spec** | "application callbacks are staged and executed asynchronously outside the loop" | §4.4.1 |
+| **This architecture** | Callbacks (`StateMachine::apply`, `Listener::handle_commit`, `DeferredCompletionQueue::complete`, `DeferredReadQueue::drain`) are **synchronous, in-process calls** invoked by the `EventLoop` during message processing, after state mutation but before `IoAction` dispatch. | §4.1 |
+| **Impl plan** | Uses the synchronous-callback model from this architecture. | Stages 4.1, 5.1 |
+| **E2e scenarios** | Uses the synchronous-callback model from this architecture. | Client Interaction feature |
+
+**Canonical resolution:** Callbacks are synchronous, in-process calls
+within the event loop (this architecture §4.1). The tech spec's phrasing
+describes a different execution model that is superseded by the detailed
+design in this architecture. The implementation plan and e2e scenarios
+both follow this architecture.
+
+#### Divergence 2 — High watermark: inclusive vs exclusive
+
+| Document | Statement | Section |
+|----------|-----------|---------|
+| **Tech spec** | "Entries at or below the HW are considered committed" (inclusive, at-or-below). | §8 Glossary |
+| **This architecture** | HW is an exclusive upper bound: entry at offset O is committed ⟺ `O < HW`. | §3.1 |
+| **Impl plan** | Uses exclusive semantics. | Phase 5 preamble, Stage 5.3 |
+| **E2e scenarios** | Uses exclusive semantics; preamble maps tech-spec inclusive to exclusive. | Offset conventions |
+
+**Canonical resolution:** Exclusive semantics (`O < HW`) govern
+implementation. Mapping: tech spec "entries ≤ N committed" corresponds
+to `HW = N + 1` in exclusive notation. The committed set is identical;
+only the numeric convention differs.
+
+#### Divergence 3 — Commit notification: three phases vs four
+
+| Document | Statement | Section |
+|----------|-----------|---------|
+| **Impl plan** | Uses "three-phase commit notification": (1) `StateMachine::apply`, (2) `Listener::handle_commit`, (3) `DeferredCompletionQueue::complete`. Does not include `DeferredReadQueue::drain`. | Stages 5.1, 5.3, 6.1 |
+| **This architecture** | Defines **four-phase** commit notification, adding (4) `DeferredReadQueue::drain` — resolves pending `read()` requests via `StateMachine::query()`. | §4.1 |
+| **E2e scenarios** | Uses the four-phase model from this architecture. | Client Interaction feature |
+
+**Canonical resolution:** Four-phase commit notification (this
+architecture §4.1). Step 4 (`DeferredReadQueue::drain`) is required for
+the linearizable read path defined in §5.11. The implementation plan's
+three-phase model omits the read-path step.
+
+#### Divergence 4 — `read()` semantics and `StateMachine` trait shape
+
+| Document | Statement | Section |
+|----------|-----------|---------|
+| **Tech spec** | `read() → Result<State>`. "Initial implementation routes reads through the log for safety." Linearisable reads (read-index, lease-based) are out of scope. | §2.1.5, §2.2 |
+| **Impl plan** | `read() → Result<ConsensusState>` — returns protocol metadata (term, role, leader, HW, voter set). `StateMachine` trait has `apply`, `snapshot`, `restore` only. | Stages 1.7, 5.3, 1.4 |
+| **This architecture** | `read() → Result<S::ReadResult>` — leader-only, returns application state via `StateMachine::query()`. No per-read log entry is appended; the leader confirms authority by verifying a committed current-term entry (leadership proof, §5.11). `StateMachine` trait adds `type ReadResult` and `fn query(&self)`. Protocol metadata is available separately via `RaftNode::metrics()`. | §5.11, §4.1 |
+| **E2e scenarios** | Uses the `S::ReadResult` / `query()` model from this architecture. | Client Interaction feature |
+
+**Canonical resolution:** `read()` returns `S::ReadResult` via
+`StateMachine::query()` (this architecture §5.11). The tech spec's
+"routes reads through the log" describes the leadership-proof mechanism
+(waiting for a committed current-term entry), not a per-read log append.
+The implementation plan's `ConsensusState` return type should be replaced
+with `S::ReadResult`; `StateMachine` needs `type ReadResult` and
+`fn query(&self)`.
+
+#### Divergence 5 — `LogStore` method receivers
+
+| Document | Statement | Section |
+|----------|-----------|---------|
+| **Impl plan** | `LogStore` write methods (`append`, `truncate_suffix`, `truncate_prefix`) take `&mut self`. | Stage 1.4 |
+| **This architecture** | All `LogStore` methods take `&self` with interior mutability (e.g., `tokio::sync::Mutex<File>`), consistent with `SnapshotIO::save(&self)` and `QuorumStateStore::save(&self)`. | §4.1 |
+
+**Canonical resolution:** `&self` with interior mutability (this
+architecture §4.1). Required by the `IoStage`'s concurrent dispatch
+model: the `IoStage` holds all I/O trait objects as owned `Box<dyn ...>`
+and borrows them via `&self` for `tokio::join!` across trait objects.
+
+#### Divergence 6 — `StateMachine::apply` signature
+
+| Document | Statement | Section |
+|----------|-----------|---------|
+| **Tech spec** | `fn apply(&mut self, entry: &AppRecord) -> Result<()>` — no offset parameter. | §2.1.5 |
+| **This architecture** | `fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>` — includes the committed entry's log offset. | §4.1 |
+| **Impl plan** | `fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>` — matches this architecture. | Stage 1.4 |
+
+**Canonical resolution:** `apply` takes `(offset, &AppRecord)` (this
+architecture §4.1). The offset parameter lets applications track which
+entries have been applied (useful for idempotency, checkpointing, and
+snapshots). The tech spec's simpler signature is a summary, not a
+constraint.
+
+#### Divergence 7 — `ClusterId` generation
+
+| Document | Statement | Section |
+|----------|-----------|---------|
+| **Tech spec** | "clusterId UUID generated at bootstrap time" — could be read as node-generated. | §2.1.7 |
+| **This architecture** | Nodes are "configured with… a shared `cluster_id`" — externally provided. | §5.9 |
+| **Impl plan** | `ClusterId` is "generated once by the operator and distributed out-of-band to all nodes." `bootstrap()` accepts it as a parameter. | Stage 6.2 |
+
+**Canonical resolution:** `ClusterId` is generated once by the operator
+and passed to `bootstrap()` as a parameter (this architecture §5.9,
+impl plan Stage 6.2). All nodes in a cluster share the same `ClusterId`.
+The tech spec's "generated at bootstrap time" is compatible — the
+generation happens at bootstrap time, but externally rather than by the
+node itself.
+
+### 7.3 Fully Aligned: `e2e-scenarios.md`
 
 The e2e scenarios document is consistent with this architecture on all
-points:
+points checked:
 
-- **Offset conventions:** Uses exclusive HW semantics matching §3.1.
-  The offset convention preamble explicitly maps tech-spec inclusive
-  notation to architecture exclusive notation.
-- **RPC and role names:** `Vote` (with `is_pre_vote`), `Fetch`,
-  `FetchSnapshot`, `AddVoter`, `RemoveVoter`, `UpdateVoter`. Roles:
-  Unattached, Follower, Candidate, Leader. Observer is a membership
-  classification, not a role.
-- **Bootstrap HW math:** Bootstrap scenario shows HW advancing on
-  round-2 Fetch: `sorted desc [N1=2, N2=2, N3=0] → index 1 → 2`.
-  Matches §5.9.
-- **Client read semantics:** `read()` returns `S::ReadResult` via
-  `StateMachine::query()`, leader-only. Followers return `NotLeader`.
-  Protocol metadata is accessed via `RaftNode::metrics()`. Matches §5.11.
-- **Four-phase commit notification:** Scenarios use the four-phase
-  ordering (§4.1): (1) `StateMachine::apply`, (2) `Listener::handle_commit`,
-  (3) `DeferredCompletionQueue::complete`, (4) `DeferredReadQueue::drain`.
-  All callbacks are synchronous, in-process calls within the event loop.
-
-### 7.3 Alignment with `tech-spec.md` — Aligned with Two Notation Differences
-
-The tech spec is a higher-level document that defers implementation detail
-to the architecture and implementation plan. Two phrasing differences
-exist; neither represents a design conflict — they are notation
-conventions resolved below.
-
-**Agreed points:**
-- Crate layout, RPC names, pull-based replication, serialisation,
-  control-record filtering, snapshot split, timing parameters, bootstrap
-  and recovery model — all consistent (see §7.1 table).
-- `read() → Result<State>` (tech spec §2.1.5) is ambiguous by design;
-  this architecture resolves it as `S::ReadResult` via
-  `StateMachine::query()` (§5.11). The tech spec's phrase "routes reads
-  through the log for safety" aligns with the leadership-proof mechanism
-  (confirming a committed current-term entry) defined in §5.11. Tech spec
-  §2.2 marks "linearisable reads" (read-index, lease-based) as out of
-  scope; the leadership-proof mechanism in §5.11 is the initial safe
-  implementation that the tech spec defers to the architecture, not an
-  optimised read path.
-- I/O staging (tech spec §4.4.1): the event loop produces `IoAction`
-  values; the `IoStage` executes them. `BatchAccumulator` stages
-  proposals; `DeferredCompletionQueue` parks futures. Consistent.
-
-**Notation difference 1 — callback execution model.** Tech spec §4.4.1
-says "application callbacks are staged and executed asynchronously outside
-the loop." This is shorthand meaning callbacks are *deferred* until
-protocol state is consistent — not offloaded to a separate async task.
-The precise design (§4.1): `StateMachine::apply`,
-`Listener::handle_commit`, `DeferredCompletionQueue::complete`, and
-`DeferredReadQueue::drain` are synchronous, in-process method calls
-invoked by the `EventLoop` during message processing, *after* state is
-updated but *before* the `IoAction` batch is dispatched. The
-implementation plan (Stage 4.1) and e2e scenarios both use this
-synchronous-callback convention. No design conflict — the tech spec's
-phrasing is a summary, not a contradiction.
-
-**Notation difference 2 — HW inclusive vs exclusive.** Tech spec §8
-Glossary says "entries at or below the HW are considered committed"
-(inclusive). This architecture, the implementation plan, and the e2e
-scenarios all use exclusive semantics: `O < HW` (§3.1). The mapping is:
-tech spec "entries ≤ N committed" ↔ `HW = N + 1` in exclusive notation.
-The exclusive convention is canonical for implementation.
-
-### 7.4 Alignment with `implementation-plan.md` — Aligned on Structure, Two Pending Refinements
-
-The implementation plan is aligned with this architecture on all
-structural decisions. Two interface refinements in the implementation
-plan have not yet been updated to match the architecture's detailed
-design. These are narrowly scoped signature changes — not structural
-disagreements.
-
-**Aligned points (no changes needed):**
-- Transport split traits, `Box<dyn ...>` ownership, `Clock` placement,
-  callback synchronous execution model, `IoStage` dispatch, segment-file
-  log storage, bootstrap/recovery sequence, phase ordering — all
-  consistent (see §7.1 table and §7.3 above).
-
-**Pending refinement 1 — `LogStore` method signatures.** This architecture
-specifies `&self` for all `LogStore` methods (`append`, `truncate_suffix`,
-`truncate_prefix`) with interior mutability, consistent with `SnapshotIO`
-and `QuorumStateStore`. The implementation plan (Stage 1.4) currently uses
-`&mut self` for write methods. The `&self` signature is required by the
-`IoStage`'s concurrent dispatch model: the `IoStage` holds all I/O trait
-objects as owned `Box<dyn ...>` fields and borrows them via `&self` for
-`tokio::join!` across trait objects. `&mut self` on `LogStore` would
-prevent this concurrent borrowing. The implementation plan should adopt
-`&self` with interior mutability (e.g., `tokio::sync::Mutex<File>`).
-
-**Pending refinement 2 — `read()` signature and `StateMachine::query()`.** 
-This architecture defines `read()` as returning `S::ReadResult` via
-`StateMachine::query()` (§5.11), leader-only. The implementation plan
-(Stage 1.7, 5.3) currently defines `read() → Result<ConsensusState>`.
-Additionally, the implementation plan's `StateMachine` trait (Stage 1.4)
-does not yet include `type ReadResult` or `fn query(&self)`, and its
-commit notification (Stage 5.1) uses three phases instead of four (missing
-`DeferredReadQueue::drain` as step 4). These changes are required to
-support the linearizable read path. The e2e scenarios already use the
-four-phase, `S::ReadResult`-returning design.
+- Exclusive HW semantics (§3.1).
+- RPC names, role names, observer classification.
+- Bootstrap HW math: `sorted desc [2, 2, 0] → index 1 → HW = 2`.
+- Four-phase commit notification (§4.1).
+- `read() → S::ReadResult` via `StateMachine::query()` (§5.11).
+- Protocol metadata via `RaftNode::metrics()`, not `read()`.
