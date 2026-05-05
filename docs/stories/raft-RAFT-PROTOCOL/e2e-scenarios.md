@@ -223,20 +223,20 @@ Feature: Pull-Based Log Replication
   Scenario: Single entry replication via Fetch
     Given no application entries have been proposed (the log contains only the LeaderChangeMessage at offset 0)
     When a client proposes command "set x=1" to N1
-    Then N1 appends "set x=1" at offset 1, term 1 to its log
-    When N2 sends a Fetch RPC to N1 with fetch_offset 1
-    Then N1 responds with entry [offset 1, term 1, "set x=1"]
-    And N2 appends the entry to its local log
-    When N3 sends a Fetch RPC to N1 with fetch_offset 1
+    Then N1 appends "set x=1" at offset 1, term 1 to its log (log_end_offset becomes 2)
+    When N2 sends a Fetch RPC to N1 with fetch_offset 1 (N2 has entries [0, 1))
+    Then N1 responds with entry [offset 1, term 1, "set x=1"] (entries starting at fetch_offset)
+    And N2 appends the entry to its local log (N2's log_end_offset becomes 2)
+    When N3 sends a Fetch RPC to N1 with fetch_offset 1 (N3 has entries [0, 1))
     Then N1 responds with entry [offset 1, term 1, "set x=1"]
     And N3 appends the entry to its local log
 
   Scenario: Batch replication — multiple entries in one Fetch
-    Given the leader N1 has application entries at offsets 1–5 (offset 0 is LeaderChangeMessage)
-    And N2 has only replicated up to offset 0
-    When N2 sends a Fetch RPC to N1 with fetch_offset 1
-    Then N1 responds with entries [1, 2, 3, 4, 5]
-    And N2 appends all 5 entries to its local log in order
+    Given the leader N1 has application entries at offsets 1–5 (offset 0 is LeaderChangeMessage; log_end_offset = 6)
+    And N2 has only replicated offset 0 (N2's log_end_offset = 1)
+    When N2 sends a Fetch RPC to N1 with fetch_offset 1 (N2 has entries [0, 1))
+    Then N1 responds with entries at offsets [1, 2, 3, 4, 5]
+    And N2 appends all 5 entries to its local log in order (N2's log_end_offset becomes 6)
 
   Scenario: Follower Fetch acts as implicit heartbeat
     Given N1 is Leader and no new commands are proposed
@@ -256,10 +256,13 @@ Feature: Pull-Based Log Replication
     Given N1 is Leader for term 3
     And N1's leader-epoch checkpoint maps term 1 → start offset 0, term 3 → start offset 15
     When N2 sends a Fetch RPC with last_fetched_epoch = 1 and fetch_offset = 20
-    Then N1 consults its leader-epoch checkpoint and determines epoch 1 ended at offset 15
+    Then N1 consults its leader-epoch checkpoint for epoch 1
+    And N1 finds that epoch 1 ended at offset 15 (term 3 starts at 15)
+    And N2's fetch_offset (20) exceeds the epoch 1 boundary (15) → divergence detected
     And N1 responds with DivergingEpoch { epoch: 1, end_offset: 15 }
-    And N2 truncates its log from offset 15 onward
-    And N2 resumes Fetching from offset 15 with updated last_fetched_epoch
+    And N2 truncates its log from offset 15 onward (via LogStore::truncate_suffix(15))
+    And N2 sets its fetch_offset to 15 (log_end_offset is now 15)
+    And N2 resumes Fetching with last_fetched_epoch = 1 and fetch_offset = 15
 
   Scenario: Fetch includes cluster_id for identity verification
     Given the cluster is configured with cluster_id "cluster-abc-123"
@@ -483,29 +486,39 @@ Feature: Persistence and Crash Recovery
     Given a 3-node cluster [N1, N2, N3]
     And all persistence uses fsync to stable storage
 
-  Scenario: Leader crash and recovery — follower catches up
-    Given N1 is Leader for term 3 with committed entries at offsets 1–10
+  Scenario: Leader crash and recovery — HW rebuilt from snapshot
+    Given N1 is Leader for term 3 with committed entries at offsets 0–10 (HW = 11)
+    And N1 has a snapshot at offset 8 (last_included_offset = 8, last_included_term = 3)
     When N1 crashes and restarts
-    Then N1 reads its persisted currentTerm (3), votedFor, and log from disk
-    And N1 starts as a Follower (does not assume leadership)
-    And N1 waits for election timeout or Fetch responses from the new leader
+    Then N1 reads its quorum-state file: currentTerm = 3, votedFor from disk
+    And N1 loads the latest snapshot (last_included_offset = 8)
+    And N1 restores StateMachine from the snapshot's AppSnapshot
+    And N1 sets HW = 9 (snapshot.last_included_offset + 1; entries [0, 9) known committed)
+    And N1 scans log entries from offset 9 onward but does NOT apply them (committed status unknown)
+    And N1 resumes as Follower (never assumes leadership — must re-win election)
     When a new leader is elected
-    Then N1 Fetches any missing entries from the new leader
+    Then N1 Fetches from the new leader and receives the authoritative HW
+    And N1 applies committed entries from offset 9 onward as HW advances via Fetch responses
+
+  Scenario: Recovery without snapshot — HW starts at 0
+    Given N2 has replicated entries at offsets 0–8 and persisted them to disk
+    And N2 has no snapshot
+    When N2 crashes and restarts
+    Then N2 reads its quorum-state file for currentTerm and votedFor
+    And N2 sets HW = 0 (no snapshot → HW initialised to 0; no entries known committed)
+    And N2 scans log entries 0–8 but does NOT apply them to StateMachine
+    And N2 resumes as Follower and starts election timer
+    When N2 receives Fetch responses from the leader with HW
+    Then N2 advances its local HW and applies committed entries to StateMachine
 
   Scenario: Node recovers votedFor correctly to prevent double voting
-    Given N2 has voted for N1 in term 5 and persisted votedFor = N1
+    Given N2 has voted for N1 in term 5 and persisted votedFor = N1 in quorum-state file
     When N2 crashes and restarts during term 5
     And N3 sends a Vote RPC to N2 for term 5
-    Then N2 loads votedFor = N1 from disk
+    Then N2 loads quorum-state: currentTerm = 5, votedFor = N1
     And N2 rejects N3's vote because it already voted for N1 this term
 
-  Scenario: Log entries survive node crash
-    Given N2 has replicated entries at offsets 1–8 and persisted them to disk
-    When N2 crashes and restarts
-    Then N2's log contains entries at offsets 1–8 (recovered from disk)
-    And N2 can resume Fetching from the leader at offset 8
-
-  Scenario: Uncommitted entries from crashed leader are preserved
+  Scenario: Uncommitted entries from crashed leader are preserved until divergence
     Given N1 was Leader for term 2 and appended entry at offset 5 but it was not committed
     When N1 crashes and N3 becomes Leader for term 3
     And N3's log does not contain offset 5 from term 2
@@ -514,11 +527,15 @@ Feature: Persistence and Crash Recovery
     And N1's log now matches N3's
 
   Scenario: All nodes crash and recover (full cluster restart)
-    Given all three nodes have committed entries at offsets 1–10
+    Given all three nodes have committed entries at offsets 0–10 (HW was 11)
+    And each node has a snapshot at offset 10
     When all nodes crash simultaneously and restart
-    Then each node recovers its currentTerm, votedFor, and log from stable storage
-    And a new election occurs
-    And the winning leader has all committed entries (offsets 1–10)
+    Then each node reads its quorum-state file for currentTerm and votedFor
+    And each node loads its snapshot (last_included_offset = 10), setting HW = 11
+    And each node restores its StateMachine from the snapshot's AppSnapshot
+    And each node resumes as Follower (none assumes leadership)
+    And a new election occurs (election timeouts fire)
+    And the winning leader has all committed entries (its log includes offsets 0–10)
     And normal operation resumes with no data loss
 
   Scenario: fsync failure is treated as fatal
@@ -561,16 +578,25 @@ Feature: Log Compaction and Snapshots
     # or deleting uncommitted tail entries).
 
   Scenario: Snapshot is consistent because committed logs are consistent
-    Given N1, N2, and N3 have all committed entries at offsets 0–100
+    Given N1, N2, and N3 have all committed entries at offsets 0–100 (HW = 101)
+    And each node's StateMachine has applied the same command entries in the same order
     When each node independently takes a snapshot at offset 100
-    Then all three snapshots contain identical state machine data
+    Then each Snapshot contains:
+      | Part                          | Assertion                                           |
+      | metadata.last_included_offset | 100                                                 |
+      | metadata.last_included_term   | same term on all three nodes                        |
+      | metadata.voters               | [N1, N2, N3]                                        |
+      | app_snapshot.data             | equal across all three (StateMachine::snapshot() returns identical bytes) |
     And each node performs prefix truncation on its own log independently
 
   Scenario: Snapshot includes voter set for recovery
     Given the current voter set is [N1, N2, N3]
-    When N2 takes a snapshot
-    Then the snapshot metadata includes the voter set [N1, N2, N3]
-    And on crash recovery, N2 can reconstruct the voter configuration from the snapshot
+    And N2 has committed entries through offset 50 (HW = 51)
+    When N2 takes a snapshot at offset 50
+    Then the Snapshot.metadata.voters is [N1, N2, N3]
+    And the Snapshot.metadata.last_included_offset is 50
+    And the Snapshot.metadata.last_included_term matches the term of the entry at offset 50
+    And on crash recovery, N2 restores the voter set from Snapshot.metadata.voters
 
   Scenario: New entries arrive after snapshot and prefix truncation
     Given N1 has taken a snapshot at offset 100 and performed prefix truncation of entries 0–100
@@ -596,28 +622,32 @@ Feature: Snapshot Transfer
     And N1 is Leader for term 1
 
   Scenario: Follower receives snapshot when log entries are compacted
-    Given N1 has committed entries at offsets 1–200
-    And N1 has taken a snapshot at offset 150 and performed prefix truncation of entries 1–150
+    Given N1 has committed entries at offsets 0–200 (HW = 201)
+    And N1 has taken a snapshot at offset 150 and performed prefix truncation
     And N1's log start offset (LSO) is 151
-    And N2 has only replicated through offset 50 (N2's log end offset is 51)
+    And N2 has only replicated through offset 50 (N2's fetch_offset is 51, meaning entries [0, 51))
     When N2 sends a Fetch RPC with fetch_offset 51
-    Then N1 detects that fetch_offset 51 < LSO (151)
-    And N1 responds with a SnapshotId field (offset 150, term 1)
-    When N2 sends FetchSnapshot RPCs to download the snapshot
-    Then N1 streams the snapshot in chunks
-    And N2 reassembles the complete snapshot
-    And N2 restores its state machine from the snapshot
-    And N2 sets its log start offset to 151
-    And N2 resumes Fetching entries from offset 151
+    Then N1 detects that fetch_offset (51) < LSO (151)
+    And N1 responds with entries=[] and snapshot_id = { offset: 150, epoch: 1 }
+    When N2 sends FetchSnapshot RPCs to download the snapshot at position 0
+    Then N1 streams the snapshot via SnapshotIO::read_chunk
+    And N2 receives chunks until is_last_chunk = true
+    And N2 performs atomic snapshot install:
+      | Step | Action                                                    |
+      | 1    | StateMachine::restore(app_snapshot) — restores SM state   |
+      | 2    | Set log_start_offset to 151                               |
+      | 3    | Update voter set from SnapshotMetadata.voters             |
+      | 4    | fsync all state                                           |
+    And N2 resumes Fetching from offset 151 with updated fetch_offset = 151
 
   Scenario: Chunked snapshot transfer handles large state
-    Given the snapshot at offset 150 is 10 MB
-    And the chunk size is 1 MB
-    When N2 sends FetchSnapshot RPCs
-    Then N2 receives 10 chunks sequentially
-    And each chunk includes an offset and a flag indicating whether it is the last
-    And N2 reassembles all chunks into the full snapshot
-    And N2 verifies the snapshot integrity before restoring
+    Given N1's snapshot at offset 150 is 10 MB
+    And SnapshotIO::read_chunk uses a max_bytes of 1 MB per chunk
+    When N2 sends FetchSnapshot RPCs with incrementing positions
+    Then N2 receives chunks: (position=0, is_last_chunk=false),
+      (position=1048576, is_last_chunk=false), ... (position=9437184, is_last_chunk=true)
+    And N2 writes each chunk via SnapshotWriter (from SnapshotIO::begin_receive)
+    And N2 verifies the snapshot integrity (e.g., checksum) before calling StateMachine::restore
 
   Scenario: Snapshot transfer interrupted by leader change
     Given N2 is downloading a snapshot from N1 via FetchSnapshot
@@ -629,12 +659,14 @@ Feature: Snapshot Transfer
     And N2 restarts the snapshot transfer from N3
 
   Scenario: Snapshot transfer for a newly joined observer
-    Given N4 joins the cluster as an Observer with an empty log
-    And N1's log starts at offset 201 (entries 1–200 compacted)
+    Given N4 joins the cluster as an Observer with an empty log (log_end_offset = 0)
+    And N1's LSO is 201 (entries 0–200 compacted into a snapshot at offset 200)
     When N4 sends its first Fetch RPC to N1 with fetch_offset 0
-    Then N1 responds with SnapshotId (offset 200, term 1)
-    And N4 downloads the snapshot via FetchSnapshot
-    And N4 restores its state machine from the snapshot
+    Then N1 detects fetch_offset (0) < LSO (201)
+    And N1 responds with snapshot_id = { offset: 200, epoch: 1 }
+    And N4 downloads the snapshot via FetchSnapshot, chunk by chunk
+    And N4 calls StateMachine::restore(app_snapshot) to restore its state
+    And N4 sets its log_start_offset to 201
     And N4 resumes Fetching entries from offset 201
 ```
 
@@ -934,14 +966,14 @@ Feature: Client Interaction
   Scenario: Listener callbacks on commit — three-phase ordering
     Given the application has registered a Listener with handle_commit
     And the application implements StateMachine with apply()
-    When entries at offsets 5–7 are committed (HW advances past 7)
-    Then the event loop executes the three-phase commit sequence per the architecture doc:
+    When entries at offsets 5–7 are committed (HW advances to 8; offsets < 8 committed)
+    Then the event loop executes the three-phase commit sequence per the architecture doc (§4.1):
     And Phase 1: StateMachine::apply is called once per committed command entry (offsets 5, 6, 7 in order)
-    And control records (if any) are handled internally and never reach StateMachine::apply
+    And control records (if any among 5–7) are handled internally and never reach StateMachine::apply
     And Phase 2: Listener::handle_commit receives one batch of committed AppRecords [5, 6, 7]
-    And Phase 3: DeferredCompletionQueue::complete resolves client futures for offsets 5–7
+    And Phase 3: DeferredCompletionQueue::complete resolves client futures whose offset < HW (offsets 5, 6, 7)
     And all three phases are synchronous in-process calls within the event loop
-    And the Fetch response (via IoStage) reflects the same HW that the callbacks observed
+    And the Fetch response (via IoStage) reflects the same HW = 8 that the callbacks observed
 ```
 
 ---

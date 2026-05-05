@@ -28,9 +28,9 @@
   },
   {
     "title": "Trait Definitions (Storage, Transport, Clock)",
-    "description": "Trait Definitions (Storage, Transport, Clock) (7 steps)",
+    "description": "Trait Definitions (Storage, Transport, Clock) (8 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-trait-definitions-storage-transport-clock",
-    "contentHash": "58b6f1221529ed62e5414e7f1fac7a954167e0ea25476b43cd63af479beb0677",
+    "contentHash": "7087bcfada8103a041b55ae48f246735f8c4e09dbcf6e900a9a4257fa081b02e",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-clock",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-clock",
     "status": "planning"
@@ -57,7 +57,7 @@
     "title": "\u0060RaftNode\u0060 Public API Skeleton",
     "description": "\u0060RaftNode\u0060 Public API Skeleton (7 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-raftnode-public-api-skeleton",
-    "contentHash": "1dbf5ba56fd183cc51a724cc673f6638bde0a1b48e746757a45fe112a70fba47",
+    "contentHash": "b8ed467314cce680a4be60f473c9b9627485917b0f92d24bec83752aa4f9d226",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
     "status": "planning"
@@ -120,7 +120,7 @@
     "title": "RPC Codec and Channel Transport",
     "description": "RPC Codec and Channel Transport (5 steps)",
     "anchor": "phase-transport-layer-xraft-transport/stage-rpc-codec-and-channel-transport",
-    "contentHash": "a298dd3c54f4b5452aa7ff96c1985bdd8b9b7a99524bbca89d0981c3b97f65be",
+    "contentHash": "52bf10af8b7c819fd7fc0db389a6f625770889dcd0df13d9c6c630ee977c15b9",
     "workstreamId": "ws-raft-raft-protocol-phase-transport-layer-xraft-transport-stage-rpc-codec-and-channel-transport",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-transport-layer-xraft-transport-stage-rpc-codec-and-channel-transport",
     "status": "planning"
@@ -138,7 +138,7 @@
     "title": "TCP Transport (Production)",
     "description": "TCP Transport (Production) (6 steps)",
     "anchor": "phase-transport-layer-xraft-transport/stage-tcp-transport-production",
-    "contentHash": "37f724b627d356ec27b770b3df7a51ac3ab2067d1a0a04512edefbdebbc18e74",
+    "contentHash": "b3906f0d3ecca4570022be298d5a9e3d80b8039be521ea4a2fde3d3561621094",
     "workstreamId": "ws-raft-raft-protocol-phase-transport-layer-xraft-transport-stage-tcp-transport-production",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-transport-layer-xraft-transport-stage-tcp-transport-production",
     "status": "planning"
@@ -327,7 +327,7 @@
     "title": "API Documentation and README",
     "description": "API Documentation and README (9 steps)",
     "anchor": "phase-observability-documentation-and-polish/stage-api-documentation-and-readme",
-    "contentHash": "5505f5c345a594ac4c321952a96bbe97422f71cb2d0458fddfaae83c7b73aaab",
+    "contentHash": "89b6067f37f139f22fd4d47297cbd299f4640a1d866fe7131d0a41f00eb44dee",
     "workstreamId": "ws-raft-raft-protocol-phase-observability-documentation-and-polish-stage-api-documentation-and-readme",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-observability-documentation-and-polish-stage-api-documentation-and-readme",
     "status": "planning"

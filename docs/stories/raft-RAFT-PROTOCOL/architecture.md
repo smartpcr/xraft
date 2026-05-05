@@ -768,9 +768,14 @@ pub trait QuorumStateStore: Send + Sync + 'static {
           ▼             ▼       ▼             ▼                     ▼
    ┌────────────┐ ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌────────┐
    │ Transport  │ │ LogStore │ │SnapshotIO │ │QuorumSt. │ │ Clock  │
-   │  (trait)   │ │ (trait)  │ │  (trait)  │ │  (trait) │ │(trait) │
+   │ Sender +   │ │ (trait)  │ │  (trait)  │ │  (trait) │ │(trait) │
+   │ Receiver   │ │          │ │           │ │          │ │        │
+   │ (traits)   │ │          │ │           │ │          │ │        │
    └─────┬──────┘ └────┬─────┘ └─────┬─────┘ └────┬─────┘ └───┬────┘
          │              │             │             │           │
+         │              │             │             │           │
+         │  ◄── IoStage calls ──►     │             │    EventLoop
+         │  (Sender only)            │             │    calls Clock
          ▼              ▼             ▼             ▼           ▼
    ┌──────────┐  ┌───────────┐ ┌───────────┐ ┌──────────┐ ┌────────┐
    │TcpTrans- │  │SegmentLog │ │ Snapshot-  │ │QuorumSt- │ │Tokio-  │
@@ -1388,7 +1393,7 @@ follower to prevent split-brain.
 
 End-to-end flow from client command to committed state machine application.
 The `EventLoop` mutates state and invokes callbacks synchronously; the
-`IoStage` executes external I/O (`LogStore::append`, `Transport::send`)
+`IoStage` executes external I/O (`LogStore::append`, `TransportSender::send`)
 via injected trait objects. No raw I/O occurs inside `xraft-core`.
 
 ```
@@ -1528,14 +1533,44 @@ initial voter set and a shared `cluster_id`. All nodes start in the
          │  ◄── Fetch(off=0) ─────────┼────────────────────────│
          │── FetchResp(entries 0,1) ──┼───────────────────────►│
          │                            │                         │
-   ┌─────┴──────┐                     │                         │
-   │ HW ← 1    │                     │                         │
-   │ VotersRec  │                     │                         │
-   │ committed. │                     │                         │
-   │ Cluster is │                     │                         │
-   │ fully      │                     │                         │
-   │ bootstrap. │                     │                         │
-   └─────┬──────┘                     │                         │
+          │                            │                         │
+          │  (Round 1 complete: entries 0,1 delivered.            │
+          │   Leader recorded N2.fetch=0, N3.fetch=0 from        │
+          │   the Fetch requests. HW calc: [2,0,0], sorted       │
+          │   desc → idx 1 = 0. HW stays 0. Two-round           │
+          │   visibility applies — §3.1.)                        │
+          │                            │                         │
+          │  ◄── Fetch(off=2) ────────│  (round 2, N2 has 0-1)  │
+          │── FetchResp(HW=0) ────────►│                         │
+          │                            │                         │
+          │  ◄── Fetch(off=2) ─────────┼────────────────────────│
+          │── FetchResp(HW=2) ─────────┼───────────────────────►│
+          │                            │  (round 2, N3 has 0-1)  │
+          │                            │                         │
+    ┌─────┴──────┐                     │                         │
+    │ Round 2:   │                     │                         │
+    │ N2.fetch=2 │                     │                         │
+    │ N3.fetch=2 │                     │                         │
+    │ HW calc:   │                     │                         │
+    │ [A=2,B=2,  │                     │                         │
+    │  C=2]      │                     │                         │
+    │ sorted →   │                     │                         │
+    │ [2,2,2]    │                     │                         │
+    │ idx ⌊3/2⌋  │                     │                         │
+    │ =1 → 2     │                     │                         │
+    │ HW ← 2    │                     │                         │
+    │ (exclusive: │                     │                         │
+    │  off 0,1   │                     │                         │
+    │  committed  │                     │                         │
+    │  since 0<2  │                     │                         │
+    │  and 1<2)   │                     │                         │
+    │ VotersRec  │                     │                         │
+    │ @off=1 is  │                     │                         │
+    │ committed. │                     │                         │
+    │ Cluster is │                     │                         │
+    │ fully      │                     │                         │
+    │ bootstrap. │                     │                         │
+    └─────┬──────┘                     │                         │
          │                            │                         │
 ```
 
@@ -1773,7 +1808,7 @@ or a stale `leader_epoch` (prevents acting on messages from a deposed leader).
 | Error Category | Handling |
 |----------------|----------|
 | **Storage I/O failure** | `LogStore` and `SnapshotIO` return `Result`. The `EventLoop` logs the error, notifies the `Listener` via `begin_shutdown()`, and halts the node. Crash-stop is safer than operating with potentially corrupt state. |
-| **Network failure** | `Transport::send()` failures are logged and retried on next tick. The pull-based model is inherently tolerant — a missed Fetch is equivalent to a slow follower. |
+| **Network failure** | `TransportSender::send()` failures are logged and retried on next tick. The pull-based model is inherently tolerant — a missed Fetch is equivalent to a slow follower. |
 | **Deserialization failure** | Malformed RPC messages are dropped with a warning log. |
 | **Stale term** | Any RPC with a term higher than `current_term` triggers a step-down to follower and term update. RPCs with a lower term are rejected. |
 
@@ -1822,10 +1857,18 @@ All crate names, trait definitions, and module structures below are
   This matches §2.1.1: "Control records are owned by xraft and are never
   exposed to the application's `StateMachine::apply`." Snapshots are split:
   `SnapshotMetadata` (consensus) and `AppSnapshot` (application).
-  I/O traits (`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`,
-  `Clock`) are injected as trait objects (`Box<dyn ...>`) and use
-  `#[async_trait]` — they are called exclusively by the `IoStage`, never
-  directly by the event loop.
+  I/O traits are separated into three categories (§4.1):
+  **Storage / Network-Send I/O** (`LogStore`, `TransportSender`,
+  `QuorumStateStore`, `SnapshotIO`) are injected as trait objects
+  (`Box<dyn ...>`), use `#[async_trait]`, require `Send + Sync + 'static`,
+  and are called exclusively by the `IoStage` when executing `IoAction`
+  batches — never directly by the event loop.
+  **Runtime** traits (`TransportReceiver`, `Clock`) are also injected as
+  trait objects, but are NOT called by the `IoStage`:
+  `TransportReceiver` is called by the `ReceiverTask` (§4.4) which feeds
+  the event loop's mpsc channel; `Clock` is used directly by the
+  `EventLoop` for timer management (election timeouts, check-quorum
+  deadlines). Neither is mediated by `IoAction`.
 - **Segment-file log storage** per §6.
 - **I/O staging** per §4.4.1 — the event loop produces `IoAction` values
   and the `IoStage` executes them via injected trait objects for all
@@ -1863,7 +1906,41 @@ All crate names, trait definitions, and module structures below are
   log replication → persistence → snapshot → membership → simulation harness.
   The `IoStage` and `BatchAccumulator` should be implemented in the core
   replication phase (they are not optional add-ons).
+
+  **Transport trait discrepancy (requires reconciliation):**
+  The implementation plan (Stage 1.4, Stage 1.7, Stage 3.1, Stage 3.3)
+  defines a single `Transport` trait with both `send(&self, ...)` and
+  `recv(&mut self)` methods. This architecture defines **split traits**:
+  `TransportSender` (outbound, `&self`, `Send + Sync`, called by `IoStage`)
+  and `TransportReceiver` (inbound, `&mut self`, `Send`, called by
+  `ReceiverTask`). The split is necessary for ownership: the sender must
+  be `Sync` for concurrent sends from `IoStage`, while the receiver takes
+  exclusive access for the single `ReceiverTask`. The implementation plan
+  should adopt the split-trait design (`TransportSender` /
+  `TransportReceiver`) and update Stages 1.4, 1.7, 3.1, and 3.3
+  accordingly. A single `TcpTransport` (or `ChannelTransport`) struct
+  may implement both traits and provide a `split()` method to yield
+  `(Box<dyn TransportSender>, Box<dyn TransportReceiver>)`.
+
+  **Clock / IoStage grouping (requires reconciliation):**
+  The implementation plan (Stage 1.7) groups `Clock` alongside I/O traits
+  as injected `Box<dyn ...>` trait objects called by the `IoStage`. This
+  architecture categorises `Clock` as a **Runtime** trait used directly by
+  the `EventLoop` for timer management — not mediated by `IoAction` or the
+  `IoStage`. The implementation plan should reflect this distinction: Clock
+  is injected into `RaftNode` but passed to the `EventLoop`, not the
+  `IoStage`.
+
 - `e2e-scenarios.md`: Sequence flows §5.1–§5.10 here define the "happy
   path" and key failure modes including bootstrap (§5.9), crash recovery
   (§5.10), and remove-voter (§5.6). The E2E document should define concrete
   test scenarios with expected assertions for each flow.
+
+- `tech-spec.md`: The tech spec §8 Glossary defines HW as "Entries at or
+  below the HW are considered committed" which uses **inclusive** semantics.
+  This architecture uses **exclusive** semantics: entries with `offset < HW`
+  are committed. The e2e-scenarios document correctly notes this mapping
+  (tech spec "entries ≤ N committed" = architecture `HW = N + 1`). The
+  tech spec glossary should be updated to use exclusive semantics for
+  consistency: "HW is an exclusive upper bound; entries with offset < HW
+  are committed."
