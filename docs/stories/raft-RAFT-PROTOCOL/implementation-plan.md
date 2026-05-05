@@ -119,16 +119,16 @@
 
 #### Implementation Steps
 - [ ] Create `xraft-core/src/raft_node.rs` defining the `RaftNode<S: StateMachine>` struct with fields: `config: RaftConfig`, `event_loop_handle`, `propose_tx: mpsc::Sender` — this is the public entry point from architecture §2.1
-- [ ] Define `RaftNode::new(config, storage, transport, state_machine) -> Result<Self>` constructor signature (body deferred to Phase 6 recovery/bootstrap)
-- [ ] Define `RaftNode::propose(command: AppRecord) -> Future<Result<Offset>>` method stub returning `NotLeader` until the event loop is wired (Phase 5)
-- [ ] Define `RaftNode::read() -> Result<ConsensusState>` method stub for reading current consensus state (current term, leader, high watermark, role) — note: linearisable reads are out of scope per tech-spec §2.2; this returns local state only; the high_watermark is an exclusive upper bound per architecture §5.2 (entry at offset O is committed when O < HW)
-- [ ] Define `RaftNode::bootstrap(cluster_id: ClusterId, initial_voters: Vec<VoterInfo>) -> Result<()>` method stub (body implemented in Phase 6) — `ClusterId` is provided by the caller, not generated internally, to ensure all nodes share the same cluster identity
+- [ ] Define `RaftNode::new(config, storage, transport, state_machine) -> Result<Self>` constructor that initialises struct fields and event-loop channel; does not start the event loop (started in Phase 4) or run recovery (completed in Phase 6)
+- [ ] Define `RaftNode::propose(command: AppRecord) -> Future<Result<Offset>>` method that sends the command to the event-loop channel and returns a future; returns `NotLeader` when no leader is active (consensus path completed in Phase 5)
+- [ ] Define `RaftNode::read() -> Result<ConsensusState>` method returning current consensus state (current term, leader, high watermark, role) — linearisable reads are out of scope per tech-spec §2.2; this returns local state only; high_watermark is an exclusive upper bound per architecture §5.2 (entry at offset O is committed when O < HW)
+- [ ] Define `RaftNode::bootstrap(cluster_id: ClusterId, initial_voters: Vec<VoterInfo>) -> Result<()>` method that validates preconditions (empty log, no quorum-state file) and stores configuration; bootstrap logic completed in Phase 6 — `ClusterId` is provided by the caller, not generated internally, to ensure all nodes share the same cluster identity
 - [ ] Define `RaftNode::shutdown() -> Result<()>` lifecycle method
 - [ ] Update `xraft-core/src/lib.rs` to re-export `RaftNode`
 
 #### Test Scenarios
 - [ ] Scenario: RaftNode compiles — Given the `RaftNode` struct with all type parameters, When `cargo check` is run, Then it compiles without errors
-- [ ] Scenario: API surface exists — Given a `RaftNode` instance constructed with mocks, When `propose()`, `read()`, `bootstrap()`, and `shutdown()` are called, Then each returns a typed `Result` (stubs return placeholder errors)
+- [ ] Scenario: API surface exists — Given a `RaftNode` instance constructed with mocks, When `propose()`, `read()`, `bootstrap()`, and `shutdown()` are called, Then each returns a typed `Result` with defined error variants
 
 ---
 
@@ -267,9 +267,10 @@
 
 > **Goal:** Implement leader election including Pre-Vote, term
 > management, vote persistence, leader step-down, and Check Quorum.
-> This is the first consensus logic. Depends on Phase 1 (types/traits)
-> and Phase 2 (quorum state persistence). Phase 3 (transport) must
-> provide at least `ChannelTransport` for testing.
+> This is the first consensus logic. Depends on Phase 1 (types/traits),
+> Phase 2 (quorum state persistence), Stage 3.1 (ChannelTransport for
+> testing), and Stage 9.1 (SimulatedClock and in-memory storage backends
+> for deterministic test scenarios).
 >
 > **Sequencing:** Stages 4.1–4.2 are sequential. Stages 4.3–4.4 depend
 > on 4.2.
@@ -401,7 +402,13 @@
 ### Stage 6.1: Crash Recovery Sequence
 
 #### Implementation Steps
-- [ ] Implement `RaftNode::recover()` — called on startup before accepting any RPCs: (1) load quorum-state for term/vote, (2) load latest snapshot (if any) — call `StateMachine::restore(app_snapshot)` and restore voter set from snapshot metadata, (3) set `log_start_offset` to `snapshot.last_included_offset + 1` (or 0 if no snapshot), (4) set `high_watermark` to `snapshot.last_included_offset + 1` (or 0 if no snapshot) — HW is never persisted (architecture §5.10 rule 1); the snapshot captures only committed state so entries [0, HW) are known committed; entries beyond this point have unknown committed status, (5) scan log from `log_start_offset` to `log_end_offset` — validate CRCs, truncate at first corrupt/partial record; do NOT apply any entries to the `StateMachine` (architecture §5.10 rule 2 — committed status of post-snapshot entries is unknown; they may be uncommitted tail entries from a deposed leader that the current leader will truncate via divergence detection), (6) process control records in the recovered log for internal bookkeeping only: `VotersRecord` → update voter set, `LeaderChangeMessage` → update leader-epoch checkpoint (these are idempotent consensus metadata updates, not state machine mutations; if the log is later truncated due to divergence, the leader's correct entries will overwrite these values), (7) rebuild leader-epoch checkpoint from log scan, (8) set role to Follower — a recovering node never resumes as Leader regardless of prior role; it must win a new election
+- [ ] Implement `RaftNode::recover()` entry point — called on startup before accepting RPCs; orchestrates the recovery phases below and returns the node in Follower state ready to send Fetch RPCs
+- [ ] Implement recovery phase 1: load quorum-state file for `current_term` and `voted_for` via `QuorumStateStore::load()`; if no file exists, initialise term=0 with no vote
+- [ ] Implement recovery phase 2: load latest snapshot (if any) via `SnapshotIO::load_latest_snapshot()`; call `StateMachine::restore(app_snapshot)` and restore voter set from snapshot metadata; set `log_start_offset` to `snapshot.last_included_offset + 1` (or 0 if no snapshot)
+- [ ] Implement recovery phase 3: initialise `high_watermark` to `snapshot.last_included_offset + 1` (or 0 if no snapshot) — HW is never persisted (architecture §5.10 rule 1); entries [0, HW) are known committed from the snapshot; entries beyond HW have unknown committed status
+- [ ] Implement recovery phase 4: scan log from `log_start_offset` to `log_end_offset`, validate CRC-32C per batch, truncate at first corrupt/partial record; do NOT apply any entries to the `StateMachine` (architecture §5.10 rule 2 — committed status unknown; entries may be uncommitted tail from a deposed leader)
+- [ ] Implement recovery phase 5: process control records in the recovered log for bookkeeping only — `VotersRecord` → update voter set, `LeaderChangeMessage` → update leader-epoch checkpoint; these are idempotent consensus metadata updates, not state machine mutations; rebuild full leader-epoch checkpoint from log scan
+- [ ] Implement recovery phase 6: set role to Follower, start election timer, begin accepting RPCs — a recovering node never resumes as Leader regardless of prior role; it must win a new election
 - [ ] After recovery, the node sends Fetch requests to the leader; the leader's Fetch response includes the authoritative HW; the node advances local HW to `min(leader_HW, local_log_end_offset)` and applies entries between old HW and new HW to the state machine (only `Command` entries — control records were already processed for bookkeeping during recovery step 6)
 - [ ] Ensure log recovery scan (from Stage 2.2) truncates any partially-written entries before replay
 - [ ] Validate invariants after recovery: `log_start_offset ≤ high_watermark ≤ log_end_offset`, voter set non-empty (from snapshot or bootstrap VotersRecord), term ≥ snapshot term, HW = `snapshot.last_included_offset + 1` (not `log_end_offset`) — entries between HW and log_end_offset have unknown committed status and must not be applied to the state machine until the leader provides the authoritative HW
@@ -414,15 +421,15 @@
 ### Stage 6.2: Cluster Bootstrap
 
 #### Implementation Steps
-- [ ] Implement `RaftNode::bootstrap(cluster_id: ClusterId, initial_voters: Vec<VoterInfo>)` — for first-time cluster formation: accept a shared `ClusterId` (generated once by the operator or first node and distributed out-of-band to all nodes), create initial `VotersRecord` control entry, persist quorum-state with term 0, write `VotersRecord` to log — all nodes in the cluster must bootstrap with the same `ClusterId` for RPC fencing to work
+- [ ] Implement `RaftNode::bootstrap(cluster_id: ClusterId, initial_voters: Vec<VoterInfo>)` — for first-time cluster formation per architecture §5.9: accept a shared `ClusterId` (generated once by the operator and distributed out-of-band to all nodes), store `cluster_id` and voter set in memory, set term=0 with no vote, set role to Follower, start election timer — the initial `VotersRecord` is NOT written to the log during bootstrap; the leader appends `LeaderChangeMessage` and `VotersRecord` to the log after winning the first election (architecture §5.9 bootstrap flow); the quorum-state file is first persisted when the node votes during the first election (via `QuorumStateStore::save` in Stage 4.2's fsync-before-ack rule)
 - [ ] Implement bootstrap guard: reject `bootstrap()` if log is non-empty or quorum-state file already exists
 - [ ] Implement single-node bootstrap for development/testing: a 1-node cluster immediately becomes leader
 - [ ] Connect `RaftNode::new(config, storage, transport, state_machine)` constructor that calls `recover()` if data exists or waits for `bootstrap()` if data directory is empty
 
 #### Test Scenarios
-- [ ] Scenario: Fresh bootstrap — Given a 3-node cluster with empty data directories and a shared `ClusterId` generated once, When each node calls `bootstrap(cluster_id, [N1, N2, N3])` with the same `ClusterId`, Then all nodes start as Followers with matching `ClusterId` and `VotersRecord` at offset 0
+- [ ] Scenario: Fresh bootstrap — Given a 3-node cluster with empty data directories and a shared `ClusterId` generated once, When each node calls `bootstrap(cluster_id, [N1, N2, N3])` with the same `ClusterId`, Then all nodes start as Followers with matching `ClusterId` and in-memory voter set {N1, N2, N3}; the log is empty and no quorum-state file exists until the first election occurs and the winning leader appends LeaderChangeMessage + VotersRecord
 - [ ] Scenario: Double bootstrap rejection — Given a node that has already bootstrapped, When `bootstrap()` is called again, Then it returns an error
-- [ ] Scenario: Single-node bootstrap — Given a 1-node cluster, When `bootstrap(cluster_id, [N1])` is called, Then N1 becomes Leader immediately after election timeout
+- [ ] Scenario: Single-node bootstrap — Given a 1-node cluster, When `bootstrap(cluster_id, [N1])` is called and the election timeout expires, Then N1 wins election as the only voter, becomes Leader, and appends LeaderChangeMessage + VotersRecord to the log
 
 ---
 
@@ -519,11 +526,13 @@
 ## Phase 9: Test Harness (`xraft-test`)
 
 > **Goal:** Build the deterministic simulation harness and in-memory
-> storage backends for comprehensive scenario testing. Depends on all
-> core phases (1–8) being structurally complete.
+> storage backends for comprehensive scenario testing.
 >
-> **Sequencing:** Stage 9.1 is independent. Stages 9.2 and 9.3 depend
-> on 9.1.
+> **Sequencing:** Stage 9.1 depends only on Phase 1 (core types and
+> traits) and can be implemented in parallel with Phases 2–8. Phases
+> 4–8 test scenarios use the SimulatedClock and in-memory backends
+> from Stage 9.1 as test infrastructure. Stages 9.2 and 9.3 depend
+> on Phases 4–8 (consensus and replication logic) plus Stage 9.1.
 
 ### Stage 9.1: In-Memory Storage and Simulated Clock
 
@@ -642,10 +651,14 @@
 
 #### Implementation Steps
 - [ ] Add `#![deny(missing_docs)]` to all four crate roots
-- [ ] Write doc-comments for all public types, traits, methods, and error variants in `xraft-core`
-- [ ] Write doc-comments for `xraft-storage`, `xraft-transport`, and `xraft-test` public APIs
+- [ ] Write doc-comments for `xraft-core` domain types: `NodeId`, `Term`, `ClusterId`, `Offset`, `LogEntry`, `EntryType`, `VoterInfo`, `VotersRecord`, `ConsensusState`, `QuorumState`, `FollowerProgress`, `AppRecord`, `AppSnapshot` in their respective modules
+- [ ] Write doc-comments for `xraft-core` traits: `LogStore`, `QuorumStateStore`, `SnapshotIO`, `Transport`, `Clock`, `StateMachine`, `Listener` and all trait methods in `traits.rs` and `listener.rs`
+- [ ] Write doc-comments for `xraft-core` public API: `RaftNode` methods (`new`, `propose`, `read`, `bootstrap`, `shutdown`), `RaftConfig` fields, `XraftError` variants, RPC message types, and `IoAction` variants
+- [ ] Write doc-comments for `xraft-storage` public API: `StorageEngine`, `SegmentLog`, `SnapshotStore`, `QuorumStateFile`, `LeaderEpochCheckpoint`
+- [ ] Write doc-comments for `xraft-transport` public API: `TcpTransport`, `ChannelTransport`, `RpcCodec`, `NetworkSimulator`
+- [ ] Write doc-comments for `xraft-test` public API: `SimulatedCluster`, `SimulatedClock`, `MemoryLogStore`, `InvariantChecker`
 - [ ] Update root `README.md` with: project description, architecture overview, quick-start example, build/test instructions, and link to docs
-- [ ] Add a `examples/kv_store.rs` minimal key-value store example demonstrating `StateMachine` trait usage with `propose()` and `read()`
+- [ ] Add `examples/kv_store.rs` minimal key-value store example demonstrating `StateMachine` trait usage with `propose()` and `read()`
 
 #### Test Scenarios
 - [ ] Scenario: Docs build — Given all doc-comments are present, When `cargo doc --workspace --no-deps` is run, Then it exits with code 0 and no warnings
