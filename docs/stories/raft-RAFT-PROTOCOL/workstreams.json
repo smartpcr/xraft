@@ -6,7 +6,7 @@
     "contentHash": "ca02a67d471a8c1825df416ee1044cebd5440a1ade39698c9fd00a908a26e6e0",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-cargo-workspace-and-root-configuration",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-cargo-workspace-and-root-configuration",
-    "status": "active"
+    "status": "review"
   },
   {
     "title": "Core Domain Types in \u0060xraft-core\u0060",
@@ -15,7 +15,7 @@
     "contentHash": "57a663e54011c40f63e5594dc948ba395bb6c6ba49f8e9aa7ce0fcf3146ed6a7",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-core-domain-types-in-xraft-core",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-core-domain-types-in-xraft-core",
-    "status": "planning"
+    "status": "review"
   },
   {
     "title": "RPC Message Types",
@@ -24,7 +24,7 @@
     "contentHash": "f809348c72739f1ba21623ea03e0209328f6278bc85394296f62575199a998e7",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-rpc-message-types",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-rpc-message-types",
-    "status": "planning"
+    "status": "active"
   },
   {
     "title": "Trait Definitions (Storage, Transport, Runtime)",
