@@ -1040,23 +1040,35 @@ Feature: Client Interaction
   # These scenarios follow the architecture doc §5.11 canonical design:
   #   - read() returns S::ReadResult via StateMachine::query()
   #   - read() is leader-only; followers return Err(NotLeader { leader_id })
-  #   - Leadership proof: the leader waits for a committed current-term
-  #     entry, then invokes query() synchronously in the event loop
+  #   - Leadership proof: a committed current-term entry proves the leader
+  #     was elected by a majority after any prior leader; query() runs after
+  #     all applies up to HW (architecture §5.11 "Why this is linearizable")
   #   - Consensus metadata is available via RaftNode::metrics() (§6.4),
   #     NOT via read()
   #
-  # The implementation-plan.md (Stage 1.7 / 5.3) currently defines
-  # read() -> Result<ConsensusState> (protocol metadata, any node) and
-  # notes linearisable reads as out of scope (tech-spec §2.2). The
-  # architecture doc §Alignment explicitly flags this as REQUIRES UPDATE
-  # — the implementation plan's read() should change to match §5.11.
+  # Linearizability (architecture §5.11): the committed current-term entry
+  # IS the linearizability basis. It proves the leader was elected by a
+  # majority after any prior leader. All apply() calls up to the current HW
+  # have executed before query() runs — the returned state reflects every
+  # write committed before the read was issued. A partitioned leader
+  # eventually steps down via check-quorum (§5.7); after step-down, pending
+  # reads are resolved with Err(NotLeader) and subsequent reads are
+  # rejected. Check-quorum is the step-down/cancellation mechanism — not a
+  # per-read revalidation step.
   #
-  # Linearizability caveat: the leadership-proof mechanism (committed
-  # current-term entry) verifies authority at the time of that commit
-  # but does NOT re-verify majority contact on each subsequent read.
-  # A partitioned leader may serve stale reads until check-quorum fires.
-  # This is NOT linearizable. True linearizable reads (read-index,
-  # lease-based) are out of scope per tech-spec §2.2.
+  # Implementation-plan alignment (architecture §7.4, Pending refinement 2):
+  #   The implementation plan currently diverges from §5.11 in three areas:
+  #   - Stage 1.7/5.3: read() -> Result<ConsensusState> should become
+  #     read() -> Result<S::ReadResult> via StateMachine::query()
+  #   - Stage 1.4: StateMachine trait needs type ReadResult and fn query(&self)
+  #   - Stage 5.1/5.3: commit notification should use four phases (adding
+  #     DeferredReadQueue::drain as step 4), not three
+  #   These are pending refinements flagged in architecture §7.4; these
+  #   scenarios follow the architecture's finalized §5.11 design.
+  #
+  # Tech-spec §2.2 marks "linearisable reads" (read-index, lease-based) as
+  # out of scope — those are optimised read paths, not the initial
+  # leadership-proof mechanism defined in architecture §5.11.
 
   Background:
     Given a 3-node cluster [N1, N2, N3]
@@ -1096,11 +1108,10 @@ Feature: Client Interaction
     # Consensus metadata (term, role, HW, voter_set) is NOT returned by read()
     # — it is available separately via RaftNode::metrics() -> RaftMetrics (§6.4).
     #
-    # NOTE: This leadership-proof mechanism confirms authority at the time the
-    # current-term entry committed but does NOT re-verify majority contact on
-    # each read. A partitioned leader may still serve reads until check-quorum
-    # fires — see "Stale leader read" scenarios below. True linearizable reads
-    # (read-index, lease-based) are out of scope per tech-spec §2.2.
+    # Per architecture §5.11 "Why this is linearizable": the committed
+    # current-term entry proves the leader holds majority authority, and
+    # all applies up to HW execute before query() runs. In steady state,
+    # no per-read I/O or majority re-verification is needed.
     Given N1 is Leader for term 1
     And a current-term entry has already been committed (HW has advanced past it)
     And N1 is still in contact with a majority of voters (check-quorum has not fired)
@@ -1151,36 +1162,37 @@ Feature: Client Interaction
     # Per architecture §5.11 cancellation: when the leader steps down (via
     # check-quorum failure, higher-term RPC, or self-removal), all pending
     # reads in the DeferredReadQueue are resolved with Err(NotLeader).
-    Given N1 is Leader for term 1
-    And a current-term entry has been committed (leadership confirmed)
-    And N1 has pending read() requests in its DeferredReadQueue
-    When N1's check-quorum timer fires and N1 has not received Fetch from a majority
-    Then N1 steps down to Follower
+    # Pending reads exist only on a fresh leader whose current-term entry
+    # (LeaderChangeMessage) has NOT yet been committed — once it commits,
+    # DeferredReadQueue is drained as step 4 of commit notification (§4.1).
+    Given N1 just won election for term 2 and appended a LeaderChangeMessage
+    And the LeaderChangeMessage has NOT yet been committed (leadership pending)
+    And clients have called read() — their requests are parked in the DeferredReadQueue
+    When N1 receives a Vote request from N3 at term 3 (higher term)
+    Then N1 steps down to Follower (observing higher term)
     And all pending reads in N1's DeferredReadQueue are resolved with Err(NotLeader { leader_id: None })
     And subsequent read() calls on N1 return Err(NotLeader { leader_id: None })
 
-  Scenario: Stale leader read is NOT linearizable
-    # A partitioned leader may serve a read that succeeds locally but is NOT
-    # linearizable against the global committed state. The leadership-proof
-    # mechanism (committed current-term entry) only verifies authority at the
-    # time of that commit — it does NOT re-verify majority contact per read.
-    # Check-quorum bounds the stale-leader serving window in time, but does
-    # NOT bound the staleness of the returned state (the new leader may have
-    # committed arbitrarily many entries during that window).
-    # True linearizable reads (read-index, lease-based) are out of scope
-    # per tech-spec §2.2.
+  Scenario: Partitioned leader steps down via check-quorum and rejects reads
+    # A partitioned leader must not serve stale reads. Check-quorum (§5.7)
+    # is the mechanism that steps down a leader that has lost majority
+    # contact. After step-down, reads are rejected — stale-leader reads
+    # must not be accepted as linearizable. The ordering below is explicit:
+    # the check-quorum deadline fires before any read is served against
+    # stale state.
     Given N1 is Leader for term 1 and a current-term entry has been committed
     When N1 becomes partitioned from N2 and N3
-    And N2 wins election for term 2 and becomes the new Leader
-    And a client proposes "set x=2" to N2 and it is committed on N2 and N3
-    And a client calls read() on N1 (still believes it is leader)
-    Then N1's event loop invokes StateMachine::query() and returns Ok(result)
-    And the returned result reflects N1's locally committed state (does NOT include "set x=2")
-    And this read is NOT linearizable — the global committed state includes "set x=2" but N1's result does not
-    When N1's check-quorum timer fires (bounding the stale-serving window)
-    Then N1 steps down to Follower
-    And subsequent read() calls on N1 return Err(NotLeader { leader_id: None })
-    And the client must discover the new leader (N2) and retry
+    Then N1's check-quorum deadline fires (within one election timeout interval)
+    And N1 checks voter liveness: only {self} has recent Fetch (1 < majority of 2)
+    And N1 steps down to Follower (check-quorum failure per §5.7)
+    And all pending reads in N1's DeferredReadQueue are resolved with Err(NotLeader { leader_id: None })
+    When a client calls read() on N1 after step-down
+    Then read() returns Err(NotLeader { leader_id: None })
+    And N1 does not serve stale application state
+    When N2 wins election for term 2 and becomes the new Leader
+    And a client calls read() on N2 (after N2's leadership is confirmed)
+    Then N2 serves the read with linearizability per architecture §5.11
+    And the client must discover N2 as the new leader to read current state
 
   Scenario: Application-level dedup via request IDs (out of xraft scope)
     Given the application wraps commands with unique request IDs
