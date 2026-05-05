@@ -1035,6 +1035,29 @@ Feature: Client Interaction
   I need to propose commands and read committed state
   So that I can build a replicated state machine on top of xraft
 
+  # Read API semantics — cross-document reconciliation:
+  #
+  # These scenarios follow the architecture doc §5.11 canonical design:
+  #   - read() returns S::ReadResult via StateMachine::query()
+  #   - read() is leader-only; followers return Err(NotLeader { leader_id })
+  #   - Leadership proof: the leader waits for a committed current-term
+  #     entry, then invokes query() synchronously in the event loop
+  #   - Consensus metadata is available via RaftNode::metrics() (§6.4),
+  #     NOT via read()
+  #
+  # The implementation-plan.md (Stage 1.7 / 5.3) currently defines
+  # read() -> Result<ConsensusState> (protocol metadata, any node) and
+  # notes linearisable reads as out of scope (tech-spec §2.2). The
+  # architecture doc §Alignment explicitly flags this as REQUIRES UPDATE
+  # — the implementation plan's read() should change to match §5.11.
+  #
+  # Linearizability caveat: the leadership-proof mechanism (committed
+  # current-term entry) verifies authority at the time of that commit
+  # but does NOT re-verify majority contact on each subsequent read.
+  # A partitioned leader may serve stale reads until check-quorum fires.
+  # This is NOT linearizable. True linearizable reads (read-index,
+  # lease-based) are out of scope per tech-spec §2.2.
+
   Background:
     Given a 3-node cluster [N1, N2, N3]
     And N1 is Leader for term 1
@@ -1065,15 +1088,22 @@ Feature: Client Interaction
     When a client calls propose("set x=1") on N1
     Then N1 returns an error indicating no leader is available
 
-  Scenario: Linearizable read on leader in steady state (leadership confirmed)
+  Scenario: Leader read in steady state (leadership confirmed)
     # Per architecture §5.11: read() returns S::ReadResult via StateMachine::query()
     # after the leader confirms its authority (a committed current-term entry).
     # The leader does NOT append a per-read log entry — it confirms leadership
     # proof, then invokes query() synchronously within the event loop.
     # Consensus metadata (term, role, HW, voter_set) is NOT returned by read()
     # — it is available separately via RaftNode::metrics() -> RaftMetrics (§6.4).
+    #
+    # NOTE: This leadership-proof mechanism confirms authority at the time the
+    # current-term entry committed but does NOT re-verify majority contact on
+    # each read. A partitioned leader may still serve reads until check-quorum
+    # fires — see "Stale leader read" scenarios below. True linearizable reads
+    # (read-index, lease-based) are out of scope per tech-spec §2.2.
     Given N1 is Leader for term 1
     And a current-term entry has already been committed (HW has advanced past it)
+    And N1 is still in contact with a majority of voters (check-quorum has not fired)
     And the StateMachine has state reflecting all committed writes
     When a client calls read() on N1
     Then the event loop confirms leadership (current-term entry already committed)
@@ -1123,15 +1153,32 @@ Feature: Client Interaction
     # reads in the DeferredReadQueue are resolved with Err(NotLeader).
     Given N1 is Leader for term 1
     And a current-term entry has been committed (leadership confirmed)
+    And N1 has pending read() requests in its DeferredReadQueue
+    When N1's check-quorum timer fires and N1 has not received Fetch from a majority
+    Then N1 steps down to Follower
+    And all pending reads in N1's DeferredReadQueue are resolved with Err(NotLeader { leader_id: None })
+    And subsequent read() calls on N1 return Err(NotLeader { leader_id: None })
+
+  Scenario: Stale leader read is NOT linearizable
+    # A partitioned leader may serve a read that succeeds locally but is NOT
+    # linearizable against the global committed state. The leadership-proof
+    # mechanism (committed current-term entry) only verifies authority at the
+    # time of that commit — it does NOT re-verify majority contact per read.
+    # Check-quorum bounds the stale-leader serving window in time, but does
+    # NOT bound the staleness of the returned state (the new leader may have
+    # committed arbitrarily many entries during that window).
+    # True linearizable reads (read-index, lease-based) are out of scope
+    # per tech-spec §2.2.
+    Given N1 is Leader for term 1 and a current-term entry has been committed
     When N1 becomes partitioned from N2 and N3
     And N2 wins election for term 2 and becomes the new Leader
-    And a client calls read() on N1 (leadership still confirmed locally)
-    Then the event loop invokes StateMachine::query() and returns Ok(result)
-    # Note: this read succeeds because N1 still believes it is the leader.
-    # The returned state is linearizable w.r.t. N1's committed state up to
-    # the point of partition. Once check-quorum detects the partition:
-    When N1's check-quorum timer fires and N1 steps down to Follower
-    Then any pending reads in N1's DeferredReadQueue are resolved with Err(NotLeader { leader_id: None })
+    And a client proposes "set x=2" to N2 and it is committed on N2 and N3
+    And a client calls read() on N1 (still believes it is leader)
+    Then N1's event loop invokes StateMachine::query() and returns Ok(result)
+    And the returned result reflects N1's locally committed state (does NOT include "set x=2")
+    And this read is NOT linearizable — the global committed state includes "set x=2" but N1's result does not
+    When N1's check-quorum timer fires (bounding the stale-serving window)
+    Then N1 steps down to Follower
     And subsequent read() calls on N1 return Err(NotLeader { leader_id: None })
     And the client must discover the new leader (N2) and retry
 
@@ -1326,8 +1373,8 @@ Feature: Observability and Metrics
 | §2.1.3 Leader step-down | Remove Voter (scenario 2) | — |
 | §2.1.4 Identity & fencing | Identity and Fencing | 6 |
 | §2.1.4 Divergence detection | Log Divergence and Truncation | — |
-| §2.1.5 Library API | Client Interaction | 11 |
+| §2.1.5 Library API | Client Interaction | 12 |
 | §2.1.6 Metrics | Observability and Metrics | 7 |
 | §2.1.6 Deterministic simulation | Safety Invariants (scenario 6) | — |
 | §2.1.7 Bootstrap & recovery | Cluster Bootstrap | 5 |
-| **Total** | **17 Features** | **102 Scenarios** |
+| **Total** | **17 Features** | **103 Scenarios** |
