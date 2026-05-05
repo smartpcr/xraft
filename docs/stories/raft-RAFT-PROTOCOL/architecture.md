@@ -1595,7 +1595,7 @@ via injected trait objects. No raw I/O occurs inside `xraft-core`.
       │                │         ┌─────┴──────┐        │            │              │
       │                │         │ HW ≥ N+1   │        │            │              │
       │                │         │ (N < HW ✓) │        │            │              │
-      │                │         │ Four-phase  │        │            │              │
+      │                │         │ Three-phase │        │            │              │
       │                │         │ commit:     │        │            │              │
       │                │         │ 1. Filter:  │        │            │              │
       │                │         │  Control →  │        │            │              │
@@ -1715,7 +1715,7 @@ initial voter set and a shared `cluster_id`. All nodes start in the
     │ off 0,1    │                     │                         │
     │ committed  │                     │                         │
     │ (0<2,1<2). │                     │                         │
-    │ Four-phase │                     │                         │
+    │ Three-phase│                     │                         │
     │ commit:    │                     │                         │
     │ LCM@0 →    │                     │                         │
     │ internal.  │                     │                         │
@@ -2305,17 +2305,28 @@ standard three-phase commit notification (§4.1). This is
 
 **Canonical resolution:** Aligned across all documents. No conflict.
 
-### 7.3 Fully Aligned: `e2e-scenarios.md`
+### 7.3 Alignment Status: `e2e-scenarios.md`
 
-The e2e scenarios document is consistent with this architecture on all
-points checked:
+The e2e scenarios document is **partially aligned** with this
+architecture. The following points are consistent:
 
 - Exclusive HW semantics (§3.1).
 - RPC names, role names, observer classification.
 - Bootstrap HW math: `sorted desc [2, 2, 0] → index 1 → HW = 2`.
-- Four-phase commit notification (§4.1).
-- `read() → S::ReadResult` via `StateMachine::query()` (§5.11).
-- Protocol metadata via `RaftNode::metrics()`, not `read()`.
+- Pull-based Fetch replication model, divergence detection, snapshot transfer.
+- Single-change membership invariant, observer promotion flow.
+- Check Quorum step-down, Pre-Vote protocol, persistence/crash recovery.
+
+The following points in the e2e-scenarios document **contradict** this
+architecture and must be updated (see §7.4 for specific changes):
+
+| e2e-scenarios claim | Architecture canonical design | Divergence |
+|---------------------|-------------------------------|---------------|
+| Four-phase commit notification (with `DeferredReadQueue::drain` as step 4) | **Three-phase** commit notification: (1) `StateMachine::apply`, (2) `Listener::handle_commit`, (3) `DeferredCompletionQueue::complete`. No `DeferredReadQueue` exists (§4.1, Divergence 3 resolution). | D3 |
+| `read() → S::ReadResult` via `StateMachine::query()` (leader-only, linearizable) | `read() → Result<ConsensusState>` — local, non-linearizable snapshot of protocol metadata. Callable on any node. No `query()` method on `StateMachine`. No `DeferredReadQueue`. (§5.11, Divergence 4 resolution). | D4 |
+| `StateMachine` trait has `type ReadResult` and `fn query(&self)` | `StateMachine` trait has only `apply`, `snapshot`, `restore` — no `query()`, no associated type (§4.1, Divergence 4 resolution). | D4 |
+| Protocol metadata available only via `RaftNode::metrics()`, not `read()` | `read()` returns protocol metadata (`ConsensusState`: term, role, leader_id, HW, voter set). `metrics()` returns observability counters (election latency, append rate, commit latency). The two do not overlap (§5.11, §6.4). | D4 |
+| `read()` is leader-only; followers return `Err(NotLeader)` | `read()` is callable on **any node** — leader, follower, candidate, or unattached. It returns local metadata that may be stale (§5.11). | D4 |
 
 ### 7.4 Required Sibling-Doc Updates
 
@@ -2327,16 +2338,37 @@ and the required change.
 
 | Target | Current | Required change | Divergence |
 |--------|---------|-----------------|------------|
-| **Stage 1.4** — `StateMachine` trait definition | `apply`, `snapshot`, `restore` only | Add `type ReadResult: Send + 'static` and `fn query(&self) -> Result<Self::ReadResult>` | D4 |
-| **Stage 1.7** — `RaftNode::read()` signature | `read() → Result<ConsensusState>` (immediate, returns protocol metadata) | `read() → Future<Result<S::ReadResult>>` (async/future-backed, returns application state via `StateMachine::query()`; leader-only; may park in `DeferredReadQueue` until leadership is confirmed) | D4 |
-| **Stage 5.3** — `read()` implementation | Returns `ConsensusState` snapshot | Implement leadership-proof path per architecture §5.11; protocol metadata moves to `RaftNode::metrics()` | D4 |
-| **Stages 5.1, 5.3, 6.1** — commit notification | "three-phase commit notification" (apply → handle_commit → complete) | "four-phase commit notification" — add step 4: `DeferredReadQueue::drain` (resolve pending reads via `StateMachine::query()`) | D3 |
 | **Stage 1.4** — `LogStore` method receivers | `append(&mut self)`, `truncate_suffix(&mut self)`, `truncate_prefix(&mut self)` | All methods take `&self` with interior mutability (`Sync` bound); see architecture §4.1 | D5 |
+
+**Note:** The implementation plan is already aligned with this
+architecture on all other divergences. It uses three-phase commit
+notification (aligned with D3 resolution), `read() → Result<ConsensusState>`
+returning protocol metadata (aligned with D4 resolution), and
+`StateMachine` with `apply`, `snapshot`, `restore` only — no `query()`
+method, no `ReadResult` associated type (aligned with D4 resolution).
+No changes are required for D3 or D4 in the implementation plan.
+
+#### E2e-scenarios updates
+
+The e2e-scenarios document's **Feature: Client Interaction** section
+adopted a prior iteration's design that has been superseded. The
+following corrections are required to align with the canonical
+resolutions in §7.2 (Divergences 3 and 4):
+
+| Target | Current (stale) | Required change | Divergence |
+|--------|-----------------|-----------------|------------|
+| **Commit notification phases** | Four-phase commit with `DeferredReadQueue::drain` as step 4 | Three-phase commit notification: (1) `StateMachine::apply`, (2) `Listener::handle_commit`, (3) `DeferredCompletionQueue::complete`. Remove all references to `DeferredReadQueue`. | D3 |
+| **`read()` semantics** | `read() → S::ReadResult` via `StateMachine::query()`, leader-only, linearizable | `read() → Result<ConsensusState>` — local, non-linearizable snapshot of protocol metadata. Callable on any node. Remove `StateMachine::query()`, `S::ReadResult`, `DeferredReadQueue`. | D4 |
+| **`StateMachine` trait shape** | References `type ReadResult` and `fn query(&self)` | `StateMachine` has only `apply`, `snapshot`, `restore`. No `query()` method, no associated type. | D4 |
+| **Protocol metadata access** | Protocol metadata via `RaftNode::metrics()` only | `read()` returns protocol metadata (`ConsensusState`). `metrics()` returns observability counters (latencies, rates). Both exist; they do not overlap. | D4 |
+| **Read on follower** | `read()` on follower returns `Err(NotLeader)` | `read()` is callable on **any node**. Returns local `ConsensusState` that may be stale on a partitioned node. No `NotLeader` error for `read()`. | D4 |
+| **Partitioned leader read** | Leader serves reads via `StateMachine::query()` after check-quorum | After check-quorum step-down, `read()` still works (returns `ConsensusState` with `role = Follower`). No application-state reads via xraft. Applications build their own read-side state from `Listener::handle_commit` (§4.1). | D4 |
 
 #### Tech-spec clarifications
 
 | Target | Current | Suggested clarification | Divergence |
 |--------|---------|-------------------------|------------|
-| **§2.2** — "Linearisable reads" out of scope | "Read-index or lease-based reads" | Clarify that the exclusion targets two specific optimised techniques (read-index with per-read heartbeat broadcast; lease-based with clock assumptions). The initial leadership-proof read path (architecture §5.11) is NOT one of these techniques and is in scope. | D4 |
+| **§2.1.5** — `read()` signature | `read() → Result<State>` | Clarify to `read() → Result<ConsensusState>` — returns protocol metadata (term, role, leader_id, HW, voter set). Non-linearizable local snapshot, callable on any node. Does not read application state. | D4 |
+| **§2.2** — "Linearisable reads" out of scope | "Read-index or lease-based reads" | Aligned as stated: this architecture does not implement any linearizable-read mechanism. `read()` returns local protocol metadata with no linearizability guarantee. No change needed. | D4 |
 | **§4.4.1** — callback execution model | "application callbacks are staged and executed asynchronously outside the loop" | Callbacks (`StateMachine::apply`, `Listener::handle_commit`) are synchronous, in-process calls within the event loop, executed after state mutation but before `IoAction` dispatch. | D1 |
 | **§8 Glossary** — HW definition | "Entries at or below the HW are considered committed" (inclusive) | HW is an exclusive upper bound: entry at offset O is committed ⟺ `O < HW`. The committed set is identical; only the numeric convention differs (`HW_inclusive = HW_exclusive − 1`). | D2 |
