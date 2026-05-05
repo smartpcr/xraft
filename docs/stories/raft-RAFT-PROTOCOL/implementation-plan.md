@@ -52,7 +52,8 @@
 - [ ] Create `xraft-core/src/consensus_state.rs` defining `Role { Unattached, Follower, Candidate, Leader }` enum and `ConsensusState` struct with all fields from architecture doc §3.1
 - [ ] Create `xraft-core/src/quorum_state.rs` defining `QuorumState { current_term, voted_for, leader_id, leader_epoch }` struct
 - [ ] Create `xraft-core/src/follower_progress.rs` defining `FollowerProgress { node_id, fetch_offset, last_fetch_timestamp, is_voter }` struct
-- [ ] Create `xraft-core/src/lib.rs` re-exporting all type modules including `AppRecord` and `AppSnapshot`
+- [ ] Create `xraft-core/src/snapshot.rs` defining `SnapshotMetadata { last_included_offset, last_included_term, voters: Vec<VoterInfo>, leader_epoch }` and `Snapshot { metadata: SnapshotMetadata, app_snapshot: AppSnapshot }` composite struct (consensus metadata + application payload split per architecture §3.2); define `SnapshotReader` (wraps a snapshot chunk stream for follower restore) and `SnapshotWriter` (wraps a chunked write session for receiving snapshots from leader) — these types are referenced by `SnapshotIO` and `Listener` traits in Stage 1.4/1.6
+- [ ] Create `xraft-core/src/lib.rs` re-exporting all type modules including `AppRecord`, `AppSnapshot`, `Snapshot`, `SnapshotMetadata`, `SnapshotReader`, and `SnapshotWriter`
 - [ ] Add `uuid` and `bytes` crate dependencies to `xraft-core/Cargo.toml`
 
 #### Test Scenarios
@@ -79,9 +80,9 @@
 #### Implementation Steps
 - [ ] Create `xraft-core/src/traits.rs` defining `#[async_trait] trait LogStore { async fn append(&mut self, entries: &[LogEntry]) -> Result<()>, async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>>, async fn truncate_suffix(&mut self, from_offset: u64) -> Result<()>, async fn truncate_prefix(&mut self, up_to_offset: u64) -> Result<()>, fn log_start_offset(&self) -> u64, fn log_end_offset(&self) -> u64, async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>> }` — matches architecture §4.1 trait definition
 - [ ] Define `#[async_trait] trait QuorumStateStore { async fn load(&self) -> Result<Option<QuorumState>>, async fn save(&self, state: &QuorumState) -> Result<()> }` in `traits.rs` — matches architecture §4.1
-- [ ] Define `#[async_trait] trait SnapshotIO { async fn save_snapshot, async fn load_latest_snapshot, async fn read_chunk, async fn write_chunk }` in `traits.rs`
-- [ ] Define `#[async_trait] trait Transport { async fn send, fn recv_stream }` in `traits.rs`
-- [ ] Define `trait Clock { fn now, fn election_timeout, fn fetch_interval }` in `traits.rs`
+- [ ] Define `#[async_trait] trait SnapshotIO { async fn save(&self, snapshot: &Snapshot) -> Result<()>, async fn load_latest(&self) -> Result<Option<Snapshot>>, async fn read_chunk(&self, id: &SnapshotId, position: u64, max_bytes: u32) -> Result<(Bytes, bool)>, async fn begin_receive(&self, id: &SnapshotId) -> Result<SnapshotWriter> }` in `traits.rs` — matches architecture §4.1 method names exactly; uses `Snapshot`, `SnapshotId`, `SnapshotWriter` from Stage 1.2
+- [ ] Define `#[async_trait] trait Transport { async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<()>, async fn recv(&mut self) -> Result<RpcEnvelope> }` in `traits.rs` — matches architecture §4.1 (`recv` not `recv_stream`)
+- [ ] Define `trait Clock: Send + 'static { fn now(&self) -> Instant, async fn sleep_until(&self, deadline: Instant), fn random_election_timeout(&self) -> Duration }` in `traits.rs` — matches architecture §4.1 method names exactly
 - [ ] Define `trait StateMachine { fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>; fn snapshot(&self) -> Result<AppSnapshot>; fn restore(&mut self, snapshot: AppSnapshot) -> Result<()>; }` in `traits.rs` — uses `AppRecord` and `AppSnapshot` types from Stage 1.2
 - [ ] Add `async-trait` dependency to `xraft-core/Cargo.toml`
 
@@ -107,7 +108,7 @@
 > This stage defines the application callback interface that uses those types.
 
 #### Implementation Steps
-- [ ] Create `xraft-core/src/listener.rs` defining `Listener` trait with callbacks: `handle_commit(batch: &[(u64, AppRecord)])`, `handle_load_snapshot(reader: &AppSnapshot)`, `handle_leader_change(leader_id: NodeId, term: Term)`, `begin_shutdown()` — modelled on KRaft's `RaftClient.Listener`, uses `AppRecord` from Stage 1.2
+- [ ] Create `xraft-core/src/listener.rs` defining `Listener` trait with callbacks: `handle_commit(batch: &[(u64, AppRecord)])`, `handle_load_snapshot(reader: SnapshotReader)`, `handle_leader_change(leader_id: NodeId, term: Term)`, `begin_shutdown()` — modelled on KRaft's `RaftClient.Listener`, uses `AppRecord` from Stage 1.2 and `SnapshotReader` from Stage 1.2; matches architecture §4.1 trait signature
 - [ ] Create `xraft-core/src/listener_event.rs` defining `ListenerEvent` enum with variants matching each `Listener` callback, used by `IoAction::NotifyListener`
 - [ ] Update `xraft-core/src/lib.rs` to re-export `Listener` and `ListenerEvent`
 
@@ -122,13 +123,33 @@
 - [ ] Define `RaftNode::new(config, storage, transport, state_machine) -> Result<Self>` constructor that initialises struct fields and event-loop channel; does not start the event loop (started in Phase 4) or run recovery (completed in Phase 6)
 - [ ] Define `RaftNode::propose(command: AppRecord) -> Future<Result<Offset>>` method that sends the command to the event-loop channel and returns a future; returns `NotLeader` when no leader is active (consensus path completed in Phase 5)
 - [ ] Define `RaftNode::read() -> Result<ConsensusState>` method returning current consensus state (current term, leader, high watermark, role) — linearisable reads are out of scope per tech-spec §2.2; this returns local state only; high_watermark is an exclusive upper bound per architecture §5.2 (entry at offset O is committed when O < HW)
-- [ ] Define `RaftNode::bootstrap(cluster_id: ClusterId, initial_voters: Vec<VoterInfo>) -> Result<()>` method that validates preconditions (empty log, no quorum-state file) and stores configuration; bootstrap logic completed in Phase 6 — `ClusterId` is provided by the caller, not generated internally, to ensure all nodes share the same cluster identity
+- [ ] Define `RaftNode::bootstrap(cluster_id: ClusterId, initial_voters: Vec<VoterInfo>) -> Result<()>` method that validates preconditions (empty log, no quorum-state file, no existing snapshot) and stores configuration; bootstrap logic completed in Phase 6 — `ClusterId` is provided by the caller, not generated internally, to ensure all nodes share the same cluster identity
 - [ ] Define `RaftNode::shutdown() -> Result<()>` lifecycle method
 - [ ] Update `xraft-core/src/lib.rs` to re-export `RaftNode`
 
 #### Test Scenarios
 - [ ] Scenario: RaftNode compiles — Given the `RaftNode` struct with all type parameters, When `cargo check` is run, Then it compiles without errors
 - [ ] Scenario: API surface exists — Given a `RaftNode` instance constructed with mocks, When `propose()`, `read()`, `bootstrap()`, and `shutdown()` are called, Then each returns a typed `Result` with defined error variants
+
+### Stage 1.8: In-Memory Storage Backends and Simulated Clock (`xraft-test`)
+
+> **Note:** These test-only implementations depend only on the traits and types
+> defined in Stages 1.2–1.4. They are placed here (rather than in a later
+> phase) because Phases 4–8 use them as test infrastructure for deterministic
+> scenario testing. The `xraft-test` crate is the canonical location for all
+> test-only code — no test utilities live in `xraft-core`.
+
+#### Implementation Steps
+- [ ] Create `xraft-test/src/memory_log.rs` implementing `LogStore` trait with `Vec<LogEntry>` backend — supports append, read `[start_offset, end_offset)`, truncate_suffix, truncate_prefix, offset tracking
+- [ ] Implement optional fault injection in `MemoryLogStore`: configurable `fsync` failure probability, write corruption injection
+- [ ] Create `xraft-test/src/memory_snapshot.rs` implementing `SnapshotIO` trait with in-memory snapshot storage — method names match architecture §4.1: `save`, `load_latest`, `read_chunk`, `begin_receive`
+- [ ] Create `xraft-test/src/memory_quorum_state.rs` implementing `QuorumStateStore` trait with in-memory state
+- [ ] Create `xraft-test/src/simulated_clock.rs` implementing `SimulatedClock` — deterministic clock implementing the `Clock` trait from `xraft-core` (methods: `now`, `sleep_until`, `random_election_timeout` matching architecture §4.1), advances only when explicitly ticked via `advance(duration)`, allows precise control over election timeouts, fetch intervals, and Check Quorum deadlines
+
+#### Test Scenarios
+- [ ] Scenario: Memory log store — Given a `MemoryLogStore`, When 1000 entries are appended and read back, Then all entries match with correct offsets
+- [ ] Scenario: Fault injection — Given a `MemoryLogStore` with fsync failure probability 1.0, When `append` is called, Then it returns a `StorageError`
+- [ ] Scenario: Simulated clock — Given a `SimulatedClock` at time 0, When advanced by 150 ms, Then `now()` returns 150 ms and no wall-clock time has passed
 
 ---
 
@@ -159,7 +180,7 @@
 ### Stage 2.2: Segment Log — Read and Truncation
 
 #### Implementation Steps
-- [ ] Implement `LogStore::read(start_offset, end_offset)` — locate segment via sparse index, seek to start, deserialize and validate CRC
+- [ ] Implement `LogStore::read(start_offset, end_offset)` — read entries in range `[start_offset, end_offset)` (exclusive end, matching architecture §4.1); locate segment via sparse index, seek to start, deserialize and validate CRC
 - [ ] Implement `LogStore::entry_at(offset)` — read a single entry at the given offset, returning `None` if offset is outside the log bounds
 - [ ] Implement `LogStore::truncate_suffix(offset)` — remove all entries at and after the given offset (for log divergence), truncate the segment file, update the index
 - [ ] Implement `LogStore::truncate_prefix(offset)` — delete segment files whose entries are all before the given offset (for log compaction after snapshot), update `log_start_offset`
@@ -186,15 +207,15 @@
 ### Stage 2.4: Snapshot Store
 
 #### Implementation Steps
-- [ ] Create `xraft-storage/src/snapshot_store.rs` implementing `SnapshotIO` — write snapshot atomically (temp file → fsync → rename) to `data/<cluster_id>/log/snapshot/<offset>-<term>.snap`
-- [ ] Implement `load_latest_snapshot` — scan snapshot directory, parse filenames, return the one with the highest offset
+- [ ] Create `xraft-storage/src/snapshot_store.rs` implementing `SnapshotIO` — method names match architecture §4.1: `save`, `load_latest`, `read_chunk`, `begin_receive`; write snapshot atomically (temp file → fsync → rename) to `data/<cluster_id>/log/snapshot/<offset>-<term>.snap`
+- [ ] Implement `load_latest` — scan snapshot directory, parse filenames, return the `Snapshot` with the highest `last_included_offset`
 - [ ] Implement chunked read (`read_chunk(snapshot_id, position, max_bytes)`) for `FetchSnapshot` RPC serving
-- [ ] Implement chunked write (`write_chunk`) for receiving snapshot from leader, assembling chunks, and atomic finalization
+- [ ] Implement `begin_receive(snapshot_id) -> SnapshotWriter` for receiving snapshot from leader, assembling chunks, and atomic finalization
 
 #### Test Scenarios
 - [ ] Scenario: Save and load snapshot — Given a `Snapshot` with metadata and app payload, When saved and then loaded, Then all fields match
 - [ ] Scenario: Chunked read — Given a 10 KB snapshot, When read in 1 KB chunks, Then 10 chunks are returned and concatenation equals the original bytes
-- [ ] Scenario: Latest snapshot selection — Given snapshots at offsets 100, 500, and 300, When `load_latest_snapshot` is called, Then the snapshot at offset 500 is returned
+- [ ] Scenario: Latest snapshot selection — Given snapshots at offsets 100, 500, and 300, When `load_latest` is called, Then the `Snapshot` at offset 500 is returned
 
 ### Stage 2.5: Storage Integration and `StorageEngine` Facade
 
@@ -225,7 +246,7 @@
 - [ ] Create `xraft-transport/src/codec.rs` implementing `RpcCodec` — length-prefixed bincode serialisation/deserialisation of `RpcEnvelope`
 - [ ] Create `xraft-transport/src/channel.rs` implementing `ChannelTransport` — in-process transport using `tokio::sync::mpsc` channels per node pair
 - [ ] Implement `Transport::send` — serialize envelope, route to destination channel
-- [ ] Implement `Transport::recv_stream` — return an async stream draining the node's inbound channel
+- [ ] Implement `Transport::recv` — await the next inbound `RpcEnvelope` from the node's inbound channel (matches architecture §4.1 `recv` signature)
 - [ ] Implement cluster-id and leader-epoch fencing checks in the codec layer (reject envelopes with wrong cluster_id)
 
 #### Test Scenarios
@@ -254,7 +275,7 @@
 - [ ] Implement connection pooling: maintain one persistent connection per peer, reconnect on failure with exponential backoff
 - [ ] Implement length-prefixed framing using `tokio_util::codec::LengthDelimitedCodec`
 - [ ] Implement `Transport::send` — lookup or establish connection, write framed message
-- [ ] Implement `Transport::recv_stream` — accept inbound connections, decode frames, yield `RpcEnvelope` items on an async stream
+- [ ] Implement `Transport::recv` — accept inbound connections, decode frames, return next `RpcEnvelope` (matches architecture §4.1 `recv` signature)
 - [ ] Add `tokio-util` dependency to `xraft-transport/Cargo.toml`
 
 #### Test Scenarios
@@ -267,10 +288,10 @@
 
 > **Goal:** Implement leader election including Pre-Vote, term
 > management, vote persistence, leader step-down, and Check Quorum.
-> This is the first consensus logic. Depends on Phase 1 (types/traits),
-> Phase 2 (quorum state persistence), Stage 3.1 (ChannelTransport for
-> testing), and Stage 9.1 (SimulatedClock and in-memory storage backends
-> for deterministic test scenarios).
+> This is the first consensus logic. Depends on Phase 1 (types/traits
+> including Stage 1.8 in-memory backends and SimulatedClock for
+> deterministic test scenarios), Phase 2 (quorum state persistence),
+> and Stage 3.1 (ChannelTransport for testing).
 >
 > **Sequencing:** Stages 4.1–4.2 are sequential. Stages 4.3–4.4 depend
 > on 4.2.
@@ -281,11 +302,11 @@
 - [ ] Create `xraft-core/src/event_loop.rs` with async event loop skeleton: inbound message channel (`tokio::sync::mpsc`), tick-based timer, and shutdown signal
 - [ ] Implement `IoAction` enum: `PersistQuorumState`, `AppendLog`, `TruncateSuffix`, `TruncatePrefix`, `SendRpc`, `SaveSnapshot`, `NotifyListener`
 - [ ] Implement `IoActionBatch` collection and `IoStage` executor that dispatches actions to trait objects concurrently
-- [ ] Create `xraft-core/src/clock.rs` with `WallClock` (production implementation using `tokio::time`) of the `Clock` trait — `SimulatedClock` is defined in `xraft-test` (Stage 9.1), not in `xraft-core`, to keep test-only code out of the production crate
-- [ ] Implement randomised election timeout generation using `Clock::election_timeout` with jitter in [min, max] range
+- [ ] Create `xraft-core/src/clock.rs` with `WallClock` (production implementation using `tokio::time`) of the `Clock` trait — implements `now`, `sleep_until`, and `random_election_timeout` per architecture §4.1; `SimulatedClock` is defined in `xraft-test` (Stage 1.8), not in `xraft-core`, to keep test-only code out of the production crate
+- [ ] Implement randomised election timeout generation using `Clock::random_election_timeout` with jitter in [min, max] range
 
 #### Test Scenarios
-- [ ] Scenario: Simulated clock — Given a `SimulatedClock` (from `xraft-test`) at time 0, When advanced by 150 ms, Then `now()` returns 150 ms and no wall-clock time has passed
+- [ ] Scenario: Simulated clock — Given a `SimulatedClock` (from `xraft-test`, Stage 1.8) at time 0, When advanced by 150 ms, Then `now()` returns 150 ms and no wall-clock time has passed
 - [ ] Scenario: IoStage dispatch — Given an `IoActionBatch` with a `PersistQuorumState` and a `SendRpc`, When executed by `IoStage`, Then both the quorum-state store and transport receive the respective calls
 
 ### Stage 4.2: Election Manager — Vote Request/Response
@@ -402,34 +423,34 @@
 ### Stage 6.1: Crash Recovery Sequence
 
 #### Implementation Steps
-- [ ] Implement `RaftNode::recover()` entry point — called on startup before accepting RPCs; orchestrates the recovery phases below and returns the node in Follower state ready to send Fetch RPCs
+- [ ] Implement `RaftNode::recover()` entry point — called on startup before accepting RPCs; orchestrates the recovery phases below; the node starts in `Unattached` role during recovery and transitions to `Follower` upon completion, per architecture §5.9/§5.10
 - [ ] Implement recovery phase 1: load quorum-state file for `current_term` and `voted_for` via `QuorumStateStore::load()`; if no file exists, initialise term=0 with no vote
-- [ ] Implement recovery phase 2: load latest snapshot (if any) via `SnapshotIO::load_latest_snapshot()`; call `StateMachine::restore(app_snapshot)` and restore voter set from snapshot metadata; set `log_start_offset` to `snapshot.last_included_offset + 1` (or 0 if no snapshot)
-- [ ] Implement recovery phase 3: initialise `high_watermark` to `snapshot.last_included_offset + 1` (or 0 if no snapshot) — HW is never persisted (architecture §5.10 rule 1); entries [0, HW) are known committed from the snapshot; entries beyond HW have unknown committed status
+- [ ] Implement recovery phase 2: load latest snapshot (if any) via `SnapshotIO::load_latest()`; call `StateMachine::restore(app_snapshot)` and restore voter set from `snapshot.metadata.voters`; set `log_start_offset` to `snapshot.metadata.last_included_offset + 1` (or 0 if no snapshot)
+- [ ] Implement recovery phase 3: initialise `high_watermark` to `snapshot.metadata.last_included_offset + 1` (or 0 if no snapshot) — HW is never persisted (architecture §5.10 rule 1); entries [0, HW) are known committed from the snapshot; entries beyond HW have unknown committed status
 - [ ] Implement recovery phase 4: scan log from `log_start_offset` to `log_end_offset`, validate CRC-32C per batch, truncate at first corrupt/partial record; do NOT apply any entries to the `StateMachine` (architecture §5.10 rule 2 — committed status unknown; entries may be uncommitted tail from a deposed leader)
 - [ ] Implement recovery phase 5: process control records in the recovered log for bookkeeping only — `VotersRecord` → update voter set, `LeaderChangeMessage` → update leader-epoch checkpoint; these are idempotent consensus metadata updates, not state machine mutations; rebuild full leader-epoch checkpoint from log scan
-- [ ] Implement recovery phase 6: set role to Follower, start election timer, begin accepting RPCs — a recovering node never resumes as Leader regardless of prior role; it must win a new election
+- [ ] Implement recovery phase 6: transition role from `Unattached` to `Follower`, start election timer, begin accepting RPCs — a recovering node never resumes as Leader regardless of prior role; it must win a new election
 - [ ] After recovery, the node sends Fetch requests to the leader; the leader's Fetch response includes the authoritative HW; the node advances local HW to `min(leader_HW, local_log_end_offset)` and applies entries between old HW and new HW to the state machine (only `Command` entries — control records were already processed for bookkeeping during recovery step 6)
 - [ ] Ensure log recovery scan (from Stage 2.2) truncates any partially-written entries before replay
-- [ ] Validate invariants after recovery: `log_start_offset ≤ high_watermark ≤ log_end_offset`, voter set non-empty (from snapshot or bootstrap VotersRecord), term ≥ snapshot term, HW = `snapshot.last_included_offset + 1` (not `log_end_offset`) — entries between HW and log_end_offset have unknown committed status and must not be applied to the state machine until the leader provides the authoritative HW
+- [ ] Validate invariants after recovery: `log_start_offset ≤ high_watermark ≤ log_end_offset`, voter set non-empty (from snapshot or bootstrap VotersRecord), term ≥ snapshot term, HW = `snapshot.metadata.last_included_offset + 1` (not `log_end_offset`) — entries between HW and log_end_offset have unknown committed status and must not be applied to the state machine until the leader provides the authoritative HW
 
 #### Test Scenarios
-- [ ] Scenario: Clean recovery — Given a node with quorum-state(term=5, voted_for=N1), a snapshot at offset 100, and log entries 101–150, When the node restarts, Then it recovers to term 5 as Follower with `high_watermark=101` (snapshot offset + 1, not log_end_offset), log entries 101–150 are present on disk but NOT applied to the state machine (committed status unknown), control records in 101–150 are processed for bookkeeping only (VotersRecord → voter set, LeaderChangeMessage → epoch checkpoint), and the node begins sending Fetch requests to learn the authoritative HW from the leader
-- [ ] Scenario: Recovery after crash mid-write — Given a node that crashed while appending entry 151 (corrupt CRC), When it restarts, Then entries 0–150 are recovered, entry 151 is discarded, and HW is set to `snapshot.last_included_offset + 1` (not 151)
-- [ ] Scenario: Recovery with no snapshot — Given a node with log entries 0–50 and no snapshot, When it restarts, Then HW is set to 0 (no snapshot → no entries known committed), entries 0–50 are present on disk but NOT applied to the state machine; the node resumes as Follower and learns the authoritative HW from the leader via Fetch, at which point entries up to the leader-provided HW are applied to the state machine
+- [ ] Scenario: Clean recovery — Given a node with quorum-state(term=5, voted_for=N1), a snapshot at `last_included_offset=100`, and log entries 101–150, When the node restarts, Then it recovers to term 5 via `Unattached` → `Follower` transition with `high_watermark=101` (`snapshot.metadata.last_included_offset + 1`, not log_end_offset), log entries 101–150 are present on disk but NOT applied to the state machine (committed status unknown), control records in 101–150 are processed for bookkeeping only (VotersRecord → voter set, LeaderChangeMessage → epoch checkpoint), and the node begins sending Fetch requests to learn the authoritative HW from the leader
+- [ ] Scenario: Recovery after crash mid-write — Given a node that crashed while appending entry 151 (corrupt CRC), When it restarts, Then entries 0–150 are recovered, entry 151 is discarded, and HW is set to `snapshot.metadata.last_included_offset + 1` (not 151)
+- [ ] Scenario: Recovery with no snapshot — Given a node with log entries 0–50 and no snapshot, When it restarts, Then HW is set to 0 (no snapshot → no entries known committed), entries 0–50 are present on disk but NOT applied to the state machine; the node transitions `Unattached` → `Follower` and learns the authoritative HW from the leader via Fetch, at which point entries up to the leader-provided HW are applied to the state machine
 
 ### Stage 6.2: Cluster Bootstrap
 
 #### Implementation Steps
-- [ ] Implement `RaftNode::bootstrap(cluster_id: ClusterId, initial_voters: Vec<VoterInfo>)` — for first-time cluster formation per architecture §5.9: accept a shared `ClusterId` (generated once by the operator and distributed out-of-band to all nodes), store `cluster_id` and voter set in memory, set term=0 with no vote, set role to Follower, start election timer — the initial `VotersRecord` is NOT written to the log during bootstrap; the leader appends `LeaderChangeMessage` and `VotersRecord` to the log after winning the first election (architecture §5.9 bootstrap flow); the quorum-state file is first persisted when the node votes during the first election (via `QuorumStateStore::save` in Stage 4.2's fsync-before-ack rule)
-- [ ] Implement bootstrap guard: reject `bootstrap()` if log is non-empty or quorum-state file already exists
-- [ ] Implement single-node bootstrap for development/testing: a 1-node cluster immediately becomes leader
-- [ ] Connect `RaftNode::new(config, storage, transport, state_machine)` constructor that calls `recover()` if data exists or waits for `bootstrap()` if data directory is empty
+- [ ] Implement `RaftNode::bootstrap(cluster_id: ClusterId, initial_voters: Vec<VoterInfo>)` — for first-time cluster formation per architecture §5.9: accept a shared `ClusterId` (generated once by the operator and distributed out-of-band to all nodes), store `cluster_id` and voter set in memory, set term=0 with no vote, transition role from `Unattached` to `Follower`, start election timer — the initial `VotersRecord` is NOT written to the log during bootstrap; the leader appends `LeaderChangeMessage` and `VotersRecord` to the log after winning the first election (architecture §5.9 bootstrap flow); the quorum-state file is first persisted when the node votes during the first election (via `QuorumStateStore::save` in Stage 4.2's fsync-before-ack rule)
+- [ ] Implement bootstrap guard: reject `bootstrap()` if log is non-empty OR quorum-state file already exists OR a snapshot already exists — all three conditions indicate prior initialisation and must prevent re-bootstrap
+- [ ] Implement single-node bootstrap for development/testing: a 1-node cluster follows the same election path — bootstrap to `Follower`, election timeout fires, node self-votes (persisting quorum-state), wins election as the only voter, becomes Leader, and appends `LeaderChangeMessage` + `VotersRecord` — this preserves the persistence contract that quorum-state is first written during the first election
+- [ ] Connect `RaftNode::new(config, storage, transport, state_machine)` constructor that starts the node in `Unattached` role, calls `recover()` if data exists, or waits for `bootstrap()` if data directory is empty
 
 #### Test Scenarios
-- [ ] Scenario: Fresh bootstrap — Given a 3-node cluster with empty data directories and a shared `ClusterId` generated once, When each node calls `bootstrap(cluster_id, [N1, N2, N3])` with the same `ClusterId`, Then all nodes start as Followers with matching `ClusterId` and in-memory voter set {N1, N2, N3}; the log is empty and no quorum-state file exists until the first election occurs and the winning leader appends LeaderChangeMessage + VotersRecord
-- [ ] Scenario: Double bootstrap rejection — Given a node that has already bootstrapped, When `bootstrap()` is called again, Then it returns an error
-- [ ] Scenario: Single-node bootstrap — Given a 1-node cluster, When `bootstrap(cluster_id, [N1])` is called and the election timeout expires, Then N1 wins election as the only voter, becomes Leader, and appends LeaderChangeMessage + VotersRecord to the log
+- [ ] Scenario: Fresh bootstrap — Given a 3-node cluster with empty data directories and a shared `ClusterId` generated once, When each node calls `bootstrap(cluster_id, [N1, N2, N3])` with the same `ClusterId`, Then all nodes transition from `Unattached` to `Follower` with matching `ClusterId` and in-memory voter set {N1, N2, N3}; the log is empty and no quorum-state file exists until the first election occurs and the winning leader appends LeaderChangeMessage + VotersRecord
+- [ ] Scenario: Double bootstrap rejection — Given a node that has already bootstrapped (log, quorum-state, or snapshot exists), When `bootstrap()` is called again, Then it returns an error
+- [ ] Scenario: Single-node bootstrap — Given a 1-node cluster, When `bootstrap(cluster_id, [N1])` is called, Then N1 transitions from `Unattached` to `Follower`; when the election timeout expires, N1 self-votes (persisting quorum-state via fsync), wins election as the only voter, becomes Leader, and appends LeaderChangeMessage + VotersRecord to the log
 
 ---
 
@@ -447,25 +468,25 @@
 #### Implementation Steps
 - [ ] Create `xraft-core/src/snapshot_coordinator.rs` implementing `SnapshotCoordinator`
 - [ ] Implement snapshot trigger: after every N committed entries (configurable `snapshot_interval`), initiate a snapshot
-- [ ] Implement snapshot creation: call `StateMachine::snapshot()` for app payload, combine with consensus metadata (last applied offset, term, voter set), write via `SnapshotIO::save_snapshot`
-- [ ] Implement log prefix truncation after snapshot: call `LogStore::truncate_prefix(snapshot_offset)` to reclaim disk space, advance `log_start_offset`
+- [ ] Implement snapshot creation: call `StateMachine::snapshot()` for app payload, combine with consensus metadata into `Snapshot { metadata: SnapshotMetadata { last_included_offset, last_included_term, voters, leader_epoch }, app_snapshot }`, write via `SnapshotIO::save` (architecture §4.1 method name)
+- [ ] Implement log prefix truncation after snapshot: call `LogStore::truncate_prefix(snapshot.metadata.last_included_offset + 1)` to reclaim disk space — `log_start_offset` advances to `last_included_offset + 1` because the snapshot includes the entry at `last_included_offset`
 - [ ] Ensure snapshot is fully persisted (fsync) before truncating any log entries
 
 #### Test Scenarios
-- [ ] Scenario: Automatic snapshot — Given `snapshot_interval = 100`, When 100 entries are committed, Then a snapshot is taken and the log prefix up to offset 100 is eligible for truncation
-- [ ] Scenario: Log reclamation — Given a snapshot at offset 500, When prefix truncation runs, Then `log_start_offset() = 500` and entries 0–499 are no longer on disk
+- [ ] Scenario: Automatic snapshot — Given `snapshot_interval = 100`, When 100 entries are committed, Then a snapshot is taken at `last_included_offset = 99` and the log prefix is truncated so `log_start_offset = 100`
+- [ ] Scenario: Log reclamation — Given a snapshot at `last_included_offset = 499`, When prefix truncation runs, Then `log_start_offset() = 500` and entries 0–499 are no longer on disk
 - [ ] Scenario: Snapshot before truncation — Given a snapshot write that fails (simulated IO error), When truncation is attempted, Then truncation is skipped (no data loss)
 
 ### Stage 7.2: Snapshot Transfer via FetchSnapshot RPC
 
 #### Implementation Steps
 - [ ] Implement `FetchSnapshot` handling on leader: serve snapshot chunks via `SnapshotIO::read_chunk` with position tracking
-- [ ] Implement `FetchSnapshot` flow on follower: triggered when `Fetch` response contains `snapshot_id`, send `FetchSnapshotRequest` with position=0, accumulate chunks, finalize when `is_last_chunk=true`
-- [ ] After snapshot is fully received: call `StateMachine::restore`, update voter set from snapshot metadata, set `log_start_offset` to `snapshot.last_included_offset + 1`, set `high_watermark` to `snapshot.last_included_offset + 1` (snapshot captures only committed state — consistent with recovery HW rule from architecture §5.10), set `fetch_offset` to `snapshot.last_included_offset + 1`, resume normal Fetch replication from the offset immediately after the snapshot (not the snapshot's last offset)
+- [ ] Implement `FetchSnapshot` flow on follower: triggered when `Fetch` response contains `snapshot_id`, use `SnapshotIO::begin_receive(snapshot_id) -> SnapshotWriter` to initiate the chunked receive session, send `FetchSnapshotRequest` with position=0, write chunks via `SnapshotWriter`, finalize when `is_last_chunk=true`
+- [ ] After snapshot is fully received: call `StateMachine::restore(snapshot.app_snapshot)`, update voter set from `snapshot.metadata.voters`, set `log_start_offset` to `snapshot.metadata.last_included_offset + 1`, set `high_watermark` to `snapshot.metadata.last_included_offset + 1` (snapshot captures only committed state — consistent with recovery HW rule from architecture §5.10), set `fetch_offset` to `snapshot.metadata.last_included_offset + 1`, resume normal Fetch replication from the offset immediately after the snapshot (not the snapshot's last offset)
 - [ ] Handle interrupted transfer: if the follower restarts mid-transfer, detect partial snapshot and restart from position 0
 
 #### Test Scenarios
-- [ ] Scenario: Full snapshot transfer — Given leader has snapshot at offset 1000 and follower has empty log, When follower sends Fetch(offset=0) and gets `snapshot_id`, Then follower downloads the full snapshot via FetchSnapshot RPCs and resumes fetching from offset 1001 (snapshot.last_included_offset + 1)
+- [ ] Scenario: Full snapshot transfer — Given leader has snapshot at `last_included_offset=1000` and follower has empty log, When follower sends Fetch(offset=0) and gets `snapshot_id`, Then follower downloads the full snapshot via FetchSnapshot RPCs (using `begin_receive` / `SnapshotWriter`) and resumes fetching from offset 1001 (`snapshot.metadata.last_included_offset + 1`)
 - [ ] Scenario: Chunked transfer integrity — Given a 50 KB snapshot transferred in 4 KB chunks, When all chunks are received and assembled, Then the reconstructed snapshot matches the original byte-for-byte
 - [ ] Scenario: Interrupted transfer — Given a snapshot transfer interrupted after 5 of 13 chunks, When the follower reconnects, Then it restarts the transfer from position 0
 
@@ -475,8 +496,11 @@
 
 > **Goal:** Implement single-node-at-a-time voter add/remove/update,
 > observer promotion, and leader step-down on removal. Depends on
-> Phase 5 (replication, since VotersRecord must be committed) and
-> Phase 6 (bootstrap, since the initial voter set is established there).
+> Phase 5 (replication, since VotersRecord must be committed),
+> Phase 6 (bootstrap, since the initial voter set is established there),
+> and Phase 7 (snapshot transfer, since observers that join an established
+> cluster may need snapshot transfer if they are behind the leader's
+> `log_start_offset`).
 >
 > **Sequencing:** Stages 8.1–8.3 are sequential (each builds on the prior).
 
@@ -484,11 +508,11 @@
 
 #### Implementation Steps
 - [ ] Create `xraft-core/src/membership.rs` implementing `MembershipManager`
-- [ ] Implement `handle_add_voter(request)` on leader: validate no other membership change is in-flight, validate node is not already a voter, append `VotersRecord` control entry to log
+- [ ] Implement `handle_add_voter(request)` on leader: validate no other membership change is in-flight, validate node is not already a voter, append `VotersRecord` control entry to log — the `VotersRecord` is committed using the **current** voter set for quorum (i.e., the new voter does NOT count towards the majority needed to commit this VotersRecord, per architecture §5.5)
 - [ ] Implement observer registration: new node joins as observer (non-voting), replicates log via Fetch, does not contribute to quorum
 - [ ] Track observer catch-up progress: observer must reach within a configurable threshold of the leader's log end before promotion
 - [ ] On `VotersRecord` commit: update the in-memory voter set, begin counting the new voter for quorum calculations
-- [ ] Return `MembershipChangeResponse` with appropriate errors (`NotLeader`, `ChangeInProgress`, `NodeAlreadyVoter`, `NodeNotCaughtUp`) — all variants from `MembershipError` enum defined in architecture §3.2
+- [ ] Return `MembershipChangeResponse` with appropriate errors (`NotLeader { leader_id }`, `ChangeInProgress`, `NodeAlreadyVoter`, `NodeNotCaughtUp`) — all variants from `MembershipError` enum defined in architecture §3.2, including the `leader_id` field in `NotLeader` for client redirection
 
 #### Test Scenarios
 - [ ] Scenario: Add voter — Given a 3-node cluster {N1, N2, N3}, When leader N1 processes `AddVoter(N4)`, Then N4 is added as observer, catches up, a `VotersRecord` is committed, and N4 becomes a voter (quorum changes from 2 to 3)
@@ -499,15 +523,16 @@
 ### Stage 8.2: Membership Manager — Remove Voter
 
 #### Implementation Steps
-- [ ] Implement `handle_remove_voter(request)` on leader: validate no other change in-flight, validate node exists in voter set, append `VotersRecord` without the removed node
+- [ ] Implement `handle_remove_voter(request)` on leader: validate no other change in-flight, validate node exists in voter set, append `VotersRecord` without the removed node — the `VotersRecord` is committed using the **new** voter set for quorum (i.e., the removed voter does NOT count towards the majority, per architecture §5.6), ensuring the new configuration is durable on a majority of the new membership before taking effect
 - [ ] On `VotersRecord` commit: update in-memory voter set, exclude removed node from quorum calculations
-- [ ] Handle leader self-removal: if the leader is the removed node, continue serving until the `VotersRecord` commits, then step down to Follower
-- [ ] Handle removed follower: removed node stops sending Fetch RPCs and transitions to an inert state (or shuts down)
+- [ ] Handle leader self-removal: if the leader is the removed node, continue serving (processing Fetch requests, advancing HW) until the `VotersRecord` commits, then step down to `Unattached` (not `Follower`, because the leader is no longer a member of the voter set — per architecture §5.6 leader self-removal rules)
+- [ ] Handle removed follower: when the removed node learns of its removal (by fetching and applying the `VotersRecord` that excludes it), it transitions to `Unattached` and stops participating in elections; Pre-Vote and voter-set-aware vote rejection prevent the removed node from disrupting the cluster (architecture §5.6)
 
 #### Test Scenarios
-- [ ] Scenario: Remove voter — Given a 5-node cluster, When leader removes N5, Then after `VotersRecord` commits, quorum is calculated over 4 nodes
-- [ ] Scenario: Leader self-removal — Given N1 is leader of {N1, N2, N3}, When `RemoveVoter(N1)` is committed, Then N1 steps down and a new election among {N2, N3} occurs
+- [ ] Scenario: Remove voter — Given a 5-node cluster, When leader removes N5, Then the `VotersRecord` [N1,N2,N3,N4] is committed using a majority of the **new** voter set (3 of 4), and quorum is then calculated over 4 nodes
+- [ ] Scenario: Leader self-removal — Given N1 is leader of {N1, N2, N3}, When `RemoveVoter(N1)` is committed (using majority of new set {N2, N3}), Then N1 steps down to `Unattached` (not Follower) and a new election among {N2, N3} occurs
 - [ ] Scenario: Remove non-existent node — Given voter set {N1, N2, N3}, When `RemoveVoter(N4)` is requested, Then `MembershipError::NodeNotFound` error is returned
+- [ ] Scenario: Removed node behaviour — Given N3 is removed from voter set, When N3 fetches and applies the `VotersRecord` excluding it, Then N3 transitions to `Unattached` and stops participating in elections
 
 ### Stage 8.3: Update Voter and VotersRecord Snapshot Integration
 
@@ -525,29 +550,16 @@
 
 ## Phase 9: Test Harness (`xraft-test`)
 
-> **Goal:** Build the deterministic simulation harness and in-memory
-> storage backends for comprehensive scenario testing.
+> **Goal:** Build the deterministic simulation harness for comprehensive
+> scenario testing. The in-memory storage backends and `SimulatedClock`
+> are defined in Stage 1.8 (Phase 1) to resolve the dependency ordering.
+> This phase builds the higher-level `SimulatedCluster` and
+> `InvariantChecker` on top of those primitives.
 >
-> **Sequencing:** Stage 9.1 depends only on Phase 1 (core types and
-> traits) and can be implemented in parallel with Phases 2–8. Phases
-> 4–8 test scenarios use the SimulatedClock and in-memory backends
-> from Stage 9.1 as test infrastructure. Stages 9.2 and 9.3 depend
-> on Phases 4–8 (consensus and replication logic) plus Stage 9.1.
+> **Sequencing:** Stage 9.1 depends on Phases 4–8 (consensus logic)
+> plus Stage 1.8 (in-memory backends). Stage 9.2 depends on Stage 9.1.
 
-### Stage 9.1: In-Memory Storage and Simulated Clock
-
-#### Implementation Steps
-- [ ] Create `xraft-test/src/memory_log.rs` implementing `LogStore` trait with `Vec<LogEntry>` backend — supports append, read, truncate, offset tracking
-- [ ] Implement optional fault injection in `MemoryLogStore`: configurable `fsync` failure probability, write corruption injection
-- [ ] Create `xraft-test/src/memory_snapshot.rs` implementing `SnapshotIO` trait with in-memory snapshot storage
-- [ ] Create `xraft-test/src/memory_quorum_state.rs` implementing `QuorumStateStore` trait with in-memory state
-- [ ] Create `xraft-test/src/simulated_clock.rs` implementing `SimulatedClock` — deterministic clock implementing the `Clock` trait from `xraft-core`, advances only when explicitly ticked via `advance(duration)`, allows precise control over election timeouts, fetch intervals, and Check Quorum deadlines; this is the canonical location for `SimulatedClock` (it is not defined in `xraft-core`)
-
-#### Test Scenarios
-- [ ] Scenario: Memory log store — Given a `MemoryLogStore`, When 1000 entries are appended and read back, Then all entries match with correct offsets
-- [ ] Scenario: Fault injection — Given a `MemoryLogStore` with fsync failure probability 1.0, When `append` is called, Then it returns a `StorageError`
-
-### Stage 9.2: Simulated Cluster
+### Stage 9.1: Simulated Cluster
 
 #### Implementation Steps
 - [ ] Create `xraft-test/src/simulated_cluster.rs` implementing `SimulatedCluster` — manages N `RaftNode` instances with `ChannelTransport`, `MemoryLogStore`, and `SimulatedClock`
@@ -560,7 +572,7 @@
 - [ ] Scenario: Cluster formation — Given `SimulatedCluster::new(3)`, When time advances past the election timeout, Then exactly one leader is elected
 - [ ] Scenario: Node stop and restart — Given a 3-node cluster with leader N1, When N1 is stopped and time advances, Then a new leader is elected among N2/N3; when N1 restarts, Then it rejoins as Follower
 
-### Stage 9.3: Invariant Checker
+### Stage 9.2: Invariant Checker
 
 #### Implementation Steps
 - [ ] Create `xraft-test/src/invariant_checker.rs` implementing `InvariantChecker`
@@ -619,7 +631,8 @@
 - [ ] Implement test: snapshot transfer to a far-behind follower
 - [ ] Implement test: add voter to a running cluster and verify quorum change
 - [ ] Implement test: remove voter (including leader self-removal)
-- [ ] Implement test: crash recovery from snapshot — verify node recovers with HW = snapshot offset + 1, does NOT apply post-snapshot entries to SM during recovery, learns authoritative HW from leader via Fetch, then applies committed entries
+- [ ] Implement test: crash recovery from snapshot — verify node transitions `Unattached` → `Follower` with HW = `snapshot.metadata.last_included_offset + 1`, does NOT apply post-snapshot entries to SM during recovery, learns authoritative HW from leader via Fetch, then applies committed entries
+- [ ] Implement test: remove voter and verify removed node transitions to `Unattached` (not Follower)
 - [ ] Implement test: stress test — 5-node cluster, 1000 proposals, random node crashes and restarts, random partitions, assert all invariants hold
 
 #### Test Scenarios
@@ -651,7 +664,7 @@
 
 #### Implementation Steps
 - [ ] Add `#![deny(missing_docs)]` to all four crate roots
-- [ ] Write doc-comments for `xraft-core` domain types: `NodeId`, `Term`, `ClusterId`, `Offset`, `LogEntry`, `EntryType`, `VoterInfo`, `VotersRecord`, `ConsensusState`, `QuorumState`, `FollowerProgress`, `AppRecord`, `AppSnapshot` in their respective modules
+- [ ] Write doc-comments for `xraft-core` domain types: `NodeId`, `Term`, `ClusterId`, `Offset`, `LogEntry`, `EntryType`, `VoterInfo`, `VotersRecord`, `ConsensusState`, `QuorumState`, `FollowerProgress`, `AppRecord`, `AppSnapshot`, `Snapshot`, `SnapshotMetadata`, `SnapshotReader`, `SnapshotWriter` in their respective modules
 - [ ] Write doc-comments for `xraft-core` traits: `LogStore`, `QuorumStateStore`, `SnapshotIO`, `Transport`, `Clock`, `StateMachine`, `Listener` and all trait methods in `traits.rs` and `listener.rs`
 - [ ] Write doc-comments for `xraft-core` public API: `RaftNode` methods (`new`, `propose`, `read`, `bootstrap`, `shutdown`), `RaftConfig` fields, `XraftError` variants, RPC message types, and `IoAction` variants
 - [ ] Write doc-comments for `xraft-storage` public API: `StorageEngine`, `SegmentLog`, `SnapshotStore`, `QuorumStateFile`, `LeaderEpochCheckpoint`
