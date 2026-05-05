@@ -18,6 +18,7 @@ network transport, and testing infrastructure.
 ┌──────────────────────────────────────────────────────────────────────┐
 │                        Application Layer                            │
 │           (implements StateMachine + Listener traits)                │
+│           (receives AppRecord only — never control records)         │
 └───────────────────────────┬──────────────────────────────────────────┘
                             │ propose() / read() / callbacks
 ┌───────────────────────────▼──────────────────────────────────────────┐
@@ -32,6 +33,13 @@ network transport, and testing infrastructure.
 │  │  Election    │  │  Replication  │  │  Membership               │  │
 │  │  Manager     │  │  Manager     │  │  Manager                  │  │
 │  └──────────────┘  └──────────────┘  └───────────────────────────┘  │
+│                           │                                          │
+│  ┌──────────────┐  ┌──────▼───────┐  ┌───────────────────────────┐  │
+│  │  Batch       │  │  IoStage     │  │  DeferredCompletion       │  │
+│  │  Accumulator │──│  (concurrent │  │  Queue (park/complete     │  │
+│  │  (stage      │  │   I/O exec)  │  │   client futures)         │  │
+│  │   proposals) │  │              │  │                           │  │
+│  └──────────────┘  └──────┬───────┘  └───────────────────────────┘  │
 └──────────┬──────────────────┬────────────────────┬───────────────────┘
            │                  │                    │
 ┌──────────▼──────┐  ┌───────▼────────┐  ┌────────▼──────────────────┐
@@ -44,13 +52,19 @@ network transport, and testing infrastructure.
 
 **Design philosophy.** The proposed consensus core (`xraft-core`) is driven
 by a single-threaded async event loop — no locks, no shared mutable state.
-The event loop interacts with storage and network exclusively through
-injected async trait objects (`LogStore`, `Transport`, `SnapshotIO`,
-`QuorumStateStore`, `Clock`). It never opens files or sockets directly;
-all concrete I/O is provided by the transport and storage crates at
-construction time. This mirrors KRaft's `KafkaRaftClient` architecture
-and eliminates concurrency bugs in the correctness-critical consensus
-logic while allowing deterministic testing via trait substitution.
+The event loop processes protocol messages and produces `IoAction` values
+that describe the I/O to perform (append log, send RPC, persist quorum
+state). An `IoStage` executes those actions concurrently via the injected
+async trait objects (`LogStore`, `Transport`, `SnapshotIO`,
+`QuorumStateStore`, `Clock`). The event loop never opens files or sockets
+directly; all concrete I/O is provided by the transport and storage crates
+at construction time. Incoming proposals are staged in a `BatchAccumulator`
+and drained on each tick; client futures are parked in a
+`DeferredCompletionQueue` until the high watermark advances past their
+offset. This mirrors KRaft's `KafkaRaftClient` / `BatchAccumulator` /
+`DeferredEventQueue` architecture and eliminates concurrency bugs in the
+correctness-critical consensus logic while preventing slow I/O from
+delaying Fetch processing and triggering spurious elections.
 
 ---
 
@@ -64,9 +78,12 @@ loop `await`s trait methods but never opens files or sockets itself.
 
 | Sub-component | Responsibility |
 |---------------|----------------|
-| **`RaftNode`** | Public API surface. Exposes `propose()`, `read()`, and lifecycle methods. Owns the `EventLoop` and coordinates startup/shutdown. Accepts a generic `StateMachine` type parameter (monomorphised at compile time). |
-| **`EventLoop`** | Single-threaded async loop that drains an inbound message queue and dispatches to the appropriate handler. Every state transition happens here. Uses `tokio::sync::mpsc` for the inbound channel. Runs on a dedicated `tokio` task. Calls storage and transport through injected trait objects (e.g., `LogStore::append()`, `Transport::send()`); these calls are `await`ed but the loop never performs raw I/O itself. |
-| **`ConsensusState`** | The core state: current `term`, `voted_for`, node `role` (Follower / Candidate / Leader), the in-memory log index, `high_watermark`, `log_start_offset`, the voter set, and per-follower replication progress (leader only). |
+| **`RaftNode`** | Public API surface. Exposes `propose()`, `read()`, `bootstrap()`, and lifecycle methods. Owns the `EventLoop` and coordinates startup, shutdown, and crash recovery. Accepts a generic `StateMachine` type parameter (monomorphised at compile time). On construction, executes the recovery sequence (§5.9) before accepting any RPCs. |
+| **`EventLoop`** | Single-threaded async loop that processes protocol state transitions without blocking on I/O. The loop drains an inbound message queue (`tokio::sync::mpsc`) and dispatches to the appropriate handler. **I/O staging model:** The loop never directly awaits `LogStore::append()` or `Transport::send()` inline. Instead, handlers produce `IoAction` values (described below) collected into an `IoActionBatch`. After each message is processed, the loop hands the batch to the `IoStage`, which executes storage and network operations concurrently, then returns results. The loop then applies I/O results (e.g., advancing durable offsets, completing client futures) as synchronous state updates. This prevents slow `fsync` calls from delaying Fetch processing and triggering spurious elections. |
+| **`IoStage`** | Executes `IoAction` batches produced by the `EventLoop`. Each action is one of: `PersistQuorumState(QuorumState)`, `AppendLog(Vec<LogEntry>)`, `TruncateSuffix(u64)`, `TruncatePrefix(u64)`, `SendRpc(NodeId, RpcEnvelope)`, `SaveSnapshot(Snapshot)`, `NotifyListener(ListenerEvent)`. The `IoStage` calls the injected trait objects (`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`) concurrently via `tokio::join!` or `FuturesUnordered`. Storage operations complete with `fsync` before the loop processes the next message that depends on them. |
+| **`BatchAccumulator`** | Stages incoming `propose()` calls into a batch buffer. On each event-loop tick (or when the batch is full), the accumulated entries are drained into a single `AppendLog` I/O action. This amortises `fsync` cost across multiple proposals (group commit). Analogous to KRaft's `BatchAccumulator`. |
+| **`DeferredCompletionQueue`** | Parks `tokio::sync::oneshot` senders keyed by log offset. When the high watermark advances, the queue completes all futures whose offset is now ≤ HW. Analogous to KRaft's `DeferredEventQueue` / purgatory. |
+| **`ConsensusState`** | The core state: current `term`, `voted_for`, node `role` (Follower / Candidate / Leader / Unattached), the in-memory log index, `high_watermark`, `log_start_offset`, the voter set, and per-follower replication progress (leader only). The `Unattached` role is the initial state before bootstrap or recovery completes. |
 | **`ElectionManager`** | Implements Pre-Vote and Vote protocols. Manages election timeouts (randomised 150–300 ms), vote collection, term advancement, and leader-to-follower step-down on Check Quorum failure. |
 | **`ReplicationManager`** | Handles Fetch request/response processing on both leader and follower sides. On the leader: validates fetch offset against the leader-epoch checkpoint, detects log divergence (populates `DivergingEpoch`), tracks follower progress, and advances the high watermark when a majority has replicated. On the follower: sends periodic Fetch RPCs, processes responses, truncates log on divergence, and updates the local high watermark. |
 | **`MembershipManager`** | Processes `AddVoter` / `RemoveVoter` / `UpdateVoter` requests. Enforces single-node-at-a-time changes. Appends `VotersRecord` control entries to the log. Manages observer promotion to voter. Handles leader step-down when the leader is removed from the new configuration. |
@@ -145,10 +162,13 @@ LogEntry {
 ```
 
 `EntryType` variants:
-- **`Command`** — application-level state machine command.
-- **`NoOp`** — blank entry committed by a new leader (`LeaderChangeMessage`
-  equivalent) to establish commit state for the new term.
-- **`VotersRecord`** — control record encoding a membership change.
+- **`Command`** — application-level state machine command (contains an
+  `AppRecord`). The only type delivered to `StateMachine::apply`.
+- **`LeaderChangeMessage`** — no-op control record committed by a new leader
+  to establish commit state for the new term. Handled internally by xraft
+  (updates leader-epoch checkpoint); never reaches the application.
+- **`VotersRecord`** — control record encoding a membership change. Handled
+  internally by xraft (updates voter set); never reaches the application.
 
 #### `VotersRecord`
 
@@ -175,7 +195,7 @@ ConsensusState {
     cluster_id: ClusterId           // cluster identity for fencing
     current_term: Term              // latest term this node has seen
     voted_for: Option<NodeId>       // candidate voted for in current term
-    role: Role                      // Follower | Candidate | Leader
+    role: Role                      // Unattached | Follower | Candidate | Leader
     leader_id: Option<NodeId>       // known leader (if any)
 
     // Log boundaries
@@ -209,20 +229,29 @@ FollowerProgress {
 }
 ```
 
-#### `Snapshot`
+#### `Snapshot` (composite: consensus metadata + application payload)
 
 ```
 SnapshotMetadata {
     last_included_offset: u64       // last log entry included in snapshot
     last_included_term: Term        // term of that entry
     voters: Vec<VoterInfo>          // voter set at snapshot time
+    leader_epoch: Term              // leader epoch at snapshot time
+}
+
+AppSnapshot {
+    data: Vec<u8>                   // serialised application state (opaque to xraft)
 }
 
 Snapshot {
-    metadata: SnapshotMetadata
-    data: Vec<u8>                   // serialised state machine state
+    metadata: SnapshotMetadata      // owned by xraft — consensus state
+    app_snapshot: AppSnapshot       // owned by the application — state machine state
 }
 ```
+
+The split ensures xraft can read consensus metadata (voter set, offsets)
+without deserialising the application payload. On recovery, xraft restores
+its own metadata first, then calls `StateMachine::restore(app_snapshot)`.
 
 #### `QuorumState` (persisted voting state)
 
@@ -236,6 +265,44 @@ QuorumState {
 ```
 
 Persisted separately from the log in the `quorum-state` file.
+
+#### `IoAction` (event loop → I/O stage)
+
+```
+enum IoAction {
+    PersistQuorumState(QuorumState)     // fsync quorum-state file
+    AppendLog(Vec<LogEntry>)            // append + fsync log segment
+    TruncateSuffix(u64)                 // truncate log from offset (divergence)
+    TruncatePrefix(u64)                 // truncate log up to offset (compaction)
+    SendRpc(NodeId, RpcEnvelope)        // send message to peer
+    SaveSnapshot(Snapshot)              // write snapshot atomically
+    NotifyListener(ListenerEvent)       // callback to application
+}
+```
+
+The event loop processes each inbound message (RPC, proposal, timer tick)
+and collects zero or more `IoAction` values into an `IoActionBatch`. After
+the message handler returns, the batch is handed to the `IoStage` for
+concurrent execution. The loop blocks on the `IoStage` result before
+processing the next message, ensuring that all I/O for a given message
+completes before state advances. This staging model keeps the consensus
+state machine purely synchronous while allowing I/O to be parallelised
+(e.g., `fsync` the log and send RPCs concurrently).
+
+#### `AppRecord` and `AppSnapshot` (application-owned types)
+
+```
+AppRecord {
+    data: Bytes                         // opaque serialised command
+}
+
+AppSnapshot {
+    data: Vec<u8>                       // opaque serialised state machine state
+}
+```
+
+These are newtype wrappers. xraft never interprets their contents; it only
+stores, replicates, and delivers them to the application's `StateMachine`.
 
 ### 3.2 RPC Messages
 
@@ -379,28 +446,46 @@ default 256) to the byte position in the `.log` file for fast seeks.
 
 #### `StateMachine` (application → core)
 
+The `StateMachine` trait receives **only application records** (`AppRecord`).
+Consensus control records (`LeaderChangeMessage`, `VotersRecord`) are
+handled internally by xraft and never reach `apply`. This boundary is
+enforced by the `EventLoop`: when the high watermark advances, the loop
+iterates over newly committed `LogEntry` values, applies control records
+internally (e.g., updating the voter set from a `VotersRecord`, recording
+the leader-epoch from a `LeaderChangeMessage`), and calls
+`StateMachine::apply` only for entries whose `entry_type` is `Command`.
+
+Snapshots are split into two parts:
+- **Consensus metadata** (`SnapshotMetadata` — term, offset, voter set,
+  log bounds) owned by xraft.
+- **Application payload** (`AppSnapshot` — opaque bytes) owned by the
+  application via `StateMachine::snapshot()` / `restore()`.
+
 ```rust
 pub trait StateMachine: Send + 'static {
-    /// Apply a committed entry to the state machine.
-    fn apply(&mut self, entry: &LogEntry) -> Result<()>;
+    /// Apply a committed application record to the state machine.
+    /// Control records (NoOp, VotersRecord) are never passed here.
+    fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>;
 
-    /// Take a snapshot of the current state.
-    fn snapshot(&self) -> Result<Snapshot>;
+    /// Take a snapshot of the current application state.
+    fn snapshot(&self) -> Result<AppSnapshot>;
 
-    /// Restore state from a snapshot.
-    fn restore(&mut self, snapshot: Snapshot) -> Result<()>;
+    /// Restore application state from a snapshot.
+    fn restore(&mut self, snapshot: AppSnapshot) -> Result<()>;
 }
 ```
 
-Generic parameter on `RaftNode<SM: StateMachine>` — monomorphised at compile
-time for zero-cost dispatch.
+`AppRecord` is a newtype around `Bytes` — the application's serialised
+command. `AppSnapshot` is likewise opaque bytes. xraft never interprets
+either; it only stores, replicates, and delivers them.
 
 #### `Listener` (core → application callbacks)
 
 ```rust
 pub trait Listener: Send + 'static {
-    /// Called when a batch of entries is committed (HW advanced).
-    fn handle_commit(&mut self, batch: &[LogEntry]);
+    /// Called when a batch of application records is committed (HW advanced).
+    /// Only application records appear here; control records are filtered.
+    fn handle_commit(&mut self, batch: &[(u64, AppRecord)]);
 
     /// Called when a snapshot must be loaded (after FetchSnapshot completes).
     fn handle_load_snapshot(&mut self, reader: SnapshotReader);
@@ -511,39 +596,55 @@ pub trait QuorumStateStore: Send + Sync + 'static {
                      │              Application                       │
                      │ ┌──────────┐            ┌───────────┐          │
                      │ │StateMach.│            │ Listener  │          │
+                     │ │(AppRec   │            │(AppRec    │          │
+                     │ │ only)    │            │  only)    │          │
                      │ └─────┬────┘            └─────┬─────┘          │
                      └───────┼───────────────────────┼────────────────┘
                              │                       │
-               propose()    │    apply/snapshot      │ handle_commit
-               read()       │    restore             │ handle_leader_change
+               propose()    │    apply(AppRecord)    │ handle_commit
+               read()       │    snapshot/restore    │ handle_leader_change
                              │                       │ handle_load_snapshot
                      ┌───────▼───────────────────────▼────────────────┐
                      │                 RaftNode                        │
                      │           ┌──────────────┐                     │
                      │           │  EventLoop   │                     │
-                     │           │ (msg queue)  │                     │
+                     │           │ (msg queue → │                     │
+                     │           │  IoAction    │                     │
+                     │           │  batch)      │                     │
                      │           └──────┬───────┘                     │
                      │    ┌─────────────┼────────────────┐            │
                      │    ▼             ▼                ▼            │
                      │ Election     Replication     Membership        │
                      │ Manager     Manager         Manager            │
                      │    │             │                │            │
-                     └────┼─────────────┼────────────────┼────────────┘
-                          │             │                │
-            ┌─────────────┼─────────────┼────────────────┼─────────┐
-            ▼             ▼             ▼                ▼         ▼
-     ┌────────────┐ ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌────────┐
-     │ Transport  │ │ LogStore │ │SnapshotIO │ │QuorumSt. │ │ Clock  │
-     │  (trait)   │ │ (trait)  │ │  (trait)  │ │  (trait) │ │(trait) │
-     └─────┬──────┘ └────┬─────┘ └─────┬─────┘ └────┬─────┘ └───┬────┘
-           │              │             │             │           │
-           ▼              ▼             ▼             ▼           ▼
-     ┌──────────┐  ┌───────────┐ ┌───────────┐ ┌──────────┐ ┌────────┐
-     │TcpTrans- │  │SegmentLog │ │ Snapshot-  │ │QuorumSt- │ │Tokio-  │
-     │port      │  │           │ │ Store      │ │ateFile   │ │Clock   │
-     │(or Chan- │  │(+Segment  │ │            │ │          │ │(or Sim-│
-     │nelTrans.)│  │  Index)   │ │            │ │          │ │ulated) │
-     └──────────┘  └───────────┘ └───────────┘ └──────────┘ └────────┘
+                     │    └──────┬──────┘────────────────┘            │
+                     │           ▼                                    │
+                     │   ┌──────────────┐  ┌─────────────────────┐   │
+                     │   │BatchAccum.   │  │ DeferredCompletion  │   │
+                     │   │(stage writes)│  │ Queue (park futures)│   │
+                     │   └──────┬───────┘  └─────────────────────┘   │
+                     │          ▼                                     │
+                     │   ┌──────────────┐                             │
+                     │   │  IoStage     │ ◄── executes IoAction      │
+                     │   │  (concurrent │     batch after each       │
+                     │   │   I/O exec)  │     event-loop tick        │
+                     │   └──────┬───────┘                             │
+                     └──────────┼──────────────────────────────────────┘
+                                │
+          ┌─────────────────────┼───────────────────────────────────┐
+          ▼             ▼       ▼             ▼                     ▼
+   ┌────────────┐ ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌────────┐
+   │ Transport  │ │ LogStore │ │SnapshotIO │ │QuorumSt. │ │ Clock  │
+   │  (trait)   │ │ (trait)  │ │  (trait)  │ │  (trait) │ │(trait) │
+   └─────┬──────┘ └────┬─────┘ └─────┬─────┘ └────┬─────┘ └───┬────┘
+         │              │             │             │           │
+         ▼              ▼             ▼             ▼           ▼
+   ┌──────────┐  ┌───────────┐ ┌───────────┐ ┌──────────┐ ┌────────┐
+   │TcpTrans- │  │SegmentLog │ │ Snapshot-  │ │QuorumSt- │ │Tokio-  │
+   │port      │  │           │ │ Store      │ │ateFile   │ │Clock   │
+   │(or Chan- │  │(+Segment  │ │            │ │          │ │(or Sim-│
+   │nelTrans.)│  │  Index)   │ │            │ │          │ │ulated) │
+   └──────────┘  └───────────┘ └───────────┘ └──────────┘ └────────┘
 ```
 
 ### 4.3 Proposed Crate Dependency Graph
@@ -974,65 +1075,259 @@ within the election timeout window. If the count is below majority
 (`⌊V/2⌋ + 1` where V is the voter count), the leader steps down to
 follower to prevent split-brain.
 
-### 5.7 Client Proposal (Full Path)
+### 5.7 Client Proposal (Full Path — with I/O Staging)
 
 End-to-end flow from client command to committed state machine application.
-The `EventLoop` calls `LogStore` through the injected trait object (shown
-as `LogStore (trait)`). No raw I/O occurs inside `xraft-core`.
+The `EventLoop` produces `IoAction` values; the `IoStage` executes them
+via injected trait objects. No raw I/O occurs inside `xraft-core`.
 
 ```
-    Client              RaftNode              EventLoop        LogStore (trait)
-      │                    │                      │                    │
-      │── propose(cmd) ───►│                      │                    │
-      │                    │                      │                    │
-      │                    │── Propose(cmd) ──────►│                    │
-      │                    │   (via mpsc channel)  │                    │
-      │                    │                       │                    │
-      │                    │                 ┌─────┴──────┐            │
-      │                    │                 │ Am I       │            │
-      │                    │                 │ leader?    │            │
-      │                    │                 │ YES        │            │
-      │                    │                 │            │            │
-      │                    │                 │ Create     │            │
-      │                    │                 │ LogEntry   │            │
-      │                    │                 │ off=N,     │            │
-      │                    │                 │ term=T     │            │
-      │                    │                 └─────┬──────┘            │
-      │                    │                       │                    │
-      │                    │                       │── .append(entry)──►│
-      │                    │                       │   (await trait     │
-      │                    │                       │    method)         │
-      │                    │                       │◄── Ok (fsync'd) ──│
-      │                    │                       │                    │
-      │                    │                 ┌─────┴──────┐            │
-      │                    │                 │ Register   │            │
-      │                    │                 │ pending    │            │
-      │                    │                 │ proposal   │            │
-      │                    │                 │ (off=N,    │            │
-      │                    │                 │  oneshot)  │            │
-      │                    │                 └─────┬──────┘            │
-      │                    │                       │                    │
-      │                    │     ... followers fetch entry N ...       │
-      │                    │     ... HW advances to N ...              │
-      │                    │                       │                    │
-      │                    │                 ┌─────┴──────┐            │
-      │                    │                 │ HW ≥ N     │            │
-      │                    │                 │ Apply to   │            │
-      │                    │                 │ state mach.│            │
-      │                    │                 │ Notify     │            │
-      │                    │                 │ Listener   │            │
-      │                    │                 │ Complete   │            │
-      │                    │                 │ oneshot    │            │
-      │                    │                 └─────┬──────┘            │
-      │                    │                       │                    │
-      │                    │◄── Result ────────────│                    │
-      │                    │                       │                    │
-      │◄── Ok(result) ────│                       │                    │
-      │                    │                       │                    │
+    Client          RaftNode       EventLoop       BatchAccum.   IoStage        LogStore
+      │                │               │               │            │              │
+      │── propose(cmd)►│               │               │            │              │
+      │                │               │               │            │              │
+      │                │── Propose ───►│               │            │              │
+      │                │  (mpsc chan.) │               │            │              │
+      │                │               │               │            │              │
+      │                │         ┌─────┴──────┐        │            │              │
+      │                │         │ Am I       │        │            │              │
+      │                │         │ leader?    │        │            │              │
+      │                │         │ YES        │        │            │              │
+      │                │         └─────┬──────┘        │            │              │
+      │                │               │               │            │              │
+      │                │               │── stage(cmd)─►│            │              │
+      │                │               │               │            │              │
+      │                │               │  Park oneshot in            │              │
+      │                │               │  DeferredCompletionQueue    │              │
+      │                │               │  (keyed by offset N)       │              │
+      │                │               │               │            │              │
+      │                │         ┌─────┴──────┐        │            │              │
+      │                │         │ Tick: drain │        │            │              │
+      │                │         │ batch       │        │            │              │
+      │                │         └─────┬──────┘        │            │              │
+      │                │               │               │            │              │
+      │                │               │◄─ entries ────│            │              │
+      │                │               │  (drained)    │            │              │
+      │                │               │               │            │              │
+      │                │               │── IoAction::  │            │              │
+      │                │               │  AppendLog ───┼───────────►│              │
+      │                │               │               │            │── .append()─►│
+      │                │               │               │            │  (await)     │
+      │                │               │               │            │◄─ Ok(fsync)─│
+      │                │               │◄─ IoResult ───┼────────────│              │
+      │                │               │  (durable)    │            │              │
+      │                │               │               │            │              │
+      │                │       ... followers fetch entry N ...      │              │
+      │                │       ... HW advances to N ...             │              │
+      │                │               │               │            │              │
+      │                │         ┌─────┴──────┐        │            │              │
+      │                │         │ HW ≥ N     │        │            │              │
+      │                │         │ Filter:    │        │            │              │
+      │                │         │  Control → │        │            │              │
+      │                │         │  internal  │        │            │              │
+      │                │         │  Command → │        │            │              │
+      │                │         │  SM.apply  │        │            │              │
+      │                │         │ Notify     │        │            │              │
+      │                │         │  Listener  │        │            │              │
+      │                │         │ Complete   │        │            │              │
+      │                │         │  oneshot   │        │            │              │
+      │                │         └─────┬──────┘        │            │              │
+      │                │               │               │            │              │
+      │                │◄── Result ────│               │            │              │
+      │                │               │               │            │              │
+      │◄── Ok(result) ─│               │               │            │              │
+      │                │               │               │            │              │
 ```
 
 If the node is not the leader, `propose()` returns
 `Err(NotLeader { leader_id })` so the client can redirect.
+
+### 5.8 Cluster Bootstrap
+
+A fresh cluster with no prior state. Each node is configured with a static
+initial voter set and a shared `cluster_id`. All nodes start in the
+`Unattached` role and transition to `Follower` once bootstrap completes.
+
+```
+    Node N1 (Unattached)         Node N2 (Unattached)       Node N3 (Unattached)
+         │                            │                          │
+   ┌─────┴──────┐              ┌──────┴──────┐           ┌──────┴──────┐
+   │ Startup:   │              │ Startup:    │           │ Startup:    │
+   │ 1. No      │              │ Same as N1  │           │ Same as N1  │
+   │  quorum-st │              └──────┬──────┘           └──────┬──────┘
+   │  file →    │                     │                         │
+   │  term=0    │                     │                         │
+   │ 2. No      │                     │                         │
+   │  snapshot  │                     │                         │
+   │ 3. Empty   │                     │                         │
+   │  log       │                     │                         │
+   │ 4. Load    │                     │                         │
+   │  bootstrap │                     │                         │
+   │  voter set │                     │                         │
+   │  from      │                     │                         │
+   │  config    │                     │                         │
+   │ 5. Set     │                     │                         │
+   │  role ←    │                     │                         │
+   │  Follower  │                     │                         │
+   │ 6. Start   │                     │                         │
+   │  election  │                     │                         │
+   │  timer     │                     │                         │
+   └─────┬──────┘                     │                         │
+         │                            │                         │
+         │  (N1's election timeout expires first)               │
+         │                            │                         │
+         │── VoteRequest(term=1) ────►│                         │
+         │── VoteRequest(term=1) ─────┼────────────────────────►│
+         │                            │                         │
+         │◄─ VoteResponse(granted) ──│                         │
+         │◄─ VoteResponse(granted) ──┼─────────────────────────│
+         │                            │                         │
+   ┌─────┴──────┐                     │                         │
+   │ Become     │                     │                         │
+   │ LEADER     │                     │                         │
+   │ term=1     │                     │                         │
+   │            │                     │                         │
+   │ Append:    │                     │                         │
+   │ 1. Leader- │                     │                         │
+   │  ChangeMes.│                     │                         │
+   │  @off=0    │                     │                         │
+   │ 2. Voters- │                     │                         │
+   │  Record    │                     │                         │
+   │  @off=1    │                     │                         │
+   │  voters=   │                     │                         │
+   │  [N1,N2,N3]│                     │                         │
+   └─────┬──────┘                     │                         │
+         │                            │                         │
+         │  ◄── Fetch(off=0) ────────│                         │
+         │── FetchResp(entries 0,1) ─►│                         │
+         │                            │                         │
+         │  ◄── Fetch(off=0) ─────────┼────────────────────────│
+         │── FetchResp(entries 0,1) ──┼───────────────────────►│
+         │                            │                         │
+   ┌─────┴──────┐                     │                         │
+   │ HW ← 1    │                     │                         │
+   │ VotersRec  │                     │                         │
+   │ committed. │                     │                         │
+   │ Cluster is │                     │                         │
+   │ fully      │                     │                         │
+   │ bootstrap. │                     │                         │
+   └─────┬──────┘                     │                         │
+         │                            │                         │
+```
+
+**Bootstrap invariants:**
+- A node with no `quorum-state` file and no log is considered uninitialized.
+  It obtains its voter set from the static configuration (not from the log).
+- Once the initial `VotersRecord` is committed, the cluster is bootstrapped.
+  Subsequent voter-set changes use `AddVoter` / `RemoveVoter` RPCs.
+- The `cluster_id` is set once at bootstrap and included in every RPC. Nodes
+  reject RPCs with a mismatched `cluster_id`.
+
+### 5.9 Crash Recovery
+
+A node that was previously running crashes (or is stopped) and restarts.
+Recovery restores durable state and re-enters the cluster as a follower.
+
+```
+    Recovering Node N2           Running Leader N1
+         │                            │
+   ┌─────┴───────────────────┐        │
+   │ Phase 1: Restore        │        │
+   │ quorum state            │        │
+   │                         │        │
+   │ Read quorum-state file: │        │
+   │  current_term = 5       │        │
+   │  voted_for = N1         │        │
+   │  leader_epoch = 4       │        │
+   └─────┬───────────────────┘        │
+         │                            │
+   ┌─────┴───────────────────┐        │
+   │ Phase 2: Restore log    │        │
+   │ and snapshot             │        │
+   │                         │        │
+   │ a. Load latest snapshot │        │
+   │    (if any):            │        │
+   │    last_included_off=80 │        │
+   │    last_included_term=3 │        │
+   │    voters=[N1,N2,N3]    │        │
+   │                         │        │
+   │ b. Restore state mach.  │        │
+   │    from AppSnapshot     │        │
+   │                         │        │
+   │ c. Scan log segments    │        │
+   │    from offset 81.      │        │
+   │    Verify CRC per batch.│        │
+   │    Truncate at first    │        │
+   │    corrupt/partial rec. │        │
+   │    Entries found:       │        │
+   │    81..95 (valid)       │        │
+   │                         │        │
+   │ d. Replay committed     │        │
+   │    entries (81..HW) to  │        │
+   │    state machine via    │        │
+   │    apply():             │        │
+   │    - Command entries →  │        │
+   │      StateMachine.apply │        │
+   │    - VotersRecord →     │        │
+   │      update voter set   │        │
+   │    - LeaderChangeMes. → │        │
+   │      update leader-     │        │
+   │      epoch checkpoint   │        │
+   │                         │        │
+   │ e. Rebuild leader-epoch │        │
+   │    checkpoint from log  │        │
+   └─────┬───────────────────┘        │
+         │                            │
+   ┌─────┴───────────────────┐        │
+   │ Phase 3: Resume as      │        │
+   │ Follower                │        │
+   │                         │        │
+   │ Set role ← Follower     │        │
+   │ (NEVER resume as leader │        │
+   │  regardless of prior    │        │
+   │  role; must re-win      │        │
+   │  election)              │        │
+   │                         │        │
+   │ Start election timer    │        │
+   │ Begin accepting RPCs    │        │
+   └─────┬───────────────────┘        │
+         │                            │
+         │── FetchRequest ───────────►│
+         │   (fetch_offset=96,        │
+         │    last_fetched_epoch=5)   │
+         │                            │
+         │◄─ FetchResponse ──────────│
+         │   entries=[96..100],       │
+         │   HW=100                   │
+         │                            │
+   ┌─────┴───────────────────┐        │
+   │ Apply newly fetched     │        │
+   │ entries. Filter:        │        │
+   │ - Command → SM.apply    │        │
+   │ - Control → internal    │        │
+   │ Advance local HW.      │        │
+   │ Normal operation.       │        │
+   └─────┬───────────────────┘        │
+         │                            │
+```
+
+**Recovery invariants:**
+- A recovering node **always** starts as Follower, regardless of its prior
+  role. It must win a new election to become leader.
+- `current_term` and `voted_for` are read from the `quorum-state` file
+  before any RPC is processed. This prevents double-voting.
+- Log integrity is verified via CRC-32C checksums. The first corrupt or
+  incomplete batch causes truncation of that batch and everything after it.
+  Only committed entries (offset < HW at crash time) are guaranteed to
+  survive; uncommitted tail entries may be lost (which is safe — they were
+  never committed).
+- The high watermark is **not** persisted. On recovery, the node sets its
+  HW to the snapshot's `last_included_offset` and advances it as committed
+  entries are replayed. The authoritative HW comes from the leader via
+  subsequent Fetch responses.
+- If the log is entirely behind the leader's LSO, the node receives a
+  `SnapshotId` in the Fetch response and falls back to snapshot transfer
+  (§5.4).
 
 ---
 
@@ -1041,9 +1336,9 @@ If the node is not the leader, `propose()` returns
 ### 6.1 Persistence Guarantees
 
 Every write path that affects correctness calls `fsync` before
-acknowledgement. The `EventLoop` invokes these operations through the
-injected trait objects — the concrete `fsync` implementation lives in
-`xraft-storage`, not in `xraft-core`:
+acknowledgement. The `EventLoop` produces `IoAction` values; the `IoStage`
+executes them via injected trait objects. The concrete `fsync`
+implementation lives in `xraft-storage`, not in `xraft-core`:
 
 | Write | When | Guarantee |
 |-------|------|-----------|
@@ -1102,23 +1397,36 @@ All crate names, trait definitions, and module structures below are
   `RemoveVoter`, `UpdateVoter`.
 - **Pull-based replication** per §3 Non-Goals item 2 — no `AppendEntries`.
 - **Serialisation** uses `serde` + `bincode` per §6 Key Design Decisions.
-- **State machine interface** is generic (monomorphised) per §6.
+- **State machine interface** is generic (monomorphised) per §6. The trait
+  receives only `AppRecord` values; control records (`LeaderChangeMessage`,
+  `VotersRecord`) are handled internally by xraft and never reach `apply`.
+  This matches §2.1.1: "Control records are owned by xraft and are never
+  exposed to the application's `StateMachine::apply`." Snapshots are split:
+  `SnapshotMetadata` (consensus) and `AppSnapshot` (application).
 - **Segment-file log storage** per §6.
-- **I/O-abstract event loop** per §4.4 — the event loop `await`s injected
-  trait objects for storage and transport; it never opens files or sockets
-  directly. This enables deterministic testing via trait substitution
-  (see `xraft-test`).
+- **I/O staging** per §4.4.1 — the event loop produces `IoAction` values
+  and the `IoStage` executes them via injected trait objects. The loop never
+  directly awaits I/O inline. `BatchAccumulator` stages proposals before
+  draining (group commit); `DeferredCompletionQueue` parks client futures.
+  This matches the tech spec's description of `BatchAccumulator` and
+  `DeferredEventQueue` patterns.
 - **Timing parameters** (150–300 ms election timeout, 50 ms fetch interval)
   per §4.3.
 - **Quorum math** — majority is `⌊V/2⌋ + 1`; HW advancement uses
   descending-sorted voter offsets at index `⌊V/2⌋`. Consistent with
   §2.1.1 of the tech spec.
+- **Bootstrap & recovery** (§5.8, §5.9) align with tech spec §2.1.7.
+  Bootstrap uses static voter set → leader commits `VotersRecord`. Recovery
+  reads `quorum-state` → loads snapshot → replays log → resumes as follower.
 
 ### Open Items for Sibling Documents
 
 - `implementation-plan.md`: This architecture defines WHAT to build.
   The implementation plan should sequence the work — likely core election →
   log replication → persistence → snapshot → membership → simulation harness.
-- `e2e-scenarios.md`: Sequence flows §5.1–§5.7 here define the "happy path"
-  and key failure modes. The E2E document should define concrete test
-  scenarios with expected assertions for each flow.
+  The `IoStage` and `BatchAccumulator` should be implemented in the core
+  replication phase (they are not optional add-ons).
+- `e2e-scenarios.md`: Sequence flows §5.1–§5.9 here define the "happy path"
+  and key failure modes including bootstrap (§5.8) and crash recovery (§5.9).
+  The E2E document should define concrete test scenarios with expected
+  assertions for each flow.
