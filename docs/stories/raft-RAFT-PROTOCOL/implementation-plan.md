@@ -33,10 +33,11 @@
 - [ ] Create `xraft-core/Cargo.toml` with dependencies: `tokio`, `serde`, `bincode`, `bytes`, `tracing`
 - [ ] Create `xraft-storage/Cargo.toml` with dependency on `xraft-core`
 - [ ] Create `xraft-transport/Cargo.toml` with dependency on `xraft-core`
-- [ ] Create `xraft-test/Cargo.toml` with dev-dependency on all three crates
+- [ ] Create `xraft-test/Cargo.toml` with regular (non-dev) dependencies on `xraft-core`, `xraft-storage`, and `xraft-transport` — `xraft-test` is a test-utility crate that exports in-memory backends and `SimulatedClock`, so these must be regular dependencies (not dev-dependencies) to be available when other crates add `xraft-test` as a dev-dependency
 - [ ] Add workspace-level settings: `edition = "2021"`, `resolver = "2"`, `[workspace.lints.clippy] all = "deny"`
+- [ ] Create stub `lib.rs` files in each crate directory: `xraft-core/src/lib.rs`, `xraft-storage/src/lib.rs`, `xraft-transport/src/lib.rs`, `xraft-test/src/lib.rs` — each starts as an empty file so the workspace compiles before any domain types are added in later stages
 - [ ] Create `.github/workflows/ci.yml` with `cargo build --workspace`, `cargo test --workspace`, and `cargo clippy --workspace -- -D warnings`
-- [ ] Verify `cargo check --workspace` passes with empty `lib.rs` files in each crate
+- [ ] Verify `cargo check --workspace` passes with the stub `lib.rs` files
 
 #### Test Scenarios
 - [ ] Scenario: Workspace compiles — Given the root `Cargo.toml` and four crate stubs, When `cargo check --workspace` is run, Then it exits with code 0 and no errors
@@ -596,15 +597,17 @@
 
 #### Implementation Steps
 - [ ] Create `xraft-test/src/invariant_checker.rs` implementing `InvariantChecker`
-- [ ] Implement check: at most one leader per term across all nodes
-- [ ] Implement check: log matching — if two nodes have an entry at the same index and term, all preceding entries match
-- [ ] Implement check: leader completeness — elected leader's log contains all previously committed entries
-- [ ] Implement check: state machine safety — no two nodes have applied different entries at the same index
+- [ ] Implement check: (1) at most one leader per term across all nodes
+- [ ] Implement check: (2) append-only leader log — a leader never overwrites or deletes its own log entries (architecture §2.4, tech-spec §2.1.1 invariant 2); verified by recording the leader's log after each append and asserting no prior entry changes
+- [ ] Implement check: (3) log matching — if two nodes have an entry at the same offset and term, all preceding entries match
+- [ ] Implement check: (4) leader completeness — elected leader's log contains all previously committed entries
+- [ ] Implement check: (5) state machine safety — no two nodes have applied different entries at the same offset
 - [ ] Wire `InvariantChecker` into `SimulatedCluster` to run after every state transition (configurable)
 
 #### Test Scenarios
-- [ ] Scenario: Invariant pass — Given a healthy 3-node cluster after 100 proposals, When `InvariantChecker` runs, Then all five Raft invariants pass
-- [ ] Scenario: Invariant violation detection — Given a deliberately buggy `ElectionManager` that allows two leaders in the same term (injected for testing), When `InvariantChecker` runs, Then it panics with "at most one leader per term" violation
+- [ ] Scenario: All five invariants pass — Given a healthy 3-node cluster after 100 proposals, When `InvariantChecker` runs, Then all five Raft invariants pass: (1) at most one leader per term, (2) append-only leader log, (3) leader completeness, (4) log matching, (5) state machine safety
+- [ ] Scenario: Append-only leader violation detection — Given a deliberately buggy `ReplicationManager` that allows the leader to overwrite a previously-appended entry (injected for testing), When `InvariantChecker` runs, Then it panics with "append-only leader log" violation
+- [ ] Scenario: Election safety violation detection — Given a deliberately buggy `ElectionManager` that allows two leaders in the same term (injected for testing), When `InvariantChecker` runs, Then it panics with "at most one leader per term" violation
 
 ---
 
