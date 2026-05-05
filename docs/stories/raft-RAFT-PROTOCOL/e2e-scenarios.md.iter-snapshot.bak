@@ -4,8 +4,7 @@
 >
 > **Sibling documents:** [tech-spec.md](./tech-spec.md) ·
 > [architecture.md](./architecture.md) ·
-> [implementation-plan.md](./implementation-plan.md) *(not yet authored —
-> will be referenced once available)*
+> [implementation-plan.md](./implementation-plan.md)
 >
 > This document defines Gherkin-style end-to-end scenarios for the xraft
 > library. Every scenario is executable against the **deterministic simulation
@@ -100,8 +99,8 @@ Feature: Leader Election
     And N2's votedFor remains N1
 
   Scenario: Candidate with incomplete log is rejected
-    Given N1's log contains entries up to index 10, term 3
-    And N2's log contains entries up to index 8, term 3
+    Given N1's log contains entries up to offset 10, term 3
+    And N2's log contains entries up to offset 8, term 3
     When N2 becomes a candidate and sends Vote RPCs for term 4
     Then N1 rejects the vote because N2's log is less up-to-date
     And leader completeness invariant is preserved
@@ -185,10 +184,10 @@ Feature: Pre-Vote Protocol
 
   Scenario: Pre-vote responder grants vote only if candidate log is up-to-date
     Given N1 is partitioned from the cluster (but not crashed)
-    And N2's log contains entries up to index 5, term 3
-    And N3's log contains entries up to index 8, term 3
+    And N2's log contains entries up to offset 5, term 3
+    And N3's log contains entries up to offset 8, term 3
     When N2 sends Vote RPCs with is_pre_vote=true for term 3
-    Then N3 rejects the pre-vote because N2's log (index 5) is less up-to-date than N3's (index 8)
+    Then N3 rejects the pre-vote because N2's log (offset 5) is less up-to-date than N3's (offset 8)
     And N2 cannot proceed to a full election
 ```
 
@@ -211,16 +210,16 @@ Feature: Pull-Based Log Replication
   Scenario: Single entry replication via Fetch
     Given the log is empty across all nodes
     When a client proposes command "set x=1" to N1
-    Then N1 appends "set x=1" at index 1, term 1 to its log
+    Then N1 appends "set x=1" at offset 1, term 1 to its log
     When N2 sends a Fetch RPC to N1 with offset 0
-    Then N1 responds with entry [index 1, term 1, "set x=1"]
+    Then N1 responds with entry [offset 1, term 1, "set x=1"]
     And N2 appends the entry to its local log
     When N3 sends a Fetch RPC to N1 with offset 0
-    Then N1 responds with entry [index 1, term 1, "set x=1"]
+    Then N1 responds with entry [offset 1, term 1, "set x=1"]
     And N3 appends the entry to its local log
 
   Scenario: Batch replication — multiple entries in one Fetch
-    Given the leader N1 has entries at indices 1–5 in its log
+    Given the leader N1 has entries at offsets 1–5 in its log
     And N2's log is empty
     When N2 sends a Fetch RPC to N1 with offset 0
     Then N1 responds with entries [1, 2, 3, 4, 5]
@@ -275,47 +274,47 @@ Feature: High Watermark Advancement
     And the quorum size is 2 (majority of 3)
 
   Scenario: High watermark advances after majority Fetch (3-node)
-    Given N1 has entry at index 1, term 1
+    Given N1 has entry at offset 1, term 1
     And the high watermark (HW) is 0
-    When N2 sends a Fetch RPC and receives entry at index 1
-    Then N1 records that N2 has replicated up to index 1
-    And a majority (N1 + N2 = 2 of 3) has replicated index 1
+    When N2 sends a Fetch RPC and receives entry at offset 1
+    Then N1 records that N2 has replicated up to offset 1
+    And a majority (N1 + N2 = 2 of 3) has replicated offset 1
     And N1 advances the HW to 1
     When N3 sends a Fetch RPC
-    Then N3 receives entry at index 1 AND the updated HW = 1
-    And N3 applies entry at index 1 to its state machine
+    Then N3 receives entry at offset 1 AND the updated HW = 1
+    And N3 applies entry at offset 1 to its state machine
 
   Scenario: Two Fetch rounds required for follower to see commit
-    Given N1 has entry at index 1, term 1
+    Given N1 has entry at offset 1, term 1
     And the HW is 0
-    When N2 sends a Fetch RPC and receives entry at index 1 with HW = 0
+    When N2 sends a Fetch RPC and receives entry at offset 1 with HW = 0
     Then N2 has the entry but does NOT apply it (HW is still 0)
     When N1 advances HW to 1 (majority replicated)
     And N2 sends another Fetch RPC
     Then N2 receives HW = 1 in the response
-    And N2 applies entry at index 1 to its state machine
+    And N2 applies entry at offset 1 to its state machine
 
   Scenario: HW does not advance without majority
     Given a 5-node cluster [N1, N2, N3, N4, N5]
-    And N1 is Leader with entry at index 1
-    When only N2 has Fetched index 1 (2 of 5 — not a majority)
+    And N1 is Leader with entry at offset 1
+    When only N2 has Fetched offset 1 (2 of 5 — not a majority)
     Then the HW remains at 0
     And the entry is NOT committed
 
   Scenario: HW advances in a 5-node cluster with 3 replicas
     Given a 5-node cluster [N1, N2, N3, N4, N5]
-    And N1 is Leader with entry at index 1
-    When N2 and N3 have Fetched index 1 (N1 + N2 + N3 = 3 of 5 — majority)
+    And N1 is Leader with entry at offset 1
+    When N2 and N3 have Fetched offset 1 (N1 + N2 + N3 = 3 of 5 — majority)
     Then the HW advances to 1
     And the entry is committed
     And N4 and N5 do not need to Fetch for the entry to be committed
 
   Scenario: No-op entry committed on leader start advances HW
     Given N1 has just won election for term 2
-    And N1 appends a no-op LeaderChangeMessage at index 5, term 2
-    When N2 Fetches and replicates up to index 5
+    And N1 appends a no-op LeaderChangeMessage at offset 5, term 2
+    When N2 Fetches and replicates up to offset 5
     Then the HW advances to 5
-    And all entries up to index 5 (including uncommitted entries from term 1) are now committed
+    And all entries up to offset 5 (including uncommitted entries from term 1) are now committed
 ```
 
 ---
@@ -332,23 +331,23 @@ Feature: Log Divergence and Truncation
     Given a 3-node cluster [N1, N2, N3]
 
   Scenario: Follower truncates divergent entries on DivergingEpoch
-    Given N1 was Leader for term 1 and appended entries at indices 1–5
+    Given N1 was Leader for term 1 and appended entries at offsets 1–5
     And N2 replicated entries 1–3 but N1 crashed before entries 4–5 were committed
-    And N3 becomes Leader for term 2 and appends new entries at indices 4–6
+    And N3 becomes Leader for term 2 and appends new entries at offsets 4–6
     When N2 sends a Fetch RPC to N3 (new leader)
-    And N3 detects that N2's entry at index 4 has term 1 instead of term 2
+    And N3 detects that N2's entry at offset 4 has term 1 instead of term 2
     Then N3 responds with DivergingEpoch indicating the divergence point
-    And N2 truncates its log from index 4 onward
-    And N2 Fetches the correct entries at indices 4–6 from N3
+    And N2 truncates its log from offset 4 onward
+    And N2 Fetches the correct entries at offsets 4–6 from N3
 
   Scenario: Multiple Fetch rounds to resolve deep divergence
-    Given N2 has entries at indices 1–10 from terms [1,1,1,2,2,2,3,3,3,3]
-    And the new leader N3 has entries at indices 1–8 from terms [1,1,1,2,2,2,4,4]
+    Given N2 has entries at offsets 1–10 from terms [1,1,1,2,2,2,3,3,3,3]
+    And the new leader N3 has entries at offsets 1–8 from terms [1,1,1,2,2,2,4,4]
     When N2 sends a Fetch RPC to N3
-    Then N3 responds with DivergingEpoch for term 3 (N2's entries at indices 7–10)
-    And N2 truncates indices 7–10
+    Then N3 responds with DivergingEpoch for term 3 (N2's entries at offsets 7–10)
+    And N2 truncates offsets 7–10
     When N2 sends another Fetch RPC
-    Then N3 responds with entries at indices 7–8 from term 4
+    Then N3 responds with entries at offsets 7–8 from term 4
     And N2's log now matches the leader's
 
   Scenario: Leader validates Fetch against leader-epoch-checkpoint
@@ -360,10 +359,10 @@ Feature: Log Divergence and Truncation
     And N1 responds with DivergingEpoch so N2 can truncate back to offset 12
 
   Scenario: No divergence — follower log is a prefix of leader log
-    Given N1 is Leader with entries at indices 1–10
-    And N2 has entries at indices 1–7 (all matching the leader)
+    Given N1 is Leader with entries at offsets 1–10
+    And N2 has entries at offsets 1–7 (all matching the leader)
     When N2 sends a Fetch RPC with offset 7
-    Then N1 responds with entries at indices 8–10 (no DivergingEpoch)
+    Then N1 responds with entries at offsets 8–10 (no DivergingEpoch)
     And N2 appends the new entries normally
 ```
 
@@ -436,7 +435,7 @@ Feature: Persistence and Crash Recovery
     And all persistence uses fsync to stable storage
 
   Scenario: Leader crash and recovery — follower catches up
-    Given N1 is Leader for term 3 with committed entries at indices 1–10
+    Given N1 is Leader for term 3 with committed entries at offsets 1–10
     When N1 crashes and restarts
     Then N1 reads its persisted currentTerm (3), votedFor, and log from disk
     And N1 starts as a Follower (does not assume leadership)
@@ -452,25 +451,25 @@ Feature: Persistence and Crash Recovery
     And N2 rejects N3's vote because it already voted for N1 this term
 
   Scenario: Log entries survive node crash
-    Given N2 has replicated entries at indices 1–8 and persisted them to disk
+    Given N2 has replicated entries at offsets 1–8 and persisted them to disk
     When N2 crashes and restarts
-    Then N2's log contains entries at indices 1–8 (recovered from disk)
+    Then N2's log contains entries at offsets 1–8 (recovered from disk)
     And N2 can resume Fetching from the leader at offset 8
 
   Scenario: Uncommitted entries from crashed leader are preserved
-    Given N1 was Leader for term 2 and appended entry at index 5 but it was not committed
+    Given N1 was Leader for term 2 and appended entry at offset 5 but it was not committed
     When N1 crashes and N3 becomes Leader for term 3
-    And N3's log does not contain index 5 from term 2
+    And N3's log does not contain offset 5 from term 2
     And N1 restarts and Fetches from N3
-    Then N1 receives DivergingEpoch and truncates index 5
+    Then N1 receives DivergingEpoch and truncates offset 5
     And N1's log now matches N3's
 
   Scenario: All nodes crash and recover (full cluster restart)
-    Given all three nodes have committed entries at indices 1–10
+    Given all three nodes have committed entries at offsets 1–10
     When all nodes crash simultaneously and restart
     Then each node recovers its currentTerm, votedFor, and log from stable storage
     And a new election occurs
-    And the winning leader has all committed entries (indices 1–10)
+    And the winning leader has all committed entries (offsets 1–10)
     And normal operation resumes with no data loss
 
   Scenario: fsync failure is treated as fatal
@@ -496,21 +495,21 @@ Feature: Log Compaction and Snapshots
     And N1 is Leader for term 1
 
   Scenario: Node takes a snapshot and truncates the log
-    Given N1 has committed entries at indices 1–100
-    And N1's state machine has applied all entries up to index 100
+    Given N1 has committed entries at offsets 1–100
+    And N1's state machine has applied all entries up to offset 100
     When the snapshot threshold is reached (e.g., every 100 entries)
     Then N1 writes a snapshot to stable storage containing:
       | Field            | Value                       |
-      | lastAppliedIndex | 100                         |
-      | lastAppliedTerm  | 1                           |
+      | last_included_offset | 100                         |
+      | last_included_term | 1                           |
       | voterSet         | [N1, N2, N3]                |
-      | stateMachineData | <serialised state at idx 100> |
+      | stateMachineData | <serialised state at offset 100> |
     And N1 truncates log entries 1–100
     And N1's log start offset (LSO) advances to 101
 
   Scenario: Snapshot is consistent because logs are consistent
-    Given N1, N2, and N3 have all committed entries at indices 1–100
-    When each node independently takes a snapshot at index 100
+    Given N1, N2, and N3 have all committed entries at offsets 1–100
+    When each node independently takes a snapshot at offset 100
     Then all three snapshots contain identical state machine data
     And each node truncates its own log independently
 
@@ -521,11 +520,11 @@ Feature: Log Compaction and Snapshots
     And on crash recovery, N2 can reconstruct the voter configuration from the snapshot
 
   Scenario: New entries arrive after snapshot
-    Given N1 has taken a snapshot at index 100 and truncated entries 1–100
+    Given N1 has taken a snapshot at offset 100 and truncated entries 1–100
     When a client proposes command "set y=2"
-    Then N1 appends the entry at index 101, term 1
+    Then N1 appends the entry at offset 101, term 1
     And the entry is replicated and committed normally
-    And the log contains only entries from index 101 onward
+    And the log contains only entries from offset 101 onward
 ```
 
 ---
@@ -544,22 +543,22 @@ Feature: Snapshot Transfer
     And N1 is Leader for term 1
 
   Scenario: Follower receives snapshot when log entries are compacted
-    Given N1 has committed entries at indices 1–200
-    And N1 has taken a snapshot at index 150 and truncated entries 1–150
+    Given N1 has committed entries at offsets 1–200
+    And N1 has taken a snapshot at offset 150 and truncated entries 1–150
     And N1's log start offset (LSO) is 151
-    And N2 has only replicated up to index 50
+    And N2 has only replicated up to offset 50
     When N2 sends a Fetch RPC with offset 50
     Then N1 detects that offset 50 < LSO (151)
-    And N1 responds with a SnapshotId field (index 150, term 1)
+    And N1 responds with a SnapshotId field (offset 150, term 1)
     When N2 sends FetchSnapshot RPCs to download the snapshot
     Then N1 streams the snapshot in chunks
     And N2 reassembles the complete snapshot
     And N2 restores its state machine from the snapshot
     And N2 sets its log start offset to 151
-    And N2 resumes Fetching entries from index 151
+    And N2 resumes Fetching entries from offset 151
 
   Scenario: Chunked snapshot transfer handles large state
-    Given the snapshot at index 150 is 10 MB
+    Given the snapshot at offset 150 is 10 MB
     And the chunk size is 1 MB
     When N2 sends FetchSnapshot RPCs
     Then N2 receives 10 chunks sequentially
@@ -578,12 +577,12 @@ Feature: Snapshot Transfer
 
   Scenario: Snapshot transfer for a newly joined observer
     Given N4 joins the cluster as an Observer with an empty log
-    And N1's log starts at index 201 (entries 1–200 compacted)
+    And N1's log starts at offset 201 (entries 1–200 compacted)
     When N4 sends its first Fetch RPC to N1 with offset 0
-    Then N1 responds with SnapshotId (index 200, term 1)
+    Then N1 responds with SnapshotId (offset 200, term 1)
     And N4 downloads the snapshot via FetchSnapshot
     And N4 restores its state machine from the snapshot
-    And N4 resumes Fetching entries from index 201
+    And N4 resumes Fetching entries from offset 201
 ```
 
 ---
@@ -616,8 +615,8 @@ Feature: Cluster Bootstrap
   Scenario: Bootstrap leader appends initial VotersRecord
     Given N1 wins the initial election for term 1
     When N1 transitions to Leader
-    Then N1 appends a LeaderChangeMessage (no-op) at index 1, term 1
-    And N1 appends a VotersRecord control entry at index 2, term 1
+    Then N1 appends a LeaderChangeMessage (no-op) at offset 1, term 1
+    And N1 appends a VotersRecord control entry at offset 2, term 1
       with voter set [N1, N2, N3]
     When both entries are committed
     Then the cluster is fully bootstrapped
@@ -816,7 +815,7 @@ Feature: Client Interaction
     Then N1 returns an error indicating no leader is available
 
   Scenario: Read returns committed state
-    Given the state machine has applied entries up to index 10
+    Given the state machine has applied entries up to offset 10
     When a client calls read() on the leader
     Then the result reflects the state after applying entries 1–10
 
@@ -846,7 +845,7 @@ Feature: Client Interaction
 
   Scenario: Listener callbacks on commit
     Given the application has registered a Listener with handle_commit
-    When entries at indices 5–7 are committed
+    When entries at offsets 5–7 are committed
     Then each node's listener receives handle_commit with the batch [5, 6, 7]
     And the state machine applies those entries in order
 ```
@@ -876,27 +875,27 @@ Feature: Safety Invariants
 
   Scenario: Append-Only Leader — leader never overwrites its own entries
     Given N1 is Leader for term 3
-    And N1's log contains entries at indices 1–10
-    When N1 appends a new entry at index 11
-    Then entries at indices 1–10 are unmodified
+    And N1's log contains entries at offsets 1–10
+    When N1 appends a new entry at offset 11
+    Then entries at offsets 1–10 are unmodified
     And N1 never deletes or overwrites any existing log entry
 
   Scenario: Leader Completeness — new leader has all committed entries
-    Given N1 was Leader and committed entries at indices 1–20
+    Given N1 was Leader and committed entries at offsets 1–20
     When N1 crashes and N2 wins election for term 2
-    Then N2's log contains all committed entries from indices 1–20
+    Then N2's log contains all committed entries from offsets 1–20
     And no committed entry is ever lost during leadership transitions
 
-  Scenario: Log Matching — same index and term implies identical logs up to that point
-    Given N1 is Leader and has committed entries at indices 1–15
+  Scenario: Log Matching — same offset and term implies identical logs up to that point
+    Given N1 is Leader and has committed entries at offsets 1–15
     And N2 and N3 have replicated all entries
-    When N2's entry at index 10 has the same term as N3's entry at index 10
-    Then N2 and N3's logs are identical for all entries at indices 1–10
+    When N2's entry at offset 10 has the same term as N3's entry at offset 10
+    Then N2 and N3's logs are identical for all entries at offsets 1–10
 
-  Scenario: State Machine Safety — no two nodes apply different entries at same index
-    Given entries at indices 1–10 are committed and applied across all nodes
-    Then for every index 1–10, all nodes have applied the same entry
-    And no node ever applies a different entry at any previously applied index
+  Scenario: State Machine Safety — no two nodes apply different entries at same offset
+    Given entries at offsets 1–10 are committed and applied across all nodes
+    Then for every offset 1–10, all nodes have applied the same entry
+    And no node ever applies a different entry at any previously applied offset
 
   Scenario: Invariants hold under adversarial conditions (simulation)
     Given a 5-node cluster under deterministic simulation
@@ -911,7 +910,7 @@ Feature: Safety Invariants
     Then all committed proposals are applied in the same order on all nodes
     And no committed entry is lost
     And at most one leader exists per term at any point
-    And no node applies different entries at the same log index
+    And no node applies different entries at the same log offset
     And the simulation completes without assertion failures
 ```
 

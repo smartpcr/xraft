@@ -156,19 +156,27 @@ Term {
 LogEntry {
     offset: u64                     // position in the log (0-indexed)
     term: Term                      // term when the entry was created
-    entry_type: EntryType           // Command | NoOp | VotersRecord
+    entry_type: EntryType           // Command | LeaderChangeMessage | VotersRecord
     payload: Bytes                  // serialised command or control record
 }
 ```
 
-`EntryType` variants:
-- **`Command`** — application-level state machine command (contains an
-  `AppRecord`). The only type delivered to `StateMachine::apply`.
-- **`LeaderChangeMessage`** — no-op control record committed by a new leader
-  to establish commit state for the new term. Handled internally by xraft
-  (updates leader-epoch checkpoint); never reaches the application.
-- **`VotersRecord`** — control record encoding a membership change. Handled
-  internally by xraft (updates voter set); never reaches the application.
+`EntryType` variants — the log contains two classes of entries:
+
+- **`Command`** — application-level state machine command (wraps an
+  `AppRecord`). The only entry type delivered to `StateMachine::apply`.
+  These are **application records**.
+
+The following two are **consensus control records**, owned entirely by
+xraft. They travel through the log like any entry (replicated, committed,
+snapshotted) but are never exposed to the application's `StateMachine`:
+
+- **`LeaderChangeMessage`** — control record committed by a new leader to
+  establish commit state for the new term. When committed, the event loop
+  updates the leader-epoch checkpoint internally. Never reaches `apply`.
+- **`VotersRecord`** — control record encoding a membership change (add,
+  remove, or update a voter). When committed, the event loop updates the
+  in-memory voter set internally. Never reaches `apply`.
 
 #### `VotersRecord`
 

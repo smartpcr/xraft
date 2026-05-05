@@ -21,7 +21,7 @@
     "title": "RPC Message Types",
     "description": "RPC Message Types (6 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-rpc-message-types",
-    "contentHash": "51d6bced51bc7988f650dc76c395d71f585cab7cf387abf6b650c23a52d8145d",
+    "contentHash": "f809348c72739f1ba21623ea03e0209328f6278bc85394296f62575199a998e7",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-rpc-message-types",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-rpc-message-types",
     "status": "planning"
@@ -42,6 +42,24 @@
     "contentHash": "e18f47f261cee34d8fcba596bc72495a725b0bd71c59cccdf23b691ad5e6c15d",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-error-types-and-configuration",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-error-types-and-configuration",
+    "status": "planning"
+  },
+  {
+    "title": "Application Record Types and Listener Trait",
+    "description": "Application Record Types and Listener Trait (4 steps)",
+    "anchor": "phase-project-scaffolding-and-core-types/stage-application-record-types-and-listener-trait",
+    "contentHash": "14706e8b237e35a15074ff16006294f943ebe6248c065b4a243ae5077cc8f593",
+    "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-application-record-types-and-listener-trait",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-application-record-types-and-listener-trait",
+    "status": "planning"
+  },
+  {
+    "title": "\u0060RaftNode\u0060 Public API Skeleton",
+    "description": "\u0060RaftNode\u0060 Public API Skeleton (7 steps)",
+    "anchor": "phase-project-scaffolding-and-core-types/stage-raftnode-public-api-skeleton",
+    "contentHash": "5ec4608547d2d9d7d6453d0707b88fd7cbe046011cc78eee45fbdd0a87665082",
+    "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
     "status": "planning"
   },
   {
@@ -219,7 +237,7 @@
     "title": "Membership Manager \u2014 Add Voter",
     "description": "Membership Manager \u2014 Add Voter (6 steps)",
     "anchor": "phase-dynamic-quorum-membership-changes/stage-membership-manager-add-voter",
-    "contentHash": "642e7bbb090f549eeecfb366364b41781881a0413262e534e81b538c9c59ae50",
+    "contentHash": "8e4133c7aa76b0876324ad43ed6a7f842755b02ea6395e06f5f0050672aa10c1",
     "workstreamId": "ws-raft-raft-protocol-phase-dynamic-quorum-membership-changes-stage-membership-manager-add-voter",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-dynamic-quorum-membership-changes-stage-membership-manager-add-voter",
     "status": "planning"
@@ -228,7 +246,7 @@
     "title": "Membership Manager \u2014 Remove Voter",
     "description": "Membership Manager \u2014 Remove Voter (4 steps)",
     "anchor": "phase-dynamic-quorum-membership-changes/stage-membership-manager-remove-voter",
-    "contentHash": "773751267200dd9a877768843a85ba4de8b099428bb19039c99bc33767f4707d",
+    "contentHash": "61d3afeaf04b1abf89a3488e759a17a36672a6017b0b25825d9cfe93e51c0545",
     "workstreamId": "ws-raft-raft-protocol-phase-dynamic-quorum-membership-changes-stage-membership-manager-remove-voter",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-dynamic-quorum-membership-changes-stage-membership-manager-remove-voter",
     "status": "planning"
