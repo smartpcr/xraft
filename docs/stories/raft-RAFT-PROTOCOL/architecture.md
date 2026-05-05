@@ -1945,12 +1945,27 @@ leader to provide the authoritative HW via subsequent Fetch responses.
 ### 5.11 Client Read (Linearizable)
 
 Linearizable reads ensure the returned state reflects all writes committed
-before the read was issued. The initial implementation "routes reads through
-the log for safety" (tech-spec §2.1.5): the leader confirms its authority
-by verifying a current-term entry has been committed, then queries the
-state machine synchronously within the event loop. No per-read log entry
-is appended. Optimised read paths (read-index with heartbeat confirmation,
-lease-based) are out of scope (tech-spec §2.2).
+before the read was issued. The leader confirms its authority by verifying
+that a current-term entry has been committed (the `LeaderChangeMessage`
+appended at the start of the term, or any subsequent entry). Once
+confirmed, it queries the state machine synchronously within the event
+loop. **No per-read log entry is appended** — the existing committed
+current-term entry serves as the leadership proof.
+
+> **Reconciliation with tech-spec §2.1.5 / §2.2.** The tech spec says
+> "Initial implementation routes reads through the log for safety" and
+> lists "Linearisable reads — Read-index or lease-based reads" as out
+> of scope. These statements describe two distinct things: (1) the
+> **initial implementation** uses the replicated log's committed state
+> (specifically, the committed `LeaderChangeMessage`) to prove leadership
+> — this is what "through the log" means; (2) **optimised read paths**
+> (read-index with per-read heartbeat broadcast, lease-based with clock
+> assumptions) are out of scope. The architecture's read path satisfies
+> (1): it uses the log's committed state for the leadership proof. It
+> does not implement (2): no per-read heartbeat broadcast or lease
+> mechanism. The read path IS linearizable because the leadership proof
+> guarantees no stale leader can serve reads (see "Why this is
+> linearizable" below).
 
 ```
     Client            RaftNode        EventLoop          StateMachine
@@ -2153,7 +2168,7 @@ implementation. §7.3 confirms which sibling documents are fully aligned.
 | **I/O trait objects** | Storage / Network-Send I/O traits injected as `Box<dyn ...>` — no `Arc`. `IoStage` borrows via `&self` with `Sync` bound. | impl plan Stage 1.7 |
 | **Transport split** | Separate `TransportSender` (`&self`, `Sync`) and `TransportReceiver` (`&mut self`, not `Sync`). `split()` on concrete transports. | impl plan Stage 1.4, architecture §4.4 |
 | **Clock placement** | `Clock` is a Runtime trait, passed to the `EventLoop` (not `IoStage`), not mediated by `IoAction`. | impl plan Stage 1.4/1.7 |
-| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state → snapshot → log scan → resume as follower → learn HW from leader. | tech spec §2.1.7, impl plan Phase 6 |
+| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state → snapshot → log scan (metadata only — no SM replay) → resume as follower → learn HW from leader → apply entries via four-phase commit notification. See Divergence 8. | tech spec §2.1.7, impl plan Phase 6 |
 | **Timing parameters** | 150–300 ms election timeout (randomised), 50 ms fetch interval. | tech spec §4.3 |
 | **Quorum math** | Majority = `⌊V/2⌋ + 1`; HW = descending-sorted voter offsets at index `⌊V/2⌋` (0-indexed). Only voters count. | all docs |
 
@@ -2173,9 +2188,15 @@ positions, and declares which interpretation governs implementation.
 
 **Canonical resolution:** Callbacks are synchronous, in-process calls
 within the event loop (this architecture §4.1). The tech spec's phrasing
-describes a different execution model that is superseded by the detailed
-design in this architecture. The implementation plan and e2e scenarios
-both follow this architecture.
+"staged and executed asynchronously outside the loop" describes a
+different execution model that is superseded by the detailed design in
+this architecture. **This is safety-sensitive:** synchronous execution
+guarantees that callbacks always observe fully-updated protocol state
+(e.g., the correct HW and voter set) before any `IoAction` is
+dispatched. An asynchronous callback model would require additional
+synchronisation to prevent stale reads. The implementation plan and e2e
+scenarios both follow the synchronous-callback model from this
+architecture.
 
 #### Divergence 2 — High watermark: inclusive vs exclusive
 
@@ -2189,7 +2210,12 @@ both follow this architecture.
 **Canonical resolution:** Exclusive semantics (`O < HW`) govern
 implementation. Mapping: tech spec "entries ≤ N committed" corresponds
 to `HW = N + 1` in exclusive notation. The committed set is identical;
-only the numeric convention differs.
+only the numeric convention differs. **Safety note:** The exclusive
+convention is used consistently in the `DeferredCompletionQueue` (fires
+when `entry_offset < HW`), the `FetchResponse` (HW field), and the
+`ConsensusState.high_watermark` field. All code must use `<` (strict
+less-than) when testing whether an entry is committed — using `<=`
+would incorrectly include one uncommitted entry.
 
 #### Divergence 3 — Commit notification: three phases vs four
 
@@ -2204,22 +2230,40 @@ architecture §4.1). Step 4 (`DeferredReadQueue::drain`) is required for
 the linearizable read path defined in §5.11. The implementation plan's
 three-phase model omits the read-path step.
 
-#### Divergence 4 — `read()` semantics and `StateMachine` trait shape
+#### Divergence 4 — `read()` semantics, linearizability scope, and `StateMachine` trait shape
 
 | Document | Statement | Section |
 |----------|-----------|---------|
-| **Tech spec** | `read() → Result<State>`. "Initial implementation routes reads through the log for safety." Linearisable reads (read-index, lease-based) are out of scope. | §2.1.5, §2.2 |
+| **Tech spec** | `read() → Result<State>`. "Initial implementation routes reads through the log for safety." Out-of-scope list includes: "Linearisable reads — Read-index or lease-based reads." `StateMachine` trait has `apply`, `snapshot`, `restore` only (no `query`). | §2.1.5, §2.2 |
 | **Impl plan** | `read() → Result<ConsensusState>` — returns protocol metadata (term, role, leader, HW, voter set). `StateMachine` trait has `apply`, `snapshot`, `restore` only. | Stages 1.7, 5.3, 1.4 |
 | **This architecture** | `read() → Result<S::ReadResult>` — leader-only, returns application state via `StateMachine::query()`. No per-read log entry is appended; the leader confirms authority by verifying a committed current-term entry (leadership proof, §5.11). `StateMachine` trait adds `type ReadResult` and `fn query(&self)`. Protocol metadata is available separately via `RaftNode::metrics()`. | §5.11, §4.1 |
 | **E2e scenarios** | Uses the `S::ReadResult` / `query()` model from this architecture. | Client Interaction feature |
 
 **Canonical resolution:** `read()` returns `S::ReadResult` via
-`StateMachine::query()` (this architecture §5.11). The tech spec's
-"routes reads through the log" describes the leadership-proof mechanism
-(waiting for a committed current-term entry), not a per-read log append.
-The implementation plan's `ConsensusState` return type should be replaced
-with `S::ReadResult`; `StateMachine` needs `type ReadResult` and
-`fn query(&self)`.
+`StateMachine::query()` (this architecture §5.11).
+
+*What "routes reads through the log" means:* The tech spec's phrase
+does NOT mean appending a per-read entry to the log. It means the read
+path depends on the log's committed state — specifically, the leader
+uses its committed `LeaderChangeMessage` (a log entry) as the
+leadership proof. The log is the source of truth; no separate mechanism
+(heartbeat broadcast, clock lease) is involved.
+
+*Reconciliation with the out-of-scope listing:* The tech spec lists
+"Linearisable reads — Read-index or lease-based reads" as out of scope.
+The architecture's read path does NOT use read-index (per-read heartbeat
+broadcast to a majority) or lease-based (clock-dependent leadership
+assumption). It uses a simpler leadership-proof mechanism that relies
+on an already-committed current-term entry. This mechanism is
+linearizable (see §5.11 "Why this is linearizable") but is not one of
+the two optimised techniques the tech spec excludes. The initial
+implementation's linearizability comes from the protocol's existing
+commit guarantees, not from an additional mechanism layered on top.
+
+*Trait shape:* The implementation plan's `ConsensusState` return type
+should be replaced with `S::ReadResult`; `StateMachine` needs
+`type ReadResult` and `fn query(&self)`. The tech spec's simpler
+`StateMachine` signature is a summary, not a binding constraint.
 
 #### Divergence 5 — `LogStore` method receivers
 
@@ -2232,6 +2276,10 @@ with `S::ReadResult`; `StateMachine` needs `type ReadResult` and
 architecture §4.1). Required by the `IoStage`'s concurrent dispatch
 model: the `IoStage` holds all I/O trait objects as owned `Box<dyn ...>`
 and borrows them via `&self` for `tokio::join!` across trait objects.
+Using `&mut self` would make concurrent dispatch across trait objects
+impossible without `Arc<Mutex<...>>` wrapping. The `Sync` bound on
+`LogStore` enables safe shared-reference access; the implementation
+serialises writes internally (e.g., `tokio::sync::Mutex<File>`).
 
 #### Divergence 6 — `StateMachine::apply` signature
 
@@ -2261,6 +2309,40 @@ impl plan Stage 6.2). All nodes in a cluster share the same `ClusterId`.
 The tech spec's "generated at bootstrap time" is compatible — the
 generation happens at bootstrap time, but externally rather than by the
 node itself.
+
+#### Divergence 8 — Crash recovery: log entry replay vs deferred application
+
+| Document | Statement | Section |
+|----------|-----------|---------|
+| **Tech spec** | Crash recovery step (3): "replaying log entries after the snapshot offset". | §2.1.7 |
+| **This architecture** | "No state machine replay during recovery." Log entries between the snapshot offset and `log_end_offset` are NOT applied to the `StateMachine` during recovery because their committed status is unknown. The recovering node sets HW to `snapshot.last_included_offset + 1` and defers all further state machine applications until the leader provides the authoritative HW via Fetch responses. | §5.10 invariants 2, 4 |
+| **Impl plan** | Recovery (Phase 6) follows this architecture: log is scanned for metadata only; entries are not applied to the state machine until the leader sends HW via Fetch. | Phase 6 |
+| **E2e scenarios** | Crash recovery scenarios follow this architecture: recovered node learns HW from leader. | Feature: Persistence and Crash Recovery |
+
+**Canonical resolution:** **No state machine replay during recovery**
+(this architecture §5.10). The tech spec's "replaying log entries" is
+a compressed description of the full recovery process. In practice, log
+entries are scanned for consensus metadata (leader-epoch checkpoint,
+voter set from `VotersRecord` entries) but are NOT applied to
+`StateMachine::apply` because their committed status is unknown. Some
+entries may be uncommitted tail entries from a deposed leader that will
+be truncated on divergence detection. Applying them would put the state
+machine in an incorrect state with no rollback mechanism. The recovering
+node instead waits for the leader to provide the authoritative HW via
+Fetch responses, then applies entries `[old_HW, new_HW)` through the
+standard four-phase commit notification (§4.1). This is
+**safety-critical**: premature replay could violate state machine safety
+(Raft invariant 5).
+
+#### Divergence 9 — `Listener` trait: `handle_load_snapshot` signature
+
+| Document | Statement | Section |
+|----------|-----------|---------|
+| **Tech spec** | `handle_load_snapshot(reader)` — takes a `SnapshotReader`. | §2.1.5 |
+| **This architecture** | `handle_load_snapshot(&mut self, reader: SnapshotReader)` — same signature. | §4.1 |
+| **Impl plan** | Follows this architecture. | Stage 1.6 |
+
+**Canonical resolution:** Aligned across all documents. No conflict.
 
 ### 7.3 Fully Aligned: `e2e-scenarios.md`
 
