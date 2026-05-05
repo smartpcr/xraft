@@ -4,19 +4,22 @@
 >
 > **Sibling documents:** [tech-spec.md](./tech-spec.md) ·
 > [architecture.md](./architecture.md) ·
-> [implementation-plan.md](./implementation-plan.md)
+> [implementation-plan.md](./implementation-plan.md) *(not yet authored —
+> will be referenced once available)*
 >
 > This document defines Gherkin-style end-to-end scenarios for the xraft
 > library. Every scenario is executable against the **deterministic simulation
 > harness** described in the tech spec (§2.1.6). Scenarios use the crate and
-> RPC names established in the tech spec (§2.1.4, §4.4):
+> RPC names established in the tech spec (§2.1.4) and architecture doc (§3):
 >
 > - Crates: `xraft-core`, `xraft-transport`, `xraft-storage`, `xraft-test`
-> - RPCs: `Vote`, `Fetch`, `FetchSnapshot`, `AddVoter`, `RemoveVoter`,
->   `UpdateVoter`
+> - RPCs: `Vote` (with `is_pre_vote` flag for Pre-Vote phase), `Fetch`,
+>   `FetchSnapshot`, `AddVoter`, `RemoveVoter`, `UpdateVoter`
 > - Roles: Follower, Candidate, Leader, Observer
 > - Pull-based replication model (followers `Fetch` from leader; no push-based
 >   `AppendEntries`)
+> - At-least-once propose semantics; deduplication is the application's
+>   responsibility (tech spec §2.1.5)
 
 ---
 
@@ -31,12 +34,13 @@
 7. [Feature: Persistence and Crash Recovery](#feature-persistence-and-crash-recovery)
 8. [Feature: Log Compaction and Snapshots](#feature-log-compaction-and-snapshots)
 9. [Feature: Snapshot Transfer](#feature-snapshot-transfer)
-10. [Feature: Dynamic Quorum — Add Voter](#feature-dynamic-quorum--add-voter)
-11. [Feature: Dynamic Quorum — Remove Voter](#feature-dynamic-quorum--remove-voter)
-12. [Feature: Dynamic Quorum — Observer Promotion](#feature-dynamic-quorum--observer-promotion)
-13. [Feature: Client Interaction](#feature-client-interaction)
-14. [Feature: Safety Invariants](#feature-safety-invariants)
-15. [Feature: Observability and Metrics](#feature-observability-and-metrics)
+10. [Feature: Cluster Bootstrap](#feature-cluster-bootstrap)
+11. [Feature: Dynamic Quorum — Add Voter](#feature-dynamic-quorum--add-voter)
+12. [Feature: Dynamic Quorum — Remove Voter](#feature-dynamic-quorum--remove-voter)
+13. [Feature: Dynamic Quorum — Observer Promotion](#feature-dynamic-quorum--observer-promotion)
+14. [Feature: Client Interaction](#feature-client-interaction)
+15. [Feature: Safety Invariants](#feature-safety-invariants)
+16. [Feature: Observability and Metrics](#feature-observability-and-metrics)
 
 ---
 
@@ -115,6 +119,14 @@ Feature: Leader Election
     And N1 receives votes from N2 and N3 (3 of 5 — majority)
     Then N1 becomes Leader for term 1
     And N1 does not need votes from N4 or N5
+
+  Scenario: Follower receiving Vote RPC with higher term updates its term
+    Given N2 is a Follower with currentTerm 3
+    When N2 receives a Vote RPC from N1 with term 7
+    And N1's log is at least as up-to-date as N2's
+    Then N2 updates its currentTerm to 7
+    And N2 grants its vote to N1
+    And N2 resets its election timeout
 ```
 
 ---
@@ -135,19 +147,19 @@ Feature: Pre-Vote Protocol
   Scenario: Successful pre-vote followed by full election
     Given N1 has not heard from a leader within the election timeout
     When N1 initiates a pre-vote phase
-    Then N1 sends PreVote RPCs to N2 and N3 without incrementing its term
+    Then N1 sends Vote RPCs with is_pre_vote=true to N2 and N3 without incrementing its term
     When N2 and N3 respond positively (N1's log is up-to-date)
     Then N1 proceeds to the full election
     And N1 increments its term
-    And N1 sends Vote RPCs to N2 and N3
+    And N1 sends Vote RPCs with is_pre_vote=false to N2 and N3
 
   Scenario: Isolated node cannot disrupt cluster via pre-vote rejection
     Given N1 is Leader for term 5
     And N3 is partitioned from N1 but can reach N2
     And N2 has recently received a Fetch response from N1
     When N3's election timeout expires
-    And N3 sends PreVote RPCs to N1 and N2
-    Then N2 rejects the PreVote because it has recently heard from the leader
+    And N3 sends Vote RPCs with is_pre_vote=true to N1 and N2
+    Then N2 rejects the Vote(is_pre_vote=true) because it has recently heard from the leader
     And N1 is unreachable from N3
     And N3 cannot gather a pre-vote majority
     And N3 does NOT increment its term
@@ -156,8 +168,8 @@ Feature: Pre-Vote Protocol
   Scenario: Pre-vote prevents term inflation by isolated node
     Given N3 is completely isolated from N1 and N2
     When N3's election timeout expires repeatedly
-    Then N3 sends PreVote RPCs each time
-    And all PreVote RPCs time out (no reachable nodes)
+    Then N3 sends Vote RPCs with is_pre_vote=true each time
+    And all Vote(is_pre_vote=true) RPCs time out (no reachable nodes)
     And N3's term remains unchanged
     And when the partition heals, N3 can rejoin without forcing a new election
 
@@ -165,10 +177,19 @@ Feature: Pre-Vote Protocol
     Given N1 was Leader for term 3 but has crashed
     And N2 and N3 have not received a Fetch response within the election timeout
     When N2 initiates a pre-vote
+    And N2 sends Vote RPCs with is_pre_vote=true to N1 and N3
     And N3 has not heard from the leader recently
     Then N3 grants the pre-vote to N2
     And N2 proceeds to a full election with term 4
     And N2 wins and becomes the new Leader
+
+  Scenario: Pre-vote responder grants vote only if candidate log is up-to-date
+    Given N1 is partitioned from the cluster (but not crashed)
+    And N2's log contains entries up to index 5, term 3
+    And N3's log contains entries up to index 8, term 3
+    When N2 sends Vote RPCs with is_pre_vote=true for term 3
+    Then N3 rejects the pre-vote because N2's log (index 5) is less up-to-date than N3's (index 8)
+    And N2 cannot proceed to a full election
 ```
 
 ---
@@ -230,6 +251,12 @@ Feature: Pull-Based Log Replication
     When N2 sends a Fetch RPC with clusterId "cluster-xyz-999"
     Then N1 rejects the Fetch due to clusterId mismatch
     And the rejection prevents cross-cluster contamination
+
+  Scenario: Leader responds with leader identity in Fetch response
+    Given N1 is Leader for term 3
+    When N2 sends a Fetch RPC to N1
+    Then the Fetch response includes leaderId=N1 and leaderEpoch=3
+    And N2 can confirm it is Fetching from the correct leader
 ```
 
 ---
@@ -561,6 +588,68 @@ Feature: Snapshot Transfer
 
 ---
 
+## Feature: Cluster Bootstrap
+
+```gherkin
+Feature: Cluster Bootstrap
+  As a cluster operator
+  I need to form a new cluster from a static voter set
+  So that the Raft cluster can begin operating with a known initial configuration
+
+  # Covers tech spec §2.1.7 — Bootstrap & Recovery
+
+  Background:
+    Given three uninitialized nodes [N1, N2, N3]
+    And a bootstrap configuration specifying voter set [N1, N2, N3]
+    And a clusterId UUID "cluster-abc-123" is generated at bootstrap time
+
+  Scenario: Fresh cluster bootstrap with static voter set
+    Given each node is configured with the initial voter set [N1, N2, N3]
+    And each node has an empty log and no snapshot
+    When all three nodes start simultaneously
+    Then each node loads the bootstrap voter set
+    And each node starts in Follower state with term 0
+    And a leader election occurs (one node's election timeout expires first)
+    And the winning leader commits a VotersRecord control entry with [N1, N2, N3]
+    And the clusterId "cluster-abc-123" is associated with all subsequent RPCs
+
+  Scenario: Bootstrap leader appends initial VotersRecord
+    Given N1 wins the initial election for term 1
+    When N1 transitions to Leader
+    Then N1 appends a LeaderChangeMessage (no-op) at index 1, term 1
+    And N1 appends a VotersRecord control entry at index 2, term 1
+      with voter set [N1, N2, N3]
+    When both entries are committed
+    Then the cluster is fully bootstrapped
+    And subsequent membership changes use AddVoter / RemoveVoter RPCs
+
+  Scenario: Node reads quorum-state file on startup
+    Given N2 has previously participated in term 5 and voted for N1
+    And N2's quorum-state file contains currentTerm=5, votedFor=N1
+    When N2 restarts
+    Then N2 reads its quorum-state file before processing any RPCs
+    And N2's currentTerm is 5 and votedFor is N1
+    And N2 does not vote for any other candidate in term 5
+
+  Scenario: Uninitialized node joins as observer
+    Given the cluster [N1, N2, N3] is running with committed entries 1–100
+    And N4 is a new uninitialized node with no log and no snapshot
+    When N4 starts and connects to the cluster
+    Then N4 joins as an Observer (non-voting)
+    And N4 begins sending Fetch RPCs to the leader
+    And if the leader's log starts beyond offset 0, N4 receives a SnapshotId
+    And N4 downloads the snapshot via FetchSnapshot before normal replication
+
+  Scenario: Bootstrap rejects mismatched clusterId
+    Given the cluster [N1, N2, N3] was bootstrapped with clusterId "cluster-abc-123"
+    And N4 is configured with a different clusterId "cluster-xyz-999"
+    When N4 attempts to send Fetch RPCs to N1
+    Then N1 rejects all RPCs from N4 due to clusterId mismatch
+    And N4 cannot join the cluster
+```
+
+---
+
 ## Feature: Dynamic Quorum — Add Voter
 
 ```gherkin
@@ -644,6 +733,15 @@ Feature: Dynamic Quorum — Remove Voter
     And N1 and N2 have recently heard from the leader
     Then N1 and N2 reject N3's Vote RPCs
     And the cluster is not disrupted
+
+  Scenario: UpdateVoter changes a node's endpoint address
+    Given the voter set is [N1, N2, N3]
+    And N3's endpoint changes from 10.0.0.3:9000 to 10.0.0.30:9000
+    When a client sends an UpdateVoter RPC for N3 with the new endpoint to N1
+    Then N1 appends a VotersRecord with updated endpoint for N3
+    When the VotersRecord is committed
+    Then all nodes update N3's address in their voter configuration
+    And N3 remains a voting member with unchanged voting rights
 ```
 
 ---
@@ -722,13 +820,23 @@ Feature: Client Interaction
     When a client calls read() on the leader
     Then the result reflects the state after applying entries 1–10
 
-  Scenario: Idempotent commands with serial numbers
-    Given a client proposes command "set x=1" with serial number 42
-    And the command is committed and applied
-    When the same client retransmits command "set x=1" with serial number 42
-    Then N1 detects the duplicate serial number
-    And N1 does not append a new entry
-    And N1 returns the cached result from the first execution
+  Scenario: At-least-once semantics — duplicate proposal after leader failover
+    Given a client proposes command "set x=1" to N1 (Leader)
+    And N1 appends the entry and it is committed
+    When N1 crashes before the client receives the commit acknowledgement
+    And N2 becomes the new Leader for term 2
+    And the client retries proposing "set x=1" to N2
+    Then N2 appends a second "set x=1" entry to the log
+    And the duplicate is committed and applied
+    And xraft does NOT perform built-in deduplication
+    And it is the application's responsibility to make commands idempotent
+
+  Scenario: Application-level dedup via request IDs (out of xraft scope)
+    Given the application wraps commands with unique request IDs
+    And the state machine's apply() method tracks processed request IDs
+    When a duplicate command arrives with an already-processed request ID
+    Then the state machine ignores the duplicate during apply()
+    And xraft treats it as a normal committed entry (no special handling)
 
   Scenario: Listener callbacks on leader change
     Given the application has registered a Listener with handle_leader_change
@@ -864,23 +972,24 @@ Feature: Observability and Metrics
 
 | Tech Spec Section | Feature Covered | Scenario Count |
 |-------------------|-----------------|----------------|
-| §2.1.1 Node roles / Leader election | Leader Election | 8 |
-| §2.1.1 Pre-Vote protocol | Pre-Vote Protocol | 4 |
-| §2.1.1 Log replication (pull-based) | Pull-Based Log Replication | 6 |
+| §2.1.1 Node roles / Leader election | Leader Election | 9 |
+| §2.1.1 Pre-Vote protocol | Pre-Vote Protocol | 5 |
+| §2.1.1 Log replication (pull-based) | Pull-Based Log Replication | 7 |
 | §2.1.1 High watermark (HW) | High Watermark Advancement | 5 |
 | §2.1.1 Safety invariants | Safety Invariants | 6 |
-| §2.1.1 No-op commit on leader start | High Watermark Advancement (scenario 5) | 1 |
+| §2.1.1 No-op commit on leader start | High Watermark Advancement (scenario 5) | — |
 | §2.1.1 Check Quorum | Check Quorum | 5 |
 | §2.1.1 Persistence | Persistence and Crash Recovery | 6 |
 | §2.1.2 Snapshotting | Log Compaction and Snapshots | 4 |
 | §2.1.2 Snapshot transfer | Snapshot Transfer | 4 |
-| §2.1.2 Log truncation | Log Divergence and Truncation | 4 |
-| §2.1.3 Single-node changes | Add Voter / Remove Voter | 8 |
+| §2.1.2 Log truncation / Divergence | Log Divergence and Truncation | 4 |
+| §2.1.3 Single-node changes | Add Voter / Remove Voter / UpdateVoter | 9 |
 | §2.1.3 Non-voting members (observers) | Observer Promotion | 3 |
-| §2.1.3 Leader step-down | Remove Voter (scenario 2) | 1 |
-| §2.1.4 Identity & fencing | Pull-Based Log Replication (scenarios 5–6) | 2 |
-| §2.1.4 Divergence detection | Log Divergence and Truncation | 4 |
-| §2.1.5 Library API | Client Interaction | 7 |
+| §2.1.3 Leader step-down | Remove Voter (scenario 2) | — |
+| §2.1.4 Identity & fencing | Pull-Based Log Replication (scenarios 5–7) | — |
+| §2.1.4 Divergence detection | Log Divergence and Truncation | — |
+| §2.1.5 Library API | Client Interaction | 8 |
 | §2.1.6 Metrics | Observability and Metrics | 6 |
-| §2.1.6 Deterministic simulation | Safety Invariants (scenario 6) | 1 |
-| **Total** | **15 Features** | **77 Scenarios** |
+| §2.1.6 Deterministic simulation | Safety Invariants (scenario 6) | — |
+| §2.1.7 Bootstrap & recovery | Cluster Bootstrap | 5 |
+| **Total** | **16 Features** | **86 Scenarios** |
