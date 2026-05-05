@@ -1321,7 +1321,8 @@ follower to prevent split-brain.
 ### 5.8 Client Proposal (Full Path — with I/O Staging)
 
 End-to-end flow from client command to committed state machine application.
-The `EventLoop` produces `IoAction` values; the `IoStage` executes them
+The `EventLoop` mutates state and invokes callbacks synchronously; the
+`IoStage` executes external I/O (`LogStore::append`, `Transport::send`)
 via injected trait objects. No raw I/O occurs inside `xraft-core`.
 
 ```
@@ -1361,19 +1362,33 @@ via injected trait objects. No raw I/O occurs inside `xraft-core`.
       │                │               │  (durable)    │            │              │
       │                │               │               │            │              │
       │                │       ... followers fetch entry N ...      │              │
-      │                │       ... HW advances to N ...             │              │
+      │                │       ... Fetch triggers HW advance ...    │              │
       │                │               │               │            │              │
       │                │         ┌─────┴──────┐        │            │              │
-      │                │         │ HW ≥ N     │        │            │              │
-      │                │         │ Filter:    │        │            │              │
-      │                │         │  Control → │        │            │              │
-      │                │         │  internal  │        │            │              │
-      │                │         │  Command → │        │            │              │
-      │                │         │  SM.apply  │        │            │              │
-      │                │         │ Notify     │        │            │              │
-      │                │         │  Listener  │        │            │              │
-      │                │         │ Complete   │        │            │              │
-      │                │         │  oneshot   │        │            │              │
+      │                │         │ HW ≥ N+1   │        │            │              │
+      │                │         │ (N < HW ✓) │        │            │              │
+      │                │         │ Three-phase │        │            │              │
+      │                │         │ commit:     │        │            │              │
+      │                │         │ 1. Filter:  │        │            │              │
+      │                │         │  Control →  │        │            │              │
+      │                │         │  internal   │        │            │              │
+      │                │         │  Command →  │        │            │              │
+      │                │         │  SM.apply   │        │            │              │
+      │                │         │ 2. Listener │        │            │              │
+      │                │         │  .handle_   │        │            │              │
+      │                │         │  commit     │        │            │              │
+      │                │         │ 3. Deferred │        │            │              │
+      │                │         │  Complete   │        │            │              │
+      │                │         │  Queue:     │        │            │              │
+      │                │         │  resolve    │        │            │              │
+      │                │         │  oneshot    │        │            │              │
+      │                │         │ (all sync,  │        │            │              │
+      │                │         │  in-process)│        │            │              │
+      │                │         │             │        │            │              │
+      │                │         │ Then produce│        │            │              │
+      │                │         │ IoAction::  │        │            │              │
+      │                │         │ SendRpc for │        │            │              │
+      │                │         │ FetchResp   │        │            │              │
       │                │         └─────┬──────┘        │            │              │
       │                │               │               │            │              │
       │                │◄── Result ────│               │            │              │
@@ -1638,9 +1653,12 @@ leader to provide the authoritative HW via subsequent Fetch responses.
 4. **Leader provides the authoritative HW.** After resuming as follower,
    the node sends Fetch requests to the leader. The leader's Fetch
    response includes the current HW. The node advances its local HW to
-   `min(leader_HW, local_log_end_offset)` and applies all entries between
-   the old HW and the new HW to the state machine (filtering control
-   records as usual).
+   `min(leader_HW, local_log_end_offset)` and executes the three-phase
+   commit notification (§4.1) for all entries between the old HW and the
+   new HW: `StateMachine::apply` for command entries, `Listener::handle_commit`
+   for the batch, and `DeferredCompletionQueue::complete` (no-op post-crash
+   since there are no pending client futures). Control records are always
+   filtered from `SM::apply` and handled internally.
 
 5. **Always resume as Follower.** A recovering node never resumes as
    leader regardless of its prior role. It must win a new election.
@@ -1664,9 +1682,13 @@ leader to provide the authoritative HW via subsequent Fetch responses.
 ### 6.1 Persistence Guarantees
 
 Every write path that affects correctness calls `fsync` before
-acknowledgement. The `EventLoop` produces `IoAction` values; the `IoStage`
-executes them via injected trait objects. The concrete `fsync`
-implementation lives in `xraft-storage`, not in `xraft-core`:
+acknowledgement. The `EventLoop` produces `IoAction` values for all
+external I/O; the `IoStage` executes them via injected trait objects. The
+concrete `fsync` implementation lives in `xraft-storage`, not in
+`xraft-core`. Application callbacks (`StateMachine::apply`,
+`Listener::handle_commit`) are synchronous in-process calls, not external
+I/O, and are invoked by the event loop before the `IoAction` batch is
+dispatched (see §4.1 three-phase commit notification).
 
 | Write | When | Guarantee |
 |-------|------|-----------|
