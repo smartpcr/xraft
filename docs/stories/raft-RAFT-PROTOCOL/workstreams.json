@@ -1,0 +1,344 @@
+[
+  {
+    "title": "Cargo Workspace and Root Configuration",
+    "description": "Cargo Workspace and Root Configuration (9 steps)",
+    "anchor": "phase-project-scaffolding-and-core-types/stage-cargo-workspace-and-root-configuration",
+    "contentHash": "ca02a67d471a8c1825df416ee1044cebd5440a1ade39698c9fd00a908a26e6e0",
+    "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-cargo-workspace-and-root-configuration",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-cargo-workspace-and-root-configuration",
+    "status": "planning"
+  },
+  {
+    "title": "Core Domain Types in \u0060xraft-core\u0060",
+    "description": "Core Domain Types in \u0060xraft-core\u0060 (10 steps)",
+    "anchor": "phase-project-scaffolding-and-core-types/stage-core-domain-types-in-xraft-core",
+    "contentHash": "57a663e54011c40f63e5594dc948ba395bb6c6ba49f8e9aa7ce0fcf3146ed6a7",
+    "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-core-domain-types-in-xraft-core",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-core-domain-types-in-xraft-core",
+    "status": "planning"
+  },
+  {
+    "title": "RPC Message Types",
+    "description": "RPC Message Types (6 steps)",
+    "anchor": "phase-project-scaffolding-and-core-types/stage-rpc-message-types",
+    "contentHash": "f809348c72739f1ba21623ea03e0209328f6278bc85394296f62575199a998e7",
+    "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-rpc-message-types",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-rpc-message-types",
+    "status": "planning"
+  },
+  {
+    "title": "Trait Definitions (Storage, Transport, Runtime)",
+    "description": "Trait Definitions (Storage, Transport, Runtime) (8 steps)",
+    "anchor": "phase-project-scaffolding-and-core-types/stage-trait-definitions-storage-transport-runtime",
+    "contentHash": "4d629dfa16680f262ab7733ecbdb1ea4688dbff07e93d438c434f5c4e2d383e6",
+    "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-runtime",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-runtime",
+    "status": "planning"
+  },
+  {
+    "title": "Error Types and Configuration",
+    "description": "Error Types and Configuration (4 steps)",
+    "anchor": "phase-project-scaffolding-and-core-types/stage-error-types-and-configuration",
+    "contentHash": "e18f47f261cee34d8fcba596bc72495a725b0bd71c59cccdf23b691ad5e6c15d",
+    "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-error-types-and-configuration",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-error-types-and-configuration",
+    "status": "planning"
+  },
+  {
+    "title": "Listener Trait and ListenerEvent",
+    "description": "Listener Trait and ListenerEvent (3 steps)",
+    "anchor": "phase-project-scaffolding-and-core-types/stage-listener-trait-and-listenerevent",
+    "contentHash": "1635110f51ffd885ca7178b5c65f88df8752ba7b16d4e4e5f5005abdfe7da960",
+    "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-listener-trait-and-listenerevent",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-listener-trait-and-listenerevent",
+    "status": "planning"
+  },
+  {
+    "title": "\u0060RaftNode\u0060 Public API Skeleton",
+    "description": "\u0060RaftNode\u0060 Public API Skeleton (7 steps)",
+    "anchor": "phase-project-scaffolding-and-core-types/stage-raftnode-public-api-skeleton",
+    "contentHash": "40cf08b9504acd9625c0c19ea877c911c092ce67dbd8d42e4e37663aa5706255",
+    "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
+    "status": "planning"
+  },
+  {
+    "title": "In-Memory Storage Backends and Simulated Clock (\u0060xraft-test\u0060)",
+    "description": "In-Memory Storage Backends and Simulated Clock (\u0060xraft-test\u0060) (5 steps)",
+    "anchor": "phase-project-scaffolding-and-core-types/stage-in-memory-storage-backends-and-simulated-clock-xraft-test",
+    "contentHash": "34ad89702616f6b73680d5b1f3495316d65d65e40dfa70c7c2a34223acd673b7",
+    "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-in-memory-storage-backends-and-simulated-clock-xraft-test",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-in-memory-storage-backends-and-simulated-clock-xraft-test",
+    "status": "planning"
+  },
+  {
+    "title": "Segment Log \u2014 Write Path",
+    "description": "Segment Log \u2014 Write Path (6 steps)",
+    "anchor": "phase-storage-layer-xraft-storage/stage-segment-log-write-path",
+    "contentHash": "c7d56e4152015257a869603fab4433f0d3c32ee77cd129f1170ddae0cffaa247",
+    "workstreamId": "ws-raft-raft-protocol-phase-storage-layer-xraft-storage-stage-segment-log-write-path",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-storage-layer-xraft-storage-stage-segment-log-write-path",
+    "status": "planning"
+  },
+  {
+    "title": "Segment Log \u2014 Read and Truncation",
+    "description": "Segment Log \u2014 Read and Truncation (5 steps)",
+    "anchor": "phase-storage-layer-xraft-storage/stage-segment-log-read-and-truncation",
+    "contentHash": "9e3028dd082589743856c443332137ab84761cda9bd90429408a4b7c0a7b6dc2",
+    "workstreamId": "ws-raft-raft-protocol-phase-storage-layer-xraft-storage-stage-segment-log-read-and-truncation",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-storage-layer-xraft-storage-stage-segment-log-read-and-truncation",
+    "status": "planning"
+  },
+  {
+    "title": "Quorum State File and Leader-Epoch Checkpoint",
+    "description": "Quorum State File and Leader-Epoch Checkpoint (4 steps)",
+    "anchor": "phase-storage-layer-xraft-storage/stage-quorum-state-file-and-leader-epoch-checkpoint",
+    "contentHash": "7508e29f4a6e246f350a1e7563b0eb4dfab8e13a32092811273cf0b79fd0bdf3",
+    "workstreamId": "ws-raft-raft-protocol-phase-storage-layer-xraft-storage-stage-quorum-state-file-and-leader-epoch-checkpoint",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-storage-layer-xraft-storage-stage-quorum-state-file-and-leader-epoch-checkpoint",
+    "status": "planning"
+  },
+  {
+    "title": "Snapshot Store",
+    "description": "Snapshot Store (4 steps)",
+    "anchor": "phase-storage-layer-xraft-storage/stage-snapshot-store",
+    "contentHash": "9fdd95010497debbf10f1ddf00153510492362a869e641d9694895e1f0ef3f49",
+    "workstreamId": "ws-raft-raft-protocol-phase-storage-layer-xraft-storage-stage-snapshot-store",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-storage-layer-xraft-storage-stage-snapshot-store",
+    "status": "planning"
+  },
+  {
+    "title": "Storage Integration and \u0060StorageEngine\u0060 Facade",
+    "description": "Storage Integration and \u0060StorageEngine\u0060 Facade (4 steps)",
+    "anchor": "phase-storage-layer-xraft-storage/stage-storage-integration-and-storageengine-facade",
+    "contentHash": "fea289456c0194c44bf2911949e923c9097ee945170268e71a1444bd7816e4a0",
+    "workstreamId": "ws-raft-raft-protocol-phase-storage-layer-xraft-storage-stage-storage-integration-and-storageengine-facade",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-storage-layer-xraft-storage-stage-storage-integration-and-storageengine-facade",
+    "status": "planning"
+  },
+  {
+    "title": "RPC Codec and Channel Transport",
+    "description": "RPC Codec and Channel Transport (5 steps)",
+    "anchor": "phase-transport-layer-xraft-transport/stage-rpc-codec-and-channel-transport",
+    "contentHash": "52bf10af8b7c819fd7fc0db389a6f625770889dcd0df13d9c6c630ee977c15b9",
+    "workstreamId": "ws-raft-raft-protocol-phase-transport-layer-xraft-transport-stage-rpc-codec-and-channel-transport",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-transport-layer-xraft-transport-stage-rpc-codec-and-channel-transport",
+    "status": "planning"
+  },
+  {
+    "title": "Network Simulator (Fault Injection)",
+    "description": "Network Simulator (Fault Injection) (6 steps)",
+    "anchor": "phase-transport-layer-xraft-transport/stage-network-simulator-fault-injection",
+    "contentHash": "c7ebc87f8cd5c3e6346702d7ffc9c4d57c21a3e91fd617ea40f4d2039b49e5d9",
+    "workstreamId": "ws-raft-raft-protocol-phase-transport-layer-xraft-transport-stage-network-simulator-fault-injection",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-transport-layer-xraft-transport-stage-network-simulator-fault-injection",
+    "status": "planning"
+  },
+  {
+    "title": "TCP Transport (Production)",
+    "description": "TCP Transport (Production) (6 steps)",
+    "anchor": "phase-transport-layer-xraft-transport/stage-tcp-transport-production",
+    "contentHash": "b3906f0d3ecca4570022be298d5a9e3d80b8039be521ea4a2fde3d3561621094",
+    "workstreamId": "ws-raft-raft-protocol-phase-transport-layer-xraft-transport-stage-tcp-transport-production",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-transport-layer-xraft-transport-stage-tcp-transport-production",
+    "status": "planning"
+  },
+  {
+    "title": "Event Loop Skeleton and Timer Infrastructure",
+    "description": "Event Loop Skeleton and Timer Infrastructure (5 steps)",
+    "anchor": "phase-election-and-leader-lifecycle-xraft-core/stage-event-loop-skeleton-and-timer-infrastructure",
+    "contentHash": "f90025fc4ea475efeea99b688b98411d4ef76140f2f14e949412442dbf0263b1",
+    "workstreamId": "ws-raft-raft-protocol-phase-election-and-leader-lifecycle-xraft-core-stage-event-loop-skeleton-and-timer-infrastructure",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-election-and-leader-lifecycle-xraft-core-stage-event-loop-skeleton-and-timer-infrastructure",
+    "status": "planning"
+  },
+  {
+    "title": "Election Manager \u2014 Vote Request/Response",
+    "description": "Election Manager \u2014 Vote Request/Response (6 steps)",
+    "anchor": "phase-election-and-leader-lifecycle-xraft-core/stage-election-manager-vote-request-response",
+    "contentHash": "0c5f925ef80eef1d15753ccb6d6e5d8c76bc5479dec07625ac67e3f9f9d4db11",
+    "workstreamId": "ws-raft-raft-protocol-phase-election-and-leader-lifecycle-xraft-core-stage-election-manager-vote-request-response",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-election-and-leader-lifecycle-xraft-core-stage-election-manager-vote-request-response",
+    "status": "planning"
+  },
+  {
+    "title": "Pre-Vote Protocol",
+    "description": "Pre-Vote Protocol (4 steps)",
+    "anchor": "phase-election-and-leader-lifecycle-xraft-core/stage-pre-vote-protocol",
+    "contentHash": "4f75d312cac3118f47e1b6e9d4d8beb7ff14ea1d73f05044f90f45519506c405",
+    "workstreamId": "ws-raft-raft-protocol-phase-election-and-leader-lifecycle-xraft-core-stage-pre-vote-protocol",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-election-and-leader-lifecycle-xraft-core-stage-pre-vote-protocol",
+    "status": "planning"
+  },
+  {
+    "title": "Check Quorum and Leader Step-Down",
+    "description": "Check Quorum and Leader Step-Down (4 steps)",
+    "anchor": "phase-election-and-leader-lifecycle-xraft-core/stage-check-quorum-and-leader-step-down",
+    "contentHash": "e127b4c94a90d1cf6ed162d1012e1d62ad5515fa730fbcd495ebb50711cdf0a5",
+    "workstreamId": "ws-raft-raft-protocol-phase-election-and-leader-lifecycle-xraft-core-stage-check-quorum-and-leader-step-down",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-election-and-leader-lifecycle-xraft-core-stage-check-quorum-and-leader-step-down",
+    "status": "planning"
+  },
+  {
+    "title": "Fetch RPC \u2014 Follower Side",
+    "description": "Fetch RPC \u2014 Follower Side (6 steps)",
+    "anchor": "phase-pull-based-log-replication-xraft-core/stage-fetch-rpc-follower-side",
+    "contentHash": "fb3acaf13319f865c21529255c8b778bc5d36c163d3e09c5d85e5637ae87d925",
+    "workstreamId": "ws-raft-raft-protocol-phase-pull-based-log-replication-xraft-core-stage-fetch-rpc-follower-side",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-pull-based-log-replication-xraft-core-stage-fetch-rpc-follower-side",
+    "status": "planning"
+  },
+  {
+    "title": "Fetch RPC \u2014 Leader Side",
+    "description": "Fetch RPC \u2014 Leader Side (6 steps)",
+    "anchor": "phase-pull-based-log-replication-xraft-core/stage-fetch-rpc-leader-side",
+    "contentHash": "3bdab6b80d913a8028d0120258e0e9b70331ff0dc36b140d5effe5252fca2541",
+    "workstreamId": "ws-raft-raft-protocol-phase-pull-based-log-replication-xraft-core-stage-fetch-rpc-leader-side",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-pull-based-log-replication-xraft-core-stage-fetch-rpc-leader-side",
+    "status": "planning"
+  },
+  {
+    "title": "High Watermark Advancement and Commit Notification",
+    "description": "High Watermark Advancement and Commit Notification (7 steps)",
+    "anchor": "phase-pull-based-log-replication-xraft-core/stage-high-watermark-advancement-and-commit-notification",
+    "contentHash": "b7661fe0401b6ba3560360f06cdb37cabca4d2342ee1ebc01371bb225d524a04",
+    "workstreamId": "ws-raft-raft-protocol-phase-pull-based-log-replication-xraft-core-stage-high-watermark-advancement-and-commit-notification",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-pull-based-log-replication-xraft-core-stage-high-watermark-advancement-and-commit-notification",
+    "status": "planning"
+  },
+  {
+    "title": "Crash Recovery Sequence",
+    "description": "Crash Recovery Sequence (10 steps)",
+    "anchor": "phase-persistence-crash-recovery-and-bootstrap-xraft-core/stage-crash-recovery-sequence",
+    "contentHash": "2a87079dcae396928d74cceb129210de8551e6794745b0e569d28ee4378a4b3e",
+    "workstreamId": "ws-raft-raft-protocol-phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-crash-recovery-sequence",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-crash-recovery-sequence",
+    "status": "planning"
+  },
+  {
+    "title": "Cluster Bootstrap",
+    "description": "Cluster Bootstrap (4 steps)",
+    "anchor": "phase-persistence-crash-recovery-and-bootstrap-xraft-core/stage-cluster-bootstrap",
+    "contentHash": "19b5c547d678a140febf061f1bc8cdea34ed74f7e0a97ea29a2af0b814061b0f",
+    "workstreamId": "ws-raft-raft-protocol-phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-cluster-bootstrap",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-cluster-bootstrap",
+    "status": "planning"
+  },
+  {
+    "title": "Periodic Snapshotting and Log Truncation",
+    "description": "Periodic Snapshotting and Log Truncation (5 steps)",
+    "anchor": "phase-log-compaction-and-snapshot-transfer-xraft-core/stage-periodic-snapshotting-and-log-truncation",
+    "contentHash": "5f713d00a225c43c60089fbd843a626bbc02c69fb9e9f695f0e0fd31d4c9e881",
+    "workstreamId": "ws-raft-raft-protocol-phase-log-compaction-and-snapshot-transfer-xraft-core-stage-periodic-snapshotting-and-log-truncation",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-log-compaction-and-snapshot-transfer-xraft-core-stage-periodic-snapshotting-and-log-truncation",
+    "status": "planning"
+  },
+  {
+    "title": "Snapshot Transfer via FetchSnapshot RPC",
+    "description": "Snapshot Transfer via FetchSnapshot RPC (4 steps)",
+    "anchor": "phase-log-compaction-and-snapshot-transfer-xraft-core/stage-snapshot-transfer-via-fetchsnapshot-rpc",
+    "contentHash": "3518fbf1a7ca355d52bc49ec670d78c5348f58209834c4209ac7733364d8a6f8",
+    "workstreamId": "ws-raft-raft-protocol-phase-log-compaction-and-snapshot-transfer-xraft-core-stage-snapshot-transfer-via-fetchsnapshot-rpc",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-log-compaction-and-snapshot-transfer-xraft-core-stage-snapshot-transfer-via-fetchsnapshot-rpc",
+    "status": "planning"
+  },
+  {
+    "title": "Membership Manager \u2014 Add Voter",
+    "description": "Membership Manager \u2014 Add Voter (6 steps)",
+    "anchor": "phase-dynamic-quorum-membership-changes/stage-membership-manager-add-voter",
+    "contentHash": "0db39f6d35358ce21f5f656bf0c53142a7549bb7880d75c35205b740264fdc10",
+    "workstreamId": "ws-raft-raft-protocol-phase-dynamic-quorum-membership-changes-stage-membership-manager-add-voter",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-dynamic-quorum-membership-changes-stage-membership-manager-add-voter",
+    "status": "planning"
+  },
+  {
+    "title": "Membership Manager \u2014 Remove Voter",
+    "description": "Membership Manager \u2014 Remove Voter (4 steps)",
+    "anchor": "phase-dynamic-quorum-membership-changes/stage-membership-manager-remove-voter",
+    "contentHash": "12d64bf546405fa6116828b5200f72302aa7a855323f13c6297659f35dc179bb",
+    "workstreamId": "ws-raft-raft-protocol-phase-dynamic-quorum-membership-changes-stage-membership-manager-remove-voter",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-dynamic-quorum-membership-changes-stage-membership-manager-remove-voter",
+    "status": "planning"
+  },
+  {
+    "title": "Update Voter and VotersRecord Snapshot Integration",
+    "description": "Update Voter and VotersRecord Snapshot Integration (4 steps)",
+    "anchor": "phase-dynamic-quorum-membership-changes/stage-update-voter-and-votersrecord-snapshot-integration",
+    "contentHash": "d5b5a940f364b0bbd1f320edc85f77109024f7e9b89158b134dc20dda3e58e1e",
+    "workstreamId": "ws-raft-raft-protocol-phase-dynamic-quorum-membership-changes-stage-update-voter-and-votersrecord-snapshot-integration",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-dynamic-quorum-membership-changes-stage-update-voter-and-votersrecord-snapshot-integration",
+    "status": "planning"
+  },
+  {
+    "title": "Simulated Cluster",
+    "description": "Simulated Cluster (5 steps)",
+    "anchor": "phase-test-harness-xraft-test/stage-simulated-cluster",
+    "contentHash": "a5571443e210a87516e9a91d9335d85b5e91f2f2a053921033d838c1f472195f",
+    "workstreamId": "ws-raft-raft-protocol-phase-test-harness-xraft-test-stage-simulated-cluster",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-test-harness-xraft-test-stage-simulated-cluster",
+    "status": "planning"
+  },
+  {
+    "title": "Invariant Checker",
+    "description": "Invariant Checker (7 steps)",
+    "anchor": "phase-test-harness-xraft-test/stage-invariant-checker",
+    "contentHash": "5fec0d59ed02ce12b054db0d98d2529264f155e8cfe08ac33592018e29968f10",
+    "workstreamId": "ws-raft-raft-protocol-phase-test-harness-xraft-test-stage-invariant-checker",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-test-harness-xraft-test-stage-invariant-checker",
+    "status": "planning"
+  },
+  {
+    "title": "Election Scenario Tests",
+    "description": "Election Scenario Tests (6 steps)",
+    "anchor": "phase-integration-testing-and-scenario-validation/stage-election-scenario-tests",
+    "contentHash": "54ffd04c9b4a6cee60345f8ac3e70acf7c82ee5e16c2b97374ddba99fb0eea44",
+    "workstreamId": "ws-raft-raft-protocol-phase-integration-testing-and-scenario-validation-stage-election-scenario-tests",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-integration-testing-and-scenario-validation-stage-election-scenario-tests",
+    "status": "planning"
+  },
+  {
+    "title": "Replication and Commit Scenario Tests",
+    "description": "Replication and Commit Scenario Tests (5 steps)",
+    "anchor": "phase-integration-testing-and-scenario-validation/stage-replication-and-commit-scenario-tests",
+    "contentHash": "17620d0c4997b5da24c4d3bce204e3843eee55353cb280f35e2949609a76924a",
+    "workstreamId": "ws-raft-raft-protocol-phase-integration-testing-and-scenario-validation-stage-replication-and-commit-scenario-tests",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-integration-testing-and-scenario-validation-stage-replication-and-commit-scenario-tests",
+    "status": "planning"
+  },
+  {
+    "title": "Partition, Snapshot, and Membership Scenario Tests",
+    "description": "Partition, Snapshot, and Membership Scenario Tests (7 steps)",
+    "anchor": "phase-integration-testing-and-scenario-validation/stage-partition-snapshot-and-membership-scenario-tests",
+    "contentHash": "98d3300d7d426a744f5a637dfa3a075a5d8d2097a9008062cbca425d54bbdb24",
+    "workstreamId": "ws-raft-raft-protocol-phase-integration-testing-and-scenario-validation-stage-partition-snapshot-and-membership-scenario-tests",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-integration-testing-and-scenario-validation-stage-partition-snapshot-and-membership-scenario-tests",
+    "status": "planning"
+  },
+  {
+    "title": "Metrics Collector",
+    "description": "Metrics Collector (4 steps)",
+    "anchor": "phase-observability-documentation-and-polish/stage-metrics-collector",
+    "contentHash": "4e156e9edea7423cf6466b95c5cebcd52f0c4f18069317358d5d3552b5d269b9",
+    "workstreamId": "ws-raft-raft-protocol-phase-observability-documentation-and-polish-stage-metrics-collector",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-observability-documentation-and-polish-stage-metrics-collector",
+    "status": "planning"
+  },
+  {
+    "title": "API Documentation and README",
+    "description": "API Documentation and README (9 steps)",
+    "anchor": "phase-observability-documentation-and-polish/stage-api-documentation-and-readme",
+    "contentHash": "89b6067f37f139f22fd4d47297cbd299f4640a1d866fe7131d0a41f00eb44dee",
+    "workstreamId": "ws-raft-raft-protocol-phase-observability-documentation-and-polish-stage-api-documentation-and-readme",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-observability-documentation-and-polish-stage-api-documentation-and-readme",
+    "status": "planning"
+  },
+  {
+    "title": "CI Pipeline and Release Readiness",
+    "description": "CI Pipeline and Release Readiness (5 steps)",
+    "anchor": "phase-observability-documentation-and-polish/stage-ci-pipeline-and-release-readiness",
+    "contentHash": "b672fec4fc014e02405809ce69fbdc9f72856d745f2407e61dae1def5ab25af1",
+    "workstreamId": "ws-raft-raft-protocol-phase-observability-documentation-and-polish-stage-ci-pipeline-and-release-readiness",
+    "branch": "ws/raft-RAFT-PROTOCOL/phase-observability-documentation-and-polish-stage-ci-pipeline-and-release-readiness",
+    "status": "planning"
+  }
+]
