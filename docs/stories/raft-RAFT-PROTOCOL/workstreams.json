@@ -57,7 +57,7 @@
     "title": "\u0060RaftNode\u0060 Public API Skeleton",
     "description": "\u0060RaftNode\u0060 Public API Skeleton (7 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-raftnode-public-api-skeleton",
-    "contentHash": "e5ad10f5400a7a0d08e5e87f12bf60d667785e63795b2ac88a9f8294d927b30e",
+    "contentHash": "b4e742ab55b602895edcd71600ea2ea7fb98723546c9ca2067ca147bb679c23a",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
     "status": "planning"
@@ -199,9 +199,9 @@
   },
   {
     "title": "Crash Recovery Sequence",
-    "description": "Crash Recovery Sequence (4 steps)",
+    "description": "Crash Recovery Sequence (10 steps)",
     "anchor": "phase-persistence-crash-recovery-and-bootstrap-xraft-core/stage-crash-recovery-sequence",
-    "contentHash": "420fd37c316f67345bab81316f89ce7b39cd5ef10adc6524f6a2397c61cbdeed",
+    "contentHash": "19db1407d081db34d41d64644db31f51966fa0946d882e276dc6b3dfc8927559",
     "workstreamId": "ws-raft-raft-protocol-phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-crash-recovery-sequence",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-crash-recovery-sequence",
     "status": "planning"
@@ -210,7 +210,7 @@
     "title": "Cluster Bootstrap",
     "description": "Cluster Bootstrap (4 steps)",
     "anchor": "phase-persistence-crash-recovery-and-bootstrap-xraft-core/stage-cluster-bootstrap",
-    "contentHash": "e584876d9b6225264fc607021c45d00c17d9cd730662cf2b041b04acb8f766bb",
+    "contentHash": "f4a757ff6c15c53c37b4fb8962eb7eaf1bbdcccea233fc9a056289b770d93064",
     "workstreamId": "ws-raft-raft-protocol-phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-cluster-bootstrap",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-cluster-bootstrap",
     "status": "planning"
@@ -325,9 +325,9 @@
   },
   {
     "title": "API Documentation and README",
-    "description": "API Documentation and README (5 steps)",
+    "description": "API Documentation and README (9 steps)",
     "anchor": "phase-observability-documentation-and-polish/stage-api-documentation-and-readme",
-    "contentHash": "cd419f236a5e03133dae3b2960687fb5587d11ecec452bf3b5b576879817bd48",
+    "contentHash": "70aaa33f72f4e84ed783f7be8ca8e35c878d250fe1de133eff4aa606742cd501",
     "workstreamId": "ws-raft-raft-protocol-phase-observability-documentation-and-polish-stage-api-documentation-and-readme",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-observability-documentation-and-polish-stage-api-documentation-and-readme",
     "status": "planning"
