@@ -1942,30 +1942,38 @@ leader to provide the authoritative HW via subsequent Fetch responses.
    entries), the leader responds with a `SnapshotId` and the node falls
    back to snapshot transfer (§5.4).
 
-### 5.11 Client Read (Linearizable)
+### 5.11 Client Read (Leadership-Proof)
 
-Linearizable reads ensure the returned state reflects all writes committed
-before the read was issued. The leader confirms its authority by verifying
-that a current-term entry has been committed (the `LeaderChangeMessage`
-appended at the start of the term, or any subsequent entry). Once
-confirmed, it queries the state machine synchronously within the event
-loop. **No per-read log entry is appended** — the existing committed
-current-term entry serves as the leadership proof.
+The leader confirms its authority by verifying that a current-term entry
+has been committed (the `LeaderChangeMessage` appended at the start of
+the term, or any subsequent entry). Once confirmed, it queries the state
+machine synchronously within the event loop. **No per-read log entry is
+appended** — the existing committed current-term entry serves as the
+leadership proof. The returned state reflects every write committed
+before the read was issued.
 
-> **Reconciliation with tech-spec §2.1.5 / §2.2.** The tech spec says
-> "Initial implementation routes reads through the log for safety" and
-> lists "Linearisable reads — Read-index or lease-based reads" as out
-> of scope. These statements describe two distinct things: (1) the
-> **initial implementation** uses the replicated log's committed state
-> (specifically, the committed `LeaderChangeMessage`) to prove leadership
-> — this is what "through the log" means; (2) **optimised read paths**
-> (read-index with per-read heartbeat broadcast, lease-based with clock
-> assumptions) are out of scope. The architecture's read path satisfies
-> (1): it uses the log's committed state for the leadership proof. It
-> does not implement (2): no per-read heartbeat broadcast or lease
-> mechanism. The read path IS linearizable because the leadership proof
-> guarantees no stale leader can serve reads (see "Why this is
-> linearizable" below).
+> **Reconciliation with tech-spec §2.2 out-of-scope listing.**
+>
+> The tech spec lists "Linearisable reads — Read-index or lease-based
+> reads" as out of scope. Those are two specific **optimised** read
+> techniques: *read-index* (leader broadcasts a per-read heartbeat to a
+> majority before serving the read) and *lease-based* (leader assumes
+> continued authority based on clock bounds). This architecture
+> implements **neither**. Instead it uses a simpler leadership-proof
+> mechanism: the leader checks whether an already-committed current-term
+> entry exists in the log. No per-read network round-trip; no clock
+> assumptions.
+>
+> The tech spec also says "initial implementation routes reads through
+> the log for safety." This architecture satisfies that requirement —
+> the leadership proof IS the log: the committed `LeaderChangeMessage`
+> proves the leader was elected by a majority after any prior leader.
+>
+> This read path achieves linearizable semantics (see "Why this achieves
+> linearizable semantics" below) through the protocol's existing commit
+> guarantees — not through an additional mechanism layered on top.
+> Therefore it does not conflict with the out-of-scope exclusion of
+> read-index and lease-based techniques.
 
 ```
     Client            RaftNode        EventLoop          StateMachine
@@ -2059,22 +2067,27 @@ current-term entry serves as the leadership proof.
    the `DeferredReadQueue` are resolved with `Err(NotLeader { .. })`. On
    `shutdown()`, pending reads are resolved with `Err(Shutdown)`.
 
-**Why this is linearizable.** A committed current-term entry proves the
-leader was elected by a majority *after* any prior leader. All `apply()`
-calls up to the current HW have executed before `query()` runs. Therefore
-the returned state reflects every write committed before the read was
-issued — the definition of linearizability.
+**Why this achieves linearizable semantics.** A committed current-term
+entry proves the leader was elected by a majority *after* any prior
+leader. All `apply()` calls up to the current HW have executed before
+`query()` runs. Therefore the returned state reflects every write
+committed before the read was issued — the definition of
+linearizability. This property falls out of the existing commit
+protocol; it does not require the read-index or lease-based mechanisms
+that the tech spec excludes.
 
 **`RaftNode::read()` proposed signature:**
 
 ```rust
 impl<S: StateMachine, L: Listener> RaftNode<S, L> {
-    /// Linearizable read. Returns the application state as of the latest
-    /// committed offset. Leader-only; followers return NotLeader.
+    /// Leadership-proof read. Returns the application state as of the
+    /// latest committed offset. Leader-only; followers return NotLeader.
     ///
     /// The leader confirms its authority (a current-term entry is committed),
     /// then queries the state machine synchronously within the event loop.
-    /// The query function runs inside the event loop's single-threaded context.
+    /// If leadership is not yet confirmed (fresh leader whose
+    /// LeaderChangeMessage has not committed), the returned future parks
+    /// until confirmation completes. This is an async/future-backed call.
     pub async fn read(&self) -> Result<S::ReadResult> { ... }
 }
 ```
@@ -2227,43 +2240,48 @@ would incorrectly include one uncommitted entry.
 
 **Canonical resolution:** Four-phase commit notification (this
 architecture §4.1). Step 4 (`DeferredReadQueue::drain`) is required for
-the linearizable read path defined in §5.11. The implementation plan's
-three-phase model omits the read-path step.
+the leadership-proof read path defined in §5.11. The implementation
+plan's three-phase model omits the read-path step. *Required
+sibling-doc changes:* See §7.4.
 
-#### Divergence 4 — `read()` semantics, linearizability scope, and `StateMachine` trait shape
+#### Divergence 4 — `read()` semantics and `StateMachine` trait shape
 
 | Document | Statement | Section |
 |----------|-----------|---------|
 | **Tech spec** | `read() → Result<State>`. "Initial implementation routes reads through the log for safety." Out-of-scope list includes: "Linearisable reads — Read-index or lease-based reads." `StateMachine` trait has `apply`, `snapshot`, `restore` only (no `query`). | §2.1.5, §2.2 |
 | **Impl plan** | `read() → Result<ConsensusState>` — returns protocol metadata (term, role, leader, HW, voter set). `StateMachine` trait has `apply`, `snapshot`, `restore` only. | Stages 1.7, 5.3, 1.4 |
-| **This architecture** | `read() → Result<S::ReadResult>` — leader-only, returns application state via `StateMachine::query()`. No per-read log entry is appended; the leader confirms authority by verifying a committed current-term entry (leadership proof, §5.11). `StateMachine` trait adds `type ReadResult` and `fn query(&self)`. Protocol metadata is available separately via `RaftNode::metrics()`. | §5.11, §4.1 |
+| **This architecture** | `read() → Result<S::ReadResult>` — async/future-backed, leader-only, returns application state via `StateMachine::query()`. No per-read log entry appended; the leader confirms authority via a committed current-term entry (§5.11). `StateMachine` trait adds `type ReadResult` and `fn query(&self)`. Protocol metadata available via `RaftNode::metrics()`. | §5.11, §4.1 |
 | **E2e scenarios** | Uses the `S::ReadResult` / `query()` model from this architecture. | Client Interaction feature |
 
 **Canonical resolution:** `read()` returns `S::ReadResult` via
-`StateMachine::query()` (this architecture §5.11).
+`StateMachine::query()` (this architecture §5.11). Protocol metadata
+(term, role, HW, voter set) is available separately via
+`RaftNode::metrics()` — never via `read()`.
 
-*What "routes reads through the log" means:* The tech spec's phrase
-does NOT mean appending a per-read entry to the log. It means the read
-path depends on the log's committed state — specifically, the leader
-uses its committed `LeaderChangeMessage` (a log entry) as the
-leadership proof. The log is the source of truth; no separate mechanism
-(heartbeat broadcast, clock lease) is involved.
+Three reconciliation points:
 
-*Reconciliation with the out-of-scope listing:* The tech spec lists
-"Linearisable reads — Read-index or lease-based reads" as out of scope.
-The architecture's read path does NOT use read-index (per-read heartbeat
-broadcast to a majority) or lease-based (clock-dependent leadership
-assumption). It uses a simpler leadership-proof mechanism that relies
-on an already-committed current-term entry. This mechanism is
-linearizable (see §5.11 "Why this is linearizable") but is not one of
-the two optimised techniques the tech spec excludes. The initial
-implementation's linearizability comes from the protocol's existing
-commit guarantees, not from an additional mechanism layered on top.
+1. **"Routes reads through the log"** — this architecture satisfies the
+   tech spec's requirement. The read path depends on the log's committed
+   state: the committed `LeaderChangeMessage` is the leadership proof.
+   No separate mechanism (heartbeat broadcast, clock lease) is involved.
 
-*Trait shape:* The implementation plan's `ConsensusState` return type
-should be replaced with `S::ReadResult`; `StateMachine` needs
-`type ReadResult` and `fn query(&self)`. The tech spec's simpler
-`StateMachine` signature is a summary, not a binding constraint.
+2. **"Linearisable reads" out of scope** — the tech spec excludes two
+   specific optimised techniques: *read-index* (per-read heartbeat
+   broadcast to a majority) and *lease-based* (clock-dependent leadership
+   assumption). This architecture uses neither. The leadership-proof
+   mechanism relies on an already-committed current-term entry, which is
+   a simpler approach that achieves linearizable semantics through the
+   protocol's existing commit guarantees (§5.11 "Why this achieves
+   linearizable semantics").
+
+3. **`read()` is async/future-backed** — a fresh leader whose
+   `LeaderChangeMessage` has not yet committed parks the `ReadRequest`
+   in the `DeferredReadQueue`; the returned future resolves once
+   leadership is confirmed. Sibling docs that describe `read()` as
+   returning an immediate `Result` should be updated to reflect the
+   future-backed, leader-only semantics.
+
+*Required sibling-doc changes:* See §7.4.
 
 #### Divergence 5 — `LogStore` method receivers
 
@@ -2355,3 +2373,27 @@ points checked:
 - Four-phase commit notification (§4.1).
 - `read() → S::ReadResult` via `StateMachine::query()` (§5.11).
 - Protocol metadata via `RaftNode::metrics()`, not `read()`.
+
+### 7.4 Required Sibling-Doc Updates
+
+The following changes are required in sibling documents to align with
+the canonical resolutions in §7.2. Each entry names the exact location
+and the required change.
+
+#### Implementation plan updates
+
+| Target | Current | Required change | Divergence |
+|--------|---------|-----------------|------------|
+| **Stage 1.4** — `StateMachine` trait definition | `apply`, `snapshot`, `restore` only | Add `type ReadResult: Send + 'static` and `fn query(&self) -> Result<Self::ReadResult>` | D4 |
+| **Stage 1.7** — `RaftNode::read()` signature | `read() → Result<ConsensusState>` (immediate, returns protocol metadata) | `read() → Future<Result<S::ReadResult>>` (async/future-backed, returns application state via `StateMachine::query()`; leader-only; may park in `DeferredReadQueue` until leadership is confirmed) | D4 |
+| **Stage 5.3** — `read()` implementation | Returns `ConsensusState` snapshot | Implement leadership-proof path per architecture §5.11; protocol metadata moves to `RaftNode::metrics()` | D4 |
+| **Stages 5.1, 5.3, 6.1** — commit notification | "three-phase commit notification" (apply → handle_commit → complete) | "four-phase commit notification" — add step 4: `DeferredReadQueue::drain` (resolve pending reads via `StateMachine::query()`) | D3 |
+| **Stage 1.4** — `LogStore` method receivers | `append(&mut self)`, `truncate_suffix(&mut self)`, `truncate_prefix(&mut self)` | All methods take `&self` with interior mutability (`Sync` bound); see architecture §4.1 | D5 |
+
+#### Tech-spec clarifications
+
+| Target | Current | Suggested clarification | Divergence |
+|--------|---------|-------------------------|------------|
+| **§2.2** — "Linearisable reads" out of scope | "Read-index or lease-based reads" | Clarify that the exclusion targets two specific optimised techniques (read-index with per-read heartbeat broadcast; lease-based with clock assumptions). The initial leadership-proof read path (architecture §5.11) is NOT one of these techniques and is in scope. | D4 |
+| **§4.4.1** — callback execution model | "application callbacks are staged and executed asynchronously outside the loop" | Callbacks (`StateMachine::apply`, `Listener::handle_commit`) are synchronous, in-process calls within the event loop, executed after state mutation but before `IoAction` dispatch. | D1 |
+| **§8 Glossary** — HW definition | "Entries at or below the HW are considered committed" (inclusive) | HW is an exclusive upper bound: entry at offset O is committed ⟺ `O < HW`. The committed set is identical; only the numeric convention differs (`HW_inclusive = HW_exclusive − 1`). | D2 |
