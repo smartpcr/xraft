@@ -2,11 +2,17 @@
 
 ## 1. Architectural Overview
 
-xraft is a Rust library implementing the Raft consensus protocol using a
-**pull-based (fetch) replication model** derived from Apache Kafka's KRaft
-protocol. It is structured as a Cargo workspace of four crates that enforce
-separation between the consensus state machine, durable storage, network
-transport, and testing infrastructure.
+> **Greenfield notice.** The `smartpcr/xraft` repository contains no Rust
+> source code as of this writing — only `README.md` and planning documents
+> under `docs/`. Every crate name, module boundary, trait definition, and API
+> signature described below is a **proposed design**. Nothing references
+> existing code because none exists yet.
+
+xraft is a proposed Rust library implementing the Raft consensus protocol
+using a **pull-based (fetch) replication model** derived from Apache Kafka's
+KRaft protocol. The design calls for a Cargo workspace of four crates that
+enforce separation between the consensus state machine, durable storage,
+network transport, and testing infrastructure.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -15,7 +21,7 @@ transport, and testing infrastructure.
 └───────────────────────────┬──────────────────────────────────────────┘
                             │ propose() / read() / callbacks
 ┌───────────────────────────▼──────────────────────────────────────────┐
-│                        xraft-core                                    │
+│                   xraft-core  (proposed crate)                       │
 │  ┌──────────────┐  ┌──────────────┐  ┌───────────────────────────┐  │
 │  │  RaftNode    │  │  EventLoop   │  │  ConsensusState           │  │
 │  │  (public API)│──│  (single-    │──│  (term, role, voters,     │  │
@@ -30,31 +36,36 @@ transport, and testing infrastructure.
            │                  │                    │
 ┌──────────▼──────┐  ┌───────▼────────┐  ┌────────▼──────────────────┐
 │ xraft-transport │  │ xraft-storage  │  │ xraft-test                │
+│ (proposed crate)│  │(proposed crate)│  │ (proposed crate)          │
 │ (async RPC)     │  │ (log, snap,    │  │ (deterministic simulation)│
 │                 │  │  quorum-state) │  │                           │
 └─────────────────┘  └────────────────┘  └───────────────────────────┘
 ```
 
-**Design philosophy.** The consensus core (`xraft-core`) is a pure state
-machine driven by a single-threaded event loop — no locks, no shared mutable
-state. All I/O (network, disk) is performed by the transport and storage
-crates and fed into the event loop as messages. This mirrors KRaft's
-`KafkaRaftClient` architecture and eliminates concurrency bugs in the
-correctness-critical consensus logic.
+**Design philosophy.** The proposed consensus core (`xraft-core`) is driven
+by a single-threaded async event loop — no locks, no shared mutable state.
+The event loop interacts with storage and network exclusively through
+injected async trait objects (`LogStore`, `Transport`, `SnapshotIO`,
+`QuorumStateStore`, `Clock`). It never opens files or sockets directly;
+all concrete I/O is provided by the transport and storage crates at
+construction time. This mirrors KRaft's `KafkaRaftClient` architecture
+and eliminates concurrency bugs in the correctness-critical consensus
+logic while allowing deterministic testing via trait substitution.
 
 ---
 
 ## 2. Components and Responsibilities
 
-### 2.1 `xraft-core` — Consensus State Machine
+### 2.1 Proposed `xraft-core` — Consensus Engine
 
-The central crate. Contains no I/O code — only pure state transitions driven
-by incoming events (RPC messages, timer ticks, storage completions).
+The central crate. Contains no direct I/O code — all storage and network
+operations are dispatched through injected async trait objects. The event
+loop `await`s trait methods but never opens files or sockets itself.
 
 | Sub-component | Responsibility |
 |---------------|----------------|
 | **`RaftNode`** | Public API surface. Exposes `propose()`, `read()`, and lifecycle methods. Owns the `EventLoop` and coordinates startup/shutdown. Accepts a generic `StateMachine` type parameter (monomorphised at compile time). |
-| **`EventLoop`** | Single-threaded async loop that drains an inbound message queue and dispatches to the appropriate handler. Every state transition happens here. Uses `tokio::sync::mpsc` for the inbound channel. Runs on a dedicated `tokio` task. |
+| **`EventLoop`** | Single-threaded async loop that drains an inbound message queue and dispatches to the appropriate handler. Every state transition happens here. Uses `tokio::sync::mpsc` for the inbound channel. Runs on a dedicated `tokio` task. Calls storage and transport through injected trait objects (e.g., `LogStore::append()`, `Transport::send()`); these calls are `await`ed but the loop never performs raw I/O itself. |
 | **`ConsensusState`** | The core state: current `term`, `voted_for`, node `role` (Follower / Candidate / Leader), the in-memory log index, `high_watermark`, `log_start_offset`, the voter set, and per-follower replication progress (leader only). |
 | **`ElectionManager`** | Implements Pre-Vote and Vote protocols. Manages election timeouts (randomised 150–300 ms), vote collection, term advancement, and leader-to-follower step-down on Check Quorum failure. |
 | **`ReplicationManager`** | Handles Fetch request/response processing on both leader and follower sides. On the leader: validates fetch offset against the leader-epoch checkpoint, detects log divergence (populates `DivergingEpoch`), tracks follower progress, and advances the high watermark when a majority has replicated. On the follower: sends periodic Fetch RPCs, processes responses, truncates log on divergence, and updates the local high watermark. |
@@ -62,7 +73,7 @@ by incoming events (RPC messages, timer ticks, storage completions).
 | **`SnapshotCoordinator`** | Triggers periodic snapshots via the `StateMachine` trait. Coordinates `FetchSnapshot` RPC flows when a follower's required offset is below the log start offset. Manages chunked snapshot transfer state. |
 | **`MetricsCollector`** | Maintains consensus metrics: `current_leader`, `current_epoch`, `election_latency_avg`, `append_records_rate`, `commit_latency_avg`. Exposed as a queryable Rust struct. |
 
-### 2.2 `xraft-storage` — Durable Log and Snapshots
+### 2.2 Proposed `xraft-storage` — Durable Log and Snapshots
 
 Owns all persistent state. Every write is `fsync`-ed before acknowledgement.
 
@@ -74,11 +85,11 @@ Owns all persistent state. Every write is `fsync`-ed before acknowledgement.
 | **`QuorumStateFile`** | Persists voting state (`current_term`, `voted_for`, `leader_id`, `leader_epoch`) in a separate small file, analogous to KRaft's `quorum-state` file. Separated from the log for bootstrapping and performance. |
 | **`LeaderEpochCheckpoint`** | Persists and caches the mapping from leader epoch → start offset. Used by the leader to validate Fetch requests and detect log divergence efficiently. Loaded into memory on startup. |
 
-### 2.3 `xraft-transport` — Async RPC Layer
+### 2.3 Proposed `xraft-transport` — Async RPC Layer
 
 Abstracts network communication behind a trait so the core never touches
-sockets directly. Production implementation uses `tokio` TCP; test
-implementation uses in-process channels.
+sockets directly. The proposed production implementation uses `tokio` TCP;
+the proposed test implementation uses in-process channels.
 
 | Sub-component | Responsibility |
 |---------------|----------------|
@@ -87,7 +98,7 @@ implementation uses in-process channels.
 | **`ChannelTransport`** | In-process transport for integration tests. Uses `tokio::sync::mpsc` channels. Supports fault injection: message delay, drop, reorder, partition. |
 | **`RpcCodec`** | Serialisation/deserialisation of RPC messages. Uses `serde` + `bincode`. Every message includes `cluster_id` and `leader_epoch` for identity verification and fencing. |
 
-### 2.4 `xraft-test` — Deterministic Simulation Harness
+### 2.4 Proposed `xraft-test` — Deterministic Simulation Harness
 
 Enables reproducible testing of edge cases that are impossible to trigger
 reliably with wall-clock time and real I/O.
@@ -535,23 +546,23 @@ pub trait QuorumStateStore: Send + Sync + 'static {
      └──────────┘  └───────────┘ └───────────┘ └──────────┘ └────────┘
 ```
 
-### 4.3 Crate Dependency Graph
+### 4.3 Proposed Crate Dependency Graph
 
 ```
 xraft-test ──depends-on──► xraft-core
 xraft-test ──depends-on──► xraft-transport  (ChannelTransport)
 xraft-test ──depends-on──► xraft-storage    (MemoryLogStore)
 
-xraft-core ──depends-on──► (trait definitions only — no concrete I/O)
+xraft-core ──depends-on──► (trait definitions only — no concrete I/O deps)
 
 xraft-transport ──depends-on──► xraft-core  (message types, NodeId)
 xraft-storage   ──depends-on──► xraft-core  (LogEntry, Snapshot, QuorumState types)
 ```
 
-`xraft-core` defines all trait interfaces and data types. The concrete
-implementations in `xraft-transport` and `xraft-storage` depend on `xraft-core`
-for those types. `xraft-test` depends on all three to wire up simulation
-clusters.
+`xraft-core` will define all trait interfaces and data types. The concrete
+implementations in `xraft-transport` and `xraft-storage` will depend on
+`xraft-core` for those types. `xraft-test` will depend on all three to
+wire up simulation clusters.
 
 ---
 
@@ -615,8 +626,11 @@ Fetch response from a leader.
         │                       │                       │
   ┌─────┴──────┐                │                       │
   │ Majority   │                │                       │
-  │ votes.     │                │                       │
-  │ Become     │                │                       │
+  │ votes:     │                │                       │
+  │ ⌊3/2⌋+1=2 │                │                       │
+  │ received 3 │                │                       │
+  │ (self+B+C) │                │                       │
+  │ → Become   │                │                       │
   │ LEADER     │                │                       │
   │ term=T+1   │                │                       │
   └─────┬──────┘                │                       │
@@ -675,10 +689,16 @@ leader. Two fetch rounds are required for a follower to observe a commit.
        │                │   HW=4             │                   │
        │                │                    │                   │
        │          ┌─────┴──────┐             │                   │
-       │          │ Both B & C │             │                   │
-       │          │ fetched 5. │             │                   │
-       │          │ Majority!  │             │                   │
-       │          │ HW ← 5    │             │                   │
+       │          │ B fetched  │             │                   │
+       │          │ off=6, C   │             │                   │
+       │          │ fetched 6. │             │                   │
+       │          │ Offsets:   │             │                   │
+       │          │ A=6,B=5,   │             │                   │
+       │          │ C=5 sorted │             │                   │
+       │          │ desc=[6,5, │             │                   │
+       │          │ 5] idx     │             │                   │
+       │          │ ⌊3/2⌋=1   │             │                   │
+       │          │ → HW ← 5  │             │                   │
        │          └─────┬──────┘             │                   │
        │                │                    │                   │
        │                │  ◄── FetchRequest ─│  (second round)   │
@@ -693,12 +713,29 @@ leader. Two fetch rounds are required for a follower to observe a commit.
        │                │                    │                   │
 ```
 
-**High-watermark advancement rule:** The leader maintains `FollowerProgress`
-for each voter. When a Fetch request arrives from follower F at
-`fetch_offset = N`, the leader records that F has replicated up to `N-1`. The
-leader sorts all voter `fetch_offset` values and takes the median — this is
-the new high watermark (committed offset). Only voters count; observers do
-not contribute to quorum.
+**High-watermark advancement rule (quorum math).** The leader maintains
+`FollowerProgress` for each voter. When a Fetch request arrives from
+follower F at `fetch_offset = N`, the leader records that F has replicated
+up to `N-1`. To compute the new high watermark, the leader collects the
+replicated offset for every voter (including itself) and sorts them in
+**descending** order. The new high watermark is the value at index
+`⌊V/2⌋` (0-indexed), where `V` is the total number of voters. This is
+the highest offset replicated by at least a **majority** (`⌊V/2⌋ + 1`)
+of voters.
+
+*Example (V=3, offsets [10, 8, 5]):* Sorted descending: [10, 8, 5].
+Index ⌊3/2⌋ = 1 → value 8. Two voters (10, 8) have replicated ≥ 8 →
+majority. HW ← 8.
+
+*Example (V=5, offsets [10, 8, 7, 5, 3]):* Sorted descending:
+[10, 8, 7, 5, 3]. Index ⌊5/2⌋ = 2 → value 7. Three voters (10, 8, 7)
+have replicated ≥ 7 → majority. HW ← 7.
+
+*Example (V=4, offsets [10, 8, 5, 3]):* Sorted descending:
+[10, 8, 5, 3]. Index ⌊4/2⌋ = 2 → value 5. Three voters (10, 8, 5)
+have replicated ≥ 5 → majority. HW ← 5.
+
+Only voters count; observers do not contribute to quorum.
 
 **Two-round commit visibility:** A follower fetches entries in round 1 but
 receives the old HW. The leader advances HW after majority replication. The
@@ -908,7 +945,8 @@ The leader periodically verifies it can still reach a majority of voters.
   │ Voters with    │          │                     │
   │ recent fetch:  │          │                     │
   │ {self, B} = 2  │          │                     │
-  │ Quorum = 2     │          │                     │
+  │ Majority =     │          │                     │
+  │  ⌊3/2⌋+1 = 2  │          │                     │
   │ 2 ≥ 2 → OK    │          │                     │
   └───┬────────────┘          │                     │
       │                       │                     │
@@ -921,7 +959,8 @@ The leader periodically verifies it can still reach a majority of voters.
   │ Voters with    │          │                     │
   │ recent fetch:  │          │                     │
   │ {self} = 1     │          │                     │
-  │ Quorum = 2     │          │                     │
+  │ Majority =     │          │                     │
+  │  ⌊3/2⌋+1 = 2  │          │                     │
   │ 1 < 2 → FAIL  │          │                     │
   │                │          │                     │
   │ Step down to   │          │                     │
@@ -931,15 +970,18 @@ The leader periodically verifies it can still reach a majority of voters.
 ```
 
 The leader counts itself plus every voter whose `last_fetch_timestamp` is
-within the election timeout window. If the count is below majority, the
-leader steps down to follower to prevent split-brain.
+within the election timeout window. If the count is below majority
+(`⌊V/2⌋ + 1` where V is the voter count), the leader steps down to
+follower to prevent split-brain.
 
 ### 5.7 Client Proposal (Full Path)
 
 End-to-end flow from client command to committed state machine application.
+The `EventLoop` calls `LogStore` through the injected trait object (shown
+as `LogStore (trait)`). No raw I/O occurs inside `xraft-core`.
 
 ```
-    Client              RaftNode              EventLoop            LogStore
+    Client              RaftNode              EventLoop        LogStore (trait)
       │                    │                      │                    │
       │── propose(cmd) ───►│                      │                    │
       │                    │                      │                    │
@@ -957,8 +999,9 @@ End-to-end flow from client command to committed state machine application.
       │                    │                 │ term=T     │            │
       │                    │                 └─────┬──────┘            │
       │                    │                       │                    │
-      │                    │                       │── append([entry]) ►│
-      │                    │                       │                    │
+      │                    │                       │── .append(entry)──►│
+      │                    │                       │   (await trait     │
+      │                    │                       │    method)         │
       │                    │                       │◄── Ok (fsync'd) ──│
       │                    │                       │                    │
       │                    │                 ┌─────┴──────┐            │
@@ -998,7 +1041,9 @@ If the node is not the leader, `propose()` returns
 ### 6.1 Persistence Guarantees
 
 Every write path that affects correctness calls `fsync` before
-acknowledgement:
+acknowledgement. The `EventLoop` invokes these operations through the
+injected trait objects — the concrete `fsync` implementation lives in
+`xraft-storage`, not in `xraft-core`:
 
 | Write | When | Guarantee |
 |-------|------|-----------|
@@ -1047,9 +1092,11 @@ pub struct RaftMetrics {
 
 ### Consistency with `tech-spec.md`
 
-This architecture is designed to be fully consistent with the tech spec:
+This architecture is designed to be fully consistent with the tech spec.
+All crate names, trait definitions, and module structures below are
+**proposed designs** — no Rust source code exists in the repository yet.
 
-- **Crate layout** matches §4.4 of the tech spec: `xraft-core`,
+- **Proposed crate layout** matches §4.4 of the tech spec: `xraft-core`,
   `xraft-transport`, `xraft-storage`, `xraft-test`.
 - **RPC names** match §2.1.4: `Vote`, `Fetch`, `FetchSnapshot`, `AddVoter`,
   `RemoveVoter`, `UpdateVoter`.
@@ -1057,9 +1104,15 @@ This architecture is designed to be fully consistent with the tech spec:
 - **Serialisation** uses `serde` + `bincode` per §6 Key Design Decisions.
 - **State machine interface** is generic (monomorphised) per §6.
 - **Segment-file log storage** per §6.
-- **Single-threaded event loop** per §4.4.
+- **I/O-abstract event loop** per §4.4 — the event loop `await`s injected
+  trait objects for storage and transport; it never opens files or sockets
+  directly. This enables deterministic testing via trait substitution
+  (see `xraft-test`).
 - **Timing parameters** (150–300 ms election timeout, 50 ms fetch interval)
   per §4.3.
+- **Quorum math** — majority is `⌊V/2⌋ + 1`; HW advancement uses
+  descending-sorted voter offsets at index `⌊V/2⌋`. Consistent with
+  §2.1.1 of the tech spec.
 
 ### Open Items for Sibling Documents
 
