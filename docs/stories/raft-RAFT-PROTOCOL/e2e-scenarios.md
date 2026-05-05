@@ -56,6 +56,11 @@
 17. [Feature: Observability and Metrics](#feature-observability-and-metrics)
 18. [Feature: Graceful Shutdown and Lifecycle](#feature-graceful-shutdown-and-lifecycle)
 19. [Feature: Error Recovery and Fault Tolerance](#feature-error-recovery-and-fault-tolerance)
+20. [Feature: Log Integrity and CRC Recovery](#feature-log-integrity-and-crc-recovery)
+21. [Feature: Single-Node Cluster](#feature-single-node-cluster)
+22. [Feature: Batch Accumulation and Group Commit](#feature-batch-accumulation-and-group-commit)
+23. [Feature: Stale and Delayed Message Handling](#feature-stale-and-delayed-message-handling)
+24. [Feature: Sequential Membership Changes](#feature-sequential-membership-changes)
 
 ---
 
@@ -563,6 +568,39 @@ Feature: Persistence and Crash Recovery
     And election quorum uses the committed voter set [N1, N2, N3]
     And HW advancement for entries at offset ≥ 20 uses the pending voter set [N1, N2, N3, N4]
     And N1 resumes as Follower and awaits a leader to learn the authoritative HW
+
+  Scenario: Leader-epoch checkpoint rebuilt from log and snapshot on recovery
+    # Per architecture §2.2: LeaderEpochCheckpoint is loaded into memory on
+    # startup. The checkpoint maps each leader epoch to its start offset and
+    # is rebuilt from the snapshot metadata plus any LeaderChangeMessage entries
+    # in the recovered log (it is an in-memory cache, not a persisted file
+    # separate from the log).
+    Given N1 has a snapshot at offset 50 with last_included_term = 3
+    And N1's log after the snapshot contains:
+      | Offset | Term | EntryType            |
+      | 51     | 3    | Command              |
+      | 52     | 4    | LeaderChangeMessage  |
+      | 53     | 4    | Command              |
+    When N1 crashes and restarts
+    Then N1 rebuilds the leader-epoch checkpoint from:
+      | Epoch | Start Offset | Source             |
+      | 3     | ≤ 50         | Snapshot metadata  |
+      | 4     | 52           | Log scan           |
+    And the leader-epoch checkpoint is available in memory for Fetch validation
+    And N1 can detect divergence correctly when serving as leader
+
+  Scenario: Corrupt quorum-state file on recovery triggers crash-stop
+    # Per architecture §6.3 and risk R7: if the quorum-state file is
+    # corrupt or partially written (e.g., torn write during fsync), the
+    # node cannot safely determine its votedFor — operating without
+    # accurate voting state risks double-voting and violates election
+    # safety. The node must fail closed.
+    Given N2 has a quorum-state file that is corrupt (partial write or bad checksum)
+    When N2 attempts to start
+    Then N2 detects the corruption during QuorumStateStore::load()
+    And N2 fails to start with an irrecoverable error
+    And N2 does NOT participate in any election or accept any RPC
+    And the corruption must be resolved externally before N2 can restart
 ```
 
 ---
@@ -623,6 +661,19 @@ Feature: Log Compaction and Snapshots
     Then N1 appends the entry at offset 101, term 1
     And the entry is replicated and committed normally
     And the log contains only entries from offset 101 onward
+
+  Scenario: Snapshot taken with uncommitted VotersRecord uses committed voter set
+    # Per architecture §3.2: VotersRecord is a control record. The voter
+    # set stored in snapshot metadata is always the COMMITTED voter set,
+    # not the pending one. Snapshots capture committed state only.
+    Given N1 is Leader with committed voter set [N1, N2, N3]
+    And N1 has appended a VotersRecord [N1, N2, N3, N4] at offset 90 (not yet committed; HW < 91)
+    And N1 has committed entries through offset 80 (HW = 81)
+    When N1 takes a snapshot at offset 80
+    Then the Snapshot.metadata.voters is [N1, N2, N3] (the committed voter set)
+    And the Snapshot.metadata does NOT include the pending voter set [N1, N2, N3, N4]
+    And the uncommitted VotersRecord at offset 90 remains in the log (not compacted — only entries ≤ 80 are snapshotted)
+    And on recovery from this snapshot, the committed voter set is correctly [N1, N2, N3]
 ```
 
 ---
@@ -987,6 +1038,20 @@ Feature: Dynamic Quorum — Observer Promotion
     Then N4 detects the leader change (via Fetch response or election)
     And N4 begins Fetching from N2
     And N4 continues replicating without disruption
+
+  Scenario: Observer election timeout does not disrupt the cluster
+    # An observer's election timeout may expire if it has not heard from
+    # the leader. However, because observers are not in the voter set,
+    # their Vote RPCs (if sent) cannot win a majority among voters. The
+    # implementation should suppress election starts for observer nodes
+    # entirely, since they cannot form a valid quorum.
+    Given N4 is an Observer in a 3-voter cluster [N1, N2, N3]
+    And N1 is Leader for term 1
+    When N4 cannot reach N1 (network fault) and its election timeout expires
+    Then N4 does NOT transition to Candidate state
+    And N4 does NOT send Vote RPCs
+    And the cluster election state is unaffected
+    And N4 retries Fetch RPCs to the leader after the timeout
 ```
 
 ---
@@ -1520,6 +1585,399 @@ Feature: Error Recovery and Fault Tolerance
 
 ---
 
+## Feature: Log Integrity and CRC Recovery
+
+```gherkin
+Feature: Log Integrity and CRC Recovery
+  As a Raft node recovering from a crash
+  I need to validate log segment integrity using CRC-32C checksums
+  So that corrupt or partially written entries are detected and safely
+  truncated without losing committed data
+
+  # Per tech spec §6 (Key Design Decisions — Log integrity: CRC-32C per batch)
+  # and risk R7 (Log/snapshot corruption and torn writes).
+
+  Background:
+    Given a 3-node cluster [N1, N2, N3]
+    And log segments use CRC-32C checksums per batch
+
+  Scenario: Clean recovery with all CRCs valid
+    Given N1 has committed entries at offsets 0–50 and persisted them with valid CRCs
+    When N1 crashes and restarts
+    Then N1 scans all log segments from the start
+    And every batch CRC validates successfully
+    And N1's log is intact with all 51 entries (offsets 0–50)
+    And N1 resumes as Follower with the full log
+
+  Scenario: Recovery with corrupt CRC truncates at first bad batch
+    Given N1 has committed entries at offsets 0–50 persisted across two batches:
+      | Batch | Offsets | CRC    |
+      | 1     | 0–30    | valid  |
+      | 2     | 31–50   | corrupt (bit-flip in stored CRC or data) |
+    When N1 crashes and restarts
+    Then N1 scans log segments forward from the start
+    And N1 validates batch 1 (offsets 0–30) — CRC OK
+    And N1 encounters batch 2 — CRC mismatch detected
+    And N1 truncates batch 2 and everything after it
+    And N1's recovered log contains offsets 0–30 only (log_end_offset = 31)
+    And entries at offsets 31–50 are lost (they were uncommitted tail entries)
+    And N1 resumes as Follower and Fetches missing entries from the leader
+
+  Scenario: Torn write recovery — partial batch at end of segment
+    # A crash during fsync can leave an incomplete batch at the end of a
+    # segment file. The partial batch has no valid CRC trailer.
+    Given N1 was appending a batch covering offsets 45–50 when it crashed
+    And the batch write was interrupted — only a partial record was written to disk
+    When N1 restarts and scans the log
+    Then N1 reads complete batches for offsets 0–44 successfully
+    And N1 encounters the partial batch at the end of the segment
+    And N1 truncates the partial batch (it has no valid CRC)
+    And N1's recovered log contains offsets 0–44 (log_end_offset = 45)
+    And earlier committed entries (offsets 0–44 if HW was ≥ 45) remain intact
+    And N1 resumes and Fetches entries from offset 45 from the leader
+
+  Scenario: Crash during snapshot write leaves temp file ignored
+    # Per architecture §2.2 (SnapshotStore): snapshot writes are atomic
+    # (write-to-temp, fsync, rename). A crash during the write leaves
+    # only a temporary file that is never renamed.
+    Given N1 is writing a snapshot at offset 100 to a temp file
+    When N1 crashes during the snapshot fsync (before the rename to final path)
+    Then on restart, the temp file is present but the final snapshot file at offset 100 does not exist
+    And N1 ignores the incomplete temp file (it was never atomically renamed)
+    And N1 falls back to the previous snapshot (if any) or starts with no snapshot
+    And N1 recovers using the log entries available on disk
+    And the incomplete temp file is cleaned up
+
+  Scenario: Corrupt latest snapshot on startup — fall back to prior snapshot
+    # If the latest snapshot file is corrupt (e.g., bad checksum in the
+    # snapshot header or payload), the node should fall back to the
+    # previous good snapshot if one exists, or fail closed if none.
+    Given N1 has two snapshots on disk:
+      | Snapshot | last_included_offset | Status  |
+      | S1       | 50                   | valid   |
+      | S2       | 100                  | corrupt |
+    When N1 restarts and attempts to load the latest snapshot (S2)
+    Then N1 detects S2 is corrupt (checksum mismatch)
+    And N1 falls back to the previous snapshot S1 (last_included_offset = 50)
+    And N1 restores StateMachine from S1's AppSnapshot
+    And N1 sets HW = 51 (snapshot.last_included_offset + 1)
+    And N1 replays log entries from offset 51 onward
+    And N1 logs a warning about the corrupt snapshot S2
+
+  Scenario: Corrupt only snapshot on startup — crash-stop
+    Given N1 has one snapshot on disk at offset 100 and it is corrupt
+    And N1's log has been prefix-truncated (log_start_offset > 0, entries before snapshot are gone)
+    When N1 restarts and attempts to load the snapshot
+    Then N1 detects the snapshot is corrupt
+    And N1 has no fallback snapshot
+    And N1 cannot reconstruct state (log entries before LSO are compacted away)
+    And N1 fails to start with an irrecoverable error
+    And the error must be resolved externally (restore from backup or re-provision)
+```
+
+---
+
+## Feature: Single-Node Cluster
+
+```gherkin
+Feature: Single-Node Cluster
+  As a developer or cluster operator
+  I need a single-node cluster to function correctly
+  So that I can use combined-mode for development and testing,
+  and so that single-node deployments are a valid configuration
+
+  # Per Confluent article: combined-mode for single-node testing.
+  # A single-node cluster is the simplest valid Raft configuration.
+
+  Scenario: Single-node cluster self-elects immediately
+    Given a 1-node cluster [N1] bootstrapped with voter set [N1]
+    When N1's election timeout expires
+    Then N1 transitions to Candidate for term 1
+    And N1 votes for itself (1 of 1 — immediate majority)
+    And N1 transitions to Leader for term 1
+    And N1 appends a LeaderChangeMessage at offset 0, term 1
+    And N1 is simultaneously the only voter and the leader
+
+  Scenario: Single-node cluster commits entries without followers
+    Given a 1-node cluster [N1] where N1 is Leader for term 1
+    And N1 has appended a LeaderChangeMessage at offset 0
+    When a client proposes command "set x=1" to N1
+    Then N1 appends the entry at offset 1, term 1 (log_end_offset = 2)
+    And N1 recalculates HW: only 1 voter with log_end_offset = 2
+    And sorted desc [2] → index ⌊1/2⌋ = 0 → HW candidate = 2
+    And HW advances to 2 (entries 0 and 1 committed)
+    And the entry is committed immediately without any Fetch round
+    And StateMachine::apply is called for the command entry
+    And the propose future resolves with Ok
+
+  Scenario: Single-node check-quorum always passes
+    Given a 1-node cluster [N1] where N1 is Leader
+    When the check-quorum interval elapses
+    Then N1 counts itself as reachable (1 of 1 — majority)
+    And N1 remains Leader
+    And check-quorum never causes step-down in a single-node cluster
+
+  Scenario: Single-node cluster grows to 2 then 3 via sequential AddVoter
+    # Per architecture §5.5: only one voter change at a time.
+    # Growing from 1 to 3 requires two sequential AddVoter operations.
+    Given a 1-node cluster [N1] where N1 is Leader with voter set [N1]
+    And N2 has joined as an Observer and caught up (fetch_offset ≥ HW)
+    When a client sends AddVoter for N2 to N1
+    Then N1 appends a VotersRecord [N1, N2]
+    And HW advancement uses the new voter set [N1, N2] (majority = 2 of 2)
+    When N2 replicates and confirms the VotersRecord (both N1 and N2 have it)
+    Then the VotersRecord commits and the active voter set is [N1, N2]
+    And the quorum size is now 2 (majority of 2)
+    # Second change: 2 → 3
+    Given N3 has joined as an Observer and caught up
+    When a client sends AddVoter for N3 to N1
+    Then N1 appends a VotersRecord [N1, N2, N3]
+    And HW advancement uses [N1, N2, N3] (majority = 2 of 3)
+    When a majority of [N1, N2, N3] replicates the VotersRecord
+    Then the VotersRecord commits and the active voter set is [N1, N2, N3]
+    And the cluster is now a standard 3-node cluster
+
+  Scenario: Single-node snapshot and recovery
+    Given a 1-node cluster [N1] with committed entries at offsets 0–100
+    When N1 takes a snapshot at offset 100 and performs prefix truncation
+    And N1 crashes and restarts
+    Then N1 loads the snapshot (last_included_offset = 100)
+    And N1 restores StateMachine from the snapshot
+    And N1 sets HW = 101
+    And N1 resumes as Follower, then self-elects as Leader for term 2
+    And normal operation continues
+```
+
+---
+
+## Feature: Batch Accumulation and Group Commit
+
+```gherkin
+Feature: Batch Accumulation and Group Commit
+  As a Raft leader
+  I need to batch multiple proposals into a single log append and fsync
+  So that throughput is improved by amortising fsync cost across
+  multiple client proposals
+
+  # Per architecture §2.1 (BatchAccumulator): proposals are staged and
+  # drained on each event-loop tick or when the batch is full. This
+  # amortises fsync cost (group commit). Adapted from KRaft's
+  # BatchAccumulator.
+
+  Background:
+    Given a 3-node cluster [N1, N2, N3]
+    And N1 is Leader for term 1
+    And the BatchAccumulator max_batch_size is configured to 10
+
+  Scenario: Multiple proposals batched into single log append
+    When 3 clients concurrently propose commands "set x=1", "set y=2", "set z=3" to N1
+    Then all 3 entries are staged in the BatchAccumulator
+    When the event-loop tick fires (drain interval)
+    Then the BatchAccumulator drains all 3 entries into a single IoAction::AppendLog
+    And LogStore::append is called once with 3 entries (not 3 separate calls)
+    And a single fsync covers all 3 entries (group commit)
+    And each propose future is parked in the DeferredCompletionQueue at its respective offset
+
+  Scenario: Batch drains when max_batch_size is reached
+    When 10 clients propose commands to N1 in rapid succession
+    Then the BatchAccumulator reaches its configured capacity of 10
+    And the batch is drained immediately (before the next tick)
+    And all 10 entries are appended to the log in a single IoAction::AppendLog
+
+  Scenario: Batch drains on tick even with partial fill
+    When 2 clients propose commands to N1
+    And the batch is not full (2 < max_batch_size of 10)
+    When the event-loop tick fires
+    Then the BatchAccumulator drains the 2 pending entries
+    And they are appended to the log in a single IoAction::AppendLog
+    And fsync cost is amortised even for a small batch
+
+  Scenario: Empty batch — tick with no pending proposals
+    Given no new proposals have been submitted since the last drain
+    When the event-loop tick fires
+    Then the BatchAccumulator has no entries to drain
+    And no IoAction::AppendLog is emitted
+    And no unnecessary fsync occurs
+
+  Scenario: Proposals submitted after drain are staged in next batch
+    When a client proposes "set a=1" to N1
+    And the event-loop tick fires (draining "set a=1")
+    And then another client proposes "set b=2" before the next tick
+    Then "set b=2" is staged in a new batch
+    And it will be drained on the next tick or when the batch fills
+    And "set a=1" and "set b=2" are at consecutive log offsets
+
+  Scenario: Group commit — all propose futures in batch resolve together on HW advance
+    Given 3 proposals were batched and appended at offsets 5, 6, 7
+    And all 3 propose futures are parked in the DeferredCompletionQueue
+    When followers replicate and HW advances to 8 (offsets < 8 committed)
+    Then the DeferredCompletionQueue fires all 3 futures (offsets 5, 6, 7 all < 8)
+    And all 3 clients receive Ok simultaneously
+```
+
+---
+
+## Feature: Stale and Delayed Message Handling
+
+```gherkin
+Feature: Stale and Delayed Message Handling
+  As a Raft node
+  I need to correctly handle stale, delayed, duplicated, and
+  reordered messages
+  So that the protocol remains correct even under adverse network
+  conditions without requiring reliable ordered delivery
+
+  # These scenarios test protocol resilience to network non-idealities
+  # that the deterministic simulation harness can inject. Per tech spec
+  # §4.2: messages may be delayed, reordered, duplicated, or lost.
+
+  Background:
+    Given a 3-node cluster [N1, N2, N3]
+
+  Scenario: Candidate receives late granted vote after stepping down — ignored
+    Given N1 was a Candidate for term 5 but stepped down to Follower
+    (received a higher-term message, now at term 6)
+    When N1 receives a late VoteResponse { term: 5, vote_granted: true }
+    Then N1 ignores the response because it is no longer a Candidate
+    And N1's state is unchanged (remains Follower at term 6)
+    And the stale vote does not trigger a leadership transition
+
+  Scenario: Follower receives delayed Fetch response from old leader — fenced
+    Given N1 was Leader for term 3 and sent Fetch responses to N2
+    And N2 has since received a Fetch response from N3 (new leader, term 4)
+    And N2's known leader_epoch is now 4
+    When N2 receives a delayed Fetch response from N1 with leader_epoch = 3
+    Then N2 rejects the response because leader_epoch 3 < known epoch 4
+    And N2 does NOT apply entries from the stale response
+    And N2 does NOT reset its election timeout from the stale response
+
+  Scenario: Duplicate Fetch RPC from follower is idempotent
+    Given N1 is Leader for term 1
+    And N2 sends a Fetch RPC with fetch_offset = 5
+    When N1 receives the same Fetch RPC again (network duplicate)
+    Then N1 processes it identically to the first
+    And N1's recorded fetch_offset for N2 remains 5 (not double-incremented)
+    And the Fetch response is identical
+    And HW calculation is not affected by the duplicate
+
+  Scenario: Duplicate Vote RPC is idempotent
+    Given N1 has already voted for N2 in term 5
+    When N1 receives the same Vote RPC from N2 for term 5 again (duplicate)
+    Then N1 responds with vote_granted = true (same vote, idempotent)
+    And N1's votedFor remains N2
+    And no additional quorum-state persistence is required
+
+  Scenario: Reordered Fetch responses — older HW does not regress local HW
+    Given N2 is a Follower with local HW = 10
+    When N2 receives a Fetch response with HW = 8 (delayed older response)
+    Then N2 does NOT decrease its local HW from 10 to 8
+    And N2's HW remains 10 (HW never decreases)
+    When N2 later receives a Fetch response with HW = 15
+    Then N2 advances its local HW to 15
+
+  Scenario: Asymmetric network partition — leader to follower works, follower to leader fails
+    # In an asymmetric partition, the leader can receive Fetch RPCs from
+    # some nodes but those nodes' responses cannot reach others.
+    Given N1 is Leader for term 1
+    And the network is asymmetric: N2→N1 works (Fetch RPCs delivered) but N1→N2 fails (responses dropped)
+    When N2 sends Fetch RPCs to N1
+    Then N1 receives the Fetch and records N2's fetch_offset (HW may advance)
+    But N2 never receives the Fetch response (responses are dropped)
+    And N2's election timeout eventually fires (no Fetch response = no heartbeat)
+    And N2 initiates an election
+    And the cluster resolves the asymmetric partition via leader election
+
+  Scenario: Message from unknown node is rejected
+    Given the voter set is [N1, N2, N3]
+    When N1 receives a Fetch RPC from N99 (an unknown node not in voter or observer sets)
+    Then N1 does not track replication state for N99
+    And N1 does not count N99 toward HW advancement
+    And N1 rejects or ignores the Fetch (N99 is not a cluster member)
+```
+
+---
+
+## Feature: Sequential Membership Changes
+
+```gherkin
+Feature: Sequential Membership Changes
+  As a cluster operator
+  I need to perform multiple membership changes sequentially
+  So that the cluster can be scaled up, scaled down, or have
+  nodes replaced over time without violating the single-change invariant
+
+  # Per architecture §5.5: only one voter change at a time. Multiple
+  # changes must be serialised — each VotersRecord must commit before
+  # the next change is submitted.
+
+  Background:
+    Given a 3-node cluster [N1, N2, N3]
+    And N1 is Leader for term 1
+
+  Scenario: Add N4 then add N5 sequentially
+    Given N4 is an Observer caught up with the leader
+    When a client sends AddVoter for N4 to N1
+    Then N1 appends VotersRecord [N1, N2, N3, N4]
+    When the VotersRecord commits (majority of [N1, N2, N3, N4] = 3 of 4)
+    Then the active voter set is [N1, N2, N3, N4]
+    # Second change — only possible after first commits
+    Given N5 is an Observer caught up with the leader
+    When a client sends AddVoter for N5 to N1
+    Then N1 appends VotersRecord [N1, N2, N3, N4, N5]
+    When the VotersRecord commits (majority of [N1, N2, N3, N4, N5] = 3 of 5)
+    Then the active voter set is [N1, N2, N3, N4, N5]
+    And both changes completed without violating the single-change invariant
+
+  Scenario: Remove N3 then remove N2 — cluster shrinks from 3 to 1
+    When a client sends RemoveVoter for N3 to N1
+    Then N1 appends VotersRecord [N1, N2]
+    When the VotersRecord commits (majority of [N1, N2] = 2 of 2)
+    Then the active voter set is [N1, N2] and N3 transitions to Unattached
+    # Second change
+    When a client sends RemoveVoter for N2 to N1
+    Then N1 appends VotersRecord [N1]
+    When the VotersRecord commits (majority of [N1] = 1 of 1)
+    Then the active voter set is [N1] and N2 transitions to Unattached
+    And the cluster is now a single-node cluster with N1 as the sole voter
+
+  Scenario: Replace a node — remove N3, add N4 sequentially
+    When a client sends RemoveVoter for N3 to N1
+    Then N1 appends VotersRecord [N1, N2]
+    When the VotersRecord commits
+    Then the active voter set is [N1, N2]
+    # Now add the replacement
+    Given N4 is an Observer caught up with the leader
+    When a client sends AddVoter for N4 to N1
+    Then N1 appends VotersRecord [N1, N2, N4]
+    When the VotersRecord commits (majority of [N1, N2, N4] = 2 of 3)
+    Then the active voter set is [N1, N2, N4]
+    And N3 is no longer a member; N4 has replaced it
+
+  Scenario: Sequential changes interleaved with leader election
+    Given the voter set is [N1, N2, N3]
+    And N4 is an Observer caught up with the leader
+    When a client sends AddVoter for N4 to N1
+    And N1 appends VotersRecord [N1, N2, N3, N4]
+    And the VotersRecord commits — voter set becomes [N1, N2, N3, N4]
+    And then N1 crashes
+    When N2 wins election for term 2 and becomes Leader
+    Then N2 uses voter set [N1, N2, N3, N4] for election quorum (4 voters, need 3)
+    Given N5 is an Observer caught up with the new leader N2
+    When a client sends AddVoter for N5 to N2
+    Then N2 appends VotersRecord [N1, N2, N3, N4, N5]
+    And the change proceeds under N2's leadership
+    And the single-change invariant is maintained across the leader transition
+
+  Scenario: Second change rejected while first is in flight
+    Given a client sends AddVoter for N4 to N1
+    And N1 appends VotersRecord [N1, N2, N3, N4] but it is NOT yet committed
+    When a client sends RemoveVoter for N3 to N1
+    Then N1 rejects the RemoveVoter with MembershipError::ChangeInProgress
+    And the client must wait for the first change to commit before retrying
+```
+
+---
+
 ## Appendix: Scenario Coverage Matrix
 
 | Tech Spec Section | Feature Covered | Scenario Count |
@@ -1531,19 +1989,24 @@ Feature: Error Recovery and Fault Tolerance
 | §2.1.1 Safety invariants | Safety Invariants | 6 |
 | §2.1.1 No-op commit on leader start | High Watermark Advancement (scenario 5) | — |
 | §2.1.1 Check Quorum | Check Quorum | 5 |
-| §2.1.1 Persistence | Persistence and Crash Recovery | 7 |
-| §2.1.2 Snapshotting | Log Compaction and Snapshots | 4 |
+| §2.1.1 Persistence | Persistence and Crash Recovery | 9 |
+| §2.1.2 Snapshotting | Log Compaction and Snapshots | 5 |
 | §2.1.2 Snapshot transfer | Snapshot Transfer | 5 |
 | §2.1.2 Log truncation / Divergence | Log Divergence and Truncation | 4 |
 | §2.1.3 Single-node changes | Add Voter / Remove Voter / UpdateVoter | 15 |
-| §2.1.3 Non-voting members (observers) | Observer Promotion | 3 |
+| §2.1.3 Non-voting members (observers) | Observer Promotion | 4 |
 | §2.1.3 Leader step-down | Remove Voter (scenario 2) | — |
+| §2.1.3 Sequential membership changes | Sequential Membership Changes | 5 |
 | §2.1.4 Identity & fencing | Identity and Fencing | 6 |
 | §2.1.4 Divergence detection | Log Divergence and Truncation | — |
 | §2.1.5 Library API | Client Interaction | 14 |
+| §2.1.5 Batch accumulator | Batch Accumulation and Group Commit | 6 |
 | §2.1.6 Metrics | Observability and Metrics | 7 |
 | §2.1.6 Deterministic simulation | Safety Invariants (scenario 6) | — |
 | §2.1.7 Bootstrap & recovery | Cluster Bootstrap | 5 |
 | §4.1 Listener lifecycle | Graceful Shutdown and Lifecycle | 4 |
+| §4.2 Failure model (message loss/reorder) | Stale and Delayed Message Handling | 7 |
+| §6 Log integrity (CRC-32C) | Log Integrity and CRC Recovery | 6 |
 | §6.3 Error handling strategy | Error Recovery and Fault Tolerance | 8 |
-| **Total** | **19 Features** | **119 Scenarios** |
+| Combined-mode / single node | Single-Node Cluster | 5 |
+| **Total** | **24 Features** | **152 Scenarios** |
