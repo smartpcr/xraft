@@ -496,10 +496,10 @@ MembershipChangeResponse {
 
 enum MembershipError {
     NotLeader { leader_id: Option<NodeId> }
-    ChangeInProgress                // another change is uncommitted
+    ChangeInProgress                // an uncommitted VotersRecord exists in the log
     NodeAlreadyVoter
     NodeNotFound
-    NodeNotCaughtUp                 // observer not yet at leader's HW
+    NodeNotCaughtUp                 // observer's fetch_offset < leader's current HW
 }
 ```
 
