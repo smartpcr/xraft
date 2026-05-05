@@ -81,7 +81,8 @@
 - [ ] Create `xraft-core/src/traits.rs` defining `#[async_trait] trait LogStore { async fn append(&mut self, entries: &[LogEntry]) -> Result<()>, async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>>, async fn truncate_suffix(&mut self, from_offset: u64) -> Result<()>, async fn truncate_prefix(&mut self, up_to_offset: u64) -> Result<()>, fn log_start_offset(&self) -> u64, fn log_end_offset(&self) -> u64, async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>> }` — matches architecture §4.1 trait definition
 - [ ] Define `#[async_trait] trait QuorumStateStore { async fn load(&self) -> Result<Option<QuorumState>>, async fn save(&self, state: &QuorumState) -> Result<()> }` in `traits.rs` — matches architecture §4.1
 - [ ] Define `#[async_trait] trait SnapshotIO { async fn save(&self, snapshot: &Snapshot) -> Result<()>, async fn load_latest(&self) -> Result<Option<Snapshot>>, async fn read_chunk(&self, id: &SnapshotId, position: u64, max_bytes: u32) -> Result<(Bytes, bool)>, async fn begin_receive(&self, id: &SnapshotId) -> Result<SnapshotWriter> }` in `traits.rs` — matches architecture §4.1 method names exactly; uses `Snapshot`, `SnapshotId`, `SnapshotWriter` from Stage 1.2
-- [ ] Define `#[async_trait] trait Transport { async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<()>, async fn recv(&mut self) -> Result<RpcEnvelope> }` in `traits.rs` — matches architecture §4.1 (`recv` not `recv_stream`)
+- [ ] Define `#[async_trait] trait TransportSender: Send + Sync + 'static { async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<()> }` in `traits.rs` — takes `&self` (shared reference) because `IoStage` may send to multiple peers concurrently; matches architecture §4.4 split design
+- [ ] Define `#[async_trait] trait TransportReceiver: Send + 'static { async fn recv(&mut self) -> Result<RpcEnvelope> }` in `traits.rs` — takes `&mut self` (exclusive access) because only the `ReceiverTask` reads from the network; matches architecture §4.4 split design
 - [ ] Define `trait Clock: Send + 'static { fn now(&self) -> Instant, async fn sleep_until(&self, deadline: Instant), fn random_election_timeout(&self) -> Duration }` in `traits.rs` — matches architecture §4.1 method names exactly
 - [ ] Define `trait StateMachine: Send + 'static { fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>; fn snapshot(&self) -> Result<AppSnapshot>; fn restore(&mut self, snapshot: AppSnapshot) -> Result<()>; }` in `traits.rs` — synchronous trait (not `#[async_trait]`) per architecture §4.1; application callbacks are invoked synchronously by the `EventLoop`, not by the `IoStage`; uses `AppRecord` and `AppSnapshot` types from Stage 1.2
 - [ ] Add `async-trait` dependency to `xraft-core/Cargo.toml`
@@ -119,8 +120,8 @@
 ### Stage 1.7: `RaftNode` Public API Skeleton
 
 #### Implementation Steps
-- [ ] Create `xraft-core/src/raft_node.rs` defining the `RaftNode<S: StateMachine, L: Listener>` struct with fields: `config: RaftConfig`, `event_loop_handle`, `propose_tx: mpsc::Sender` — this is the public entry point from architecture §2.1; generic over both application-provided types `S` and `L` (monomorphised at compile time per architecture §4.1); I/O traits (`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`, `Clock`) are injected as `Box<dyn ...>` trait objects at construction time
-- [ ] Define `RaftNode::new(config, log_store, quorum_state_store, snapshot_io, transport, clock, state_machine, listener) -> Result<Self>` constructor that accepts I/O trait objects and application-provided `S` / `L` instances; initialises struct fields and event-loop channel; does not start the event loop (started in Phase 4) or run recovery (completed in Phase 6)
+- [ ] Create `xraft-core/src/raft_node.rs` defining the `RaftNode<S: StateMachine, L: Listener>` struct with fields: `config: RaftConfig`, `event_loop_handle`, `propose_tx: mpsc::Sender` — this is the public entry point from architecture §2.1; generic over both application-provided types `S` and `L` (monomorphised at compile time per architecture §4.1); I/O traits (`LogStore`, `TransportSender`, `TransportReceiver`, `QuorumStateStore`, `SnapshotIO`, `Clock`) are injected as `Box<dyn ...>` trait objects at construction time — `TransportSender` is passed to the `IoStage` for outbound RPCs, `TransportReceiver` is passed to the `ReceiverTask` for inbound RPCs (per architecture §4.4)
+- [ ] Define `RaftNode::new(config, log_store, quorum_state_store, snapshot_io, transport_sender, transport_receiver, clock, state_machine, listener) -> Result<Self>` constructor that accepts I/O trait objects (including separate `Box<dyn TransportSender>` and `Box<dyn TransportReceiver>`) and application-provided `S` / `L` instances; initialises struct fields and event-loop channel; does not start the event loop (started in Phase 4) or run recovery (completed in Phase 6)
 - [ ] Define `RaftNode::propose(command: AppRecord) -> Future<Result<Offset>>` method that sends the command to the event-loop channel and returns a future; returns `NotLeader` when no leader is active (consensus path completed in Phase 5)
 - [ ] Define `RaftNode::read() -> Result<ConsensusState>` method returning the current committed protocol state (current term, leader, high_watermark, role, voter set) — per tech-spec §2.1.5 the initial implementation routes reads through the log for safety, meaning the returned state reflects the latest HW-committed position in the log; the high_watermark in the returned state is an exclusive upper bound (entry at offset O is committed when O < HW, per architecture §3.1); linearisable reads (read-index, lease-based) are out of scope per tech-spec §2.2
 - [ ] Define `RaftNode::bootstrap(cluster_id: ClusterId, initial_voters: Vec<VoterInfo>) -> Result<()>` method that validates preconditions (empty log, no quorum-state file, no existing snapshot) and stores configuration; bootstrap logic completed in Phase 6 — `ClusterId` is provided by the caller, not generated internally, to ensure all nodes share the same cluster identity
@@ -244,9 +245,9 @@
 
 #### Implementation Steps
 - [ ] Create `xraft-transport/src/codec.rs` implementing `RpcCodec` — length-prefixed bincode serialisation/deserialisation of `RpcEnvelope`
-- [ ] Create `xraft-transport/src/channel.rs` implementing `ChannelTransport` — in-process transport using `tokio::sync::mpsc` channels per node pair
-- [ ] Implement `Transport::send` — serialize envelope, route to destination channel
-- [ ] Implement `Transport::recv` — await the next inbound `RpcEnvelope` from the node's inbound channel (matches architecture §4.1 `recv` signature)
+- [ ] Create `xraft-transport/src/channel.rs` implementing `ChannelTransport` — in-process transport using `tokio::sync::mpsc` channels per node pair; exposes `split() -> (Box<dyn TransportSender>, Box<dyn TransportReceiver>)` per architecture §4.4
+- [ ] Implement `TransportSender::send` on `ChannelSender` — serialize envelope, route to destination channel (takes `&self` for concurrent sends)
+- [ ] Implement `TransportReceiver::recv` on `ChannelReceiver` — await the next inbound `RpcEnvelope` from the node's inbound channel (takes `&mut self`, exclusive access per architecture §4.4)
 - [ ] Implement cluster-id and leader-epoch fencing checks in the codec layer (reject envelopes with wrong cluster_id)
 
 #### Test Scenarios
@@ -271,11 +272,11 @@
 ### Stage 3.3: TCP Transport (Production)
 
 #### Implementation Steps
-- [ ] Create `xraft-transport/src/tcp.rs` implementing `TcpTransport` using `tokio::net::TcpListener` and `TcpStream`
+- [ ] Create `xraft-transport/src/tcp.rs` implementing `TcpTransport` using `tokio::net::TcpListener` and `TcpStream`; exposes `split() -> (Box<dyn TransportSender>, Box<dyn TransportReceiver>)` per architecture §4.4
 - [ ] Implement connection pooling: maintain one persistent connection per peer, reconnect on failure with exponential backoff
 - [ ] Implement length-prefixed framing using `tokio_util::codec::LengthDelimitedCodec`
-- [ ] Implement `Transport::send` — lookup or establish connection, write framed message
-- [ ] Implement `Transport::recv` — accept inbound connections, decode frames, return next `RpcEnvelope` (matches architecture §4.1 `recv` signature)
+- [ ] Implement `TransportSender::send` on `TcpSender` — lookup or establish connection, write framed message (takes `&self`, requires `Send + Sync` for concurrent sends by `IoStage`)
+- [ ] Implement `TransportReceiver::recv` on `TcpReceiver` — accept inbound connections, decode frames, return next `RpcEnvelope` (takes `&mut self`, exclusive access by `ReceiverTask` per architecture §4.4)
 - [ ] Add `tokio-util` dependency to `xraft-transport/Cargo.toml`
 
 #### Test Scenarios
@@ -665,7 +666,7 @@
 #### Implementation Steps
 - [ ] Add `#![deny(missing_docs)]` to all four crate roots
 - [ ] Write doc-comments for `xraft-core` domain types: `NodeId`, `Term`, `ClusterId`, `Offset`, `LogEntry`, `EntryType`, `VoterInfo`, `VotersRecord`, `ConsensusState`, `QuorumState`, `FollowerProgress`, `AppRecord`, `AppSnapshot`, `Snapshot`, `SnapshotMetadata`, `SnapshotReader`, `SnapshotWriter` in their respective modules
-- [ ] Write doc-comments for `xraft-core` traits: `LogStore`, `QuorumStateStore`, `SnapshotIO`, `Transport`, `Clock`, `StateMachine`, `Listener` and all trait methods in `traits.rs` and `listener.rs`
+- [ ] Write doc-comments for `xraft-core` traits: `LogStore`, `QuorumStateStore`, `SnapshotIO`, `TransportSender`, `TransportReceiver`, `Clock`, `StateMachine`, `Listener` and all trait methods in `traits.rs` and `listener.rs`
 - [ ] Write doc-comments for `xraft-core` public API: `RaftNode` methods (`new`, `propose`, `read`, `bootstrap`, `shutdown`), `RaftConfig` fields, `XraftError` variants, RPC message types, and `IoAction` variants
 - [ ] Write doc-comments for `xraft-storage` public API: `StorageEngine`, `SegmentLog`, `SnapshotStore`, `QuorumStateFile`, `LeaderEpochCheckpoint`
 - [ ] Write doc-comments for `xraft-transport` public API: `TcpTransport`, `ChannelTransport`, `RpcCodec`, `NetworkSimulator`
