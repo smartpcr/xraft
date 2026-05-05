@@ -14,11 +14,24 @@
 > - Crates: `xraft-core`, `xraft-transport`, `xraft-storage`, `xraft-test`
 > - RPCs: `Vote` (with `is_pre_vote` flag for Pre-Vote phase), `Fetch`,
 >   `FetchSnapshot`, `AddVoter`, `RemoveVoter`, `UpdateVoter`
-> - Roles: Follower, Candidate, Leader, Observer
+> - Roles: Unattached, Follower, Candidate, Leader
+> - Membership: Voter or Observer (non-voting). Observer is a membership
+>   classification — not a role in the state machine. An observer node
+>   runs in Follower role but is in the observers set, not the voter set.
 > - Pull-based replication model (followers `Fetch` from leader; no push-based
 >   `AppendEntries`)
 > - At-least-once propose semantics; deduplication is the application's
 >   responsibility (tech spec §2.1.5)
+>
+> **Offset conventions** (per architecture doc §3.2 and §5.2):
+> - Log offsets are **0-based** (first entry at offset 0).
+> - `fetch_offset` is **exclusive**: a follower with `fetch_offset = N`
+>   has replicated entries `[0, N)` and wants entries starting at N.
+> - High watermark (HW) is an **exclusive upper bound**: entries with
+>   `offset < HW` are committed. `HW − 1` is the last committed offset.
+>   HW = 0 means no entries are committed.
+> - Where the tech spec describes "entries ≤ N committed", that
+>   corresponds to `HW = N + 1` in exclusive notation.
 
 ---
 
@@ -227,7 +240,7 @@ Feature: Pull-Based Log Replication
 
   Scenario: Follower Fetch acts as implicit heartbeat
     Given N1 is Leader and no new commands are proposed
-    When N2 sends a Fetch RPC to N1 with the latest offset
+    When N2 sends a Fetch RPC to N1 with fetch_offset equal to its log end offset
     Then N1 responds with an empty entry set and the current high watermark
     And N2's election timeout is reset
     And N2 remains in Follower state
@@ -273,48 +286,72 @@ Feature: High Watermark Advancement
     And N1 is the Leader for term 1
     And the quorum size is 2 (majority of 3)
 
+  # HW is exclusive (per architecture doc §5.2): entries with offset < HW
+  # are committed. fetch_offset is also exclusive: a follower with
+  # fetch_offset = N has entries [0, N). The leader records fetch_offset on
+  # each incoming Fetch request and recalculates HW by sorting all voters'
+  # fetch_offsets descending, taking the value at index ⌊V/2⌋.
+
   Scenario: High watermark advances after majority Fetch (3-node)
-    Given N1 has entry at offset 1, term 1
-    And the high watermark (HW) is 0
-    When N2 sends a Fetch RPC and receives entry at offset 1
-    Then N1 records that N2 has replicated up to offset 1
-    And a majority (N1 + N2 = 2 of 3) has replicated offset 1
-    And N1 advances the HW to 1
-    When N3 sends a Fetch RPC
-    Then N3 receives entry at offset 1 AND the updated HW = 1
-    And N3 applies entry at offset 1 to its state machine
+    Given N1 has entries at offsets 0 (LeaderChangeMessage) and 1 (command), term 1
+    And N1's log end offset is 2
+    And the high watermark (HW) is 1 (offset 0 committed; HW is exclusive)
+    When N2 sends a Fetch RPC with fetch_offset 2 (N2 has entries [0, 2))
+    Then N1 records N2's fetch_offset as 2
+    And N1 recalculates HW: sorted desc [N1=2, N2=2, N3=0] → index 1 → 2
+    And N1 advances the HW from 1 to 2 (entries with offset < 2 now committed)
+    And entry at offset 1 is now committed (1 < HW=2)
+    When N3 sends a Fetch RPC with fetch_offset 0
+    Then N3 receives entries at offsets 0–1 and HW = 2
+    And N3 applies the command entry at offset 1 to its state machine
 
   Scenario: Two Fetch rounds required for follower to see commit
-    Given N1 has entry at offset 1, term 1
-    And the HW is 0
-    When N2 sends a Fetch RPC and receives entry at offset 1 with HW = 0
-    Then N2 has the entry but does NOT apply it (HW is still 0)
-    When N1 advances HW to 1 (majority replicated)
-    And N2 sends another Fetch RPC
-    Then N2 receives HW = 1 in the response
-    And N2 applies entry at offset 1 to its state machine
+    Given N1 has entries at offsets 0 (LeaderChangeMessage) and 1 (command), term 1
+    And N1's log end offset is 2
+    And HW is 1 (only offset 0 committed)
+    # Round 1: N2 fetches the data but HW does not advance
+    When N2 sends a Fetch RPC with fetch_offset 1 (N2 has entries [0, 1))
+    Then N1 records N2's fetch_offset as 1
+    And N1 recalculates HW: sorted desc [N1=2, N2=1, N3=0] → index 1 → 1
+    And HW remains 1 (entry at offset 1 is NOT committed: 1 ≮ 1)
+    And N1 responds with entry at offset 1 and HW = 1
+    And N2 appends entry 1 but does NOT apply it (offset 1 is not < HW)
+    # Round 2: N2 confirms replication, HW advances
+    When N2 sends another Fetch RPC with fetch_offset 2 (N2 now has entries [0, 2))
+    Then N1 records N2's fetch_offset as 2
+    And N1 recalculates HW: sorted desc [N1=2, N2=2, N3=0] → index 1 → 2
+    And N1 advances HW to 2
+    And N1 responds with HW = 2
+    And N2 applies entry at offset 1 to its state machine (1 < HW=2)
 
   Scenario: HW does not advance without majority
     Given a 5-node cluster [N1, N2, N3, N4, N5]
-    And N1 is Leader with entry at offset 1
-    When only N2 has Fetched offset 1 (2 of 5 — not a majority)
-    Then the HW remains at 0
-    And the entry is NOT committed
+    And N1 is Leader with entries at offsets 0–1 (log end offset 2)
+    And HW is 1 (offset 0 committed)
+    When only N2 has confirmed replication with fetch_offset 2
+    And N3, N4, N5 still have fetch_offset 0
+    Then N1 recalculates HW: sorted desc [2, 2, 0, 0, 0] → index 2 → 0
+    And HW remains at 1 (HW never decreases)
+    And entry at offset 1 is NOT committed (1 is not < HW=1)
 
   Scenario: HW advances in a 5-node cluster with 3 replicas
     Given a 5-node cluster [N1, N2, N3, N4, N5]
-    And N1 is Leader with entry at offset 1
-    When N2 and N3 have Fetched offset 1 (N1 + N2 + N3 = 3 of 5 — majority)
-    Then the HW advances to 1
-    And the entry is committed
+    And N1 is Leader with entries at offsets 0–1 (log end offset 2)
+    And HW is 1 (offset 0 committed)
+    When N2 and N3 each send Fetch RPCs with fetch_offset 2 (both have entries [0, 2))
+    Then N1 recalculates HW: sorted desc [2, 2, 2, 0, 0] → index 2 → 2
+    And N1 advances HW to 2 (entries with offset < 2 are committed)
+    And entry at offset 1 is committed
     And N4 and N5 do not need to Fetch for the entry to be committed
 
   Scenario: No-op entry committed on leader start advances HW
     Given N1 has just won election for term 2
     And N1 appends a no-op LeaderChangeMessage at offset 5, term 2
-    When N2 Fetches and replicates up to offset 5
-    Then the HW advances to 5
-    And all entries up to offset 5 (including uncommitted entries from term 1) are now committed
+    And N1's log end offset is 6
+    When N2 sends Fetch with fetch_offset 6 (N2 has entries [0, 6))
+    Then N1 recalculates HW: majority of voters have fetch_offset ≥ 6
+    And N1 advances HW to 6 (entries with offset < 6 are committed)
+    And all entries through offset 5 (including prior-term entries) are now committed
 ```
 
 ---
@@ -359,9 +396,9 @@ Feature: Log Divergence and Truncation
     And N1 responds with DivergingEpoch so N2 can truncate back to offset 12
 
   Scenario: No divergence — follower log is a prefix of leader log
-    Given N1 is Leader with entries at offsets 1–10
-    And N2 has entries at offsets 1–7 (all matching the leader)
-    When N2 sends a Fetch RPC with offset 7
+    Given N1 is Leader with entries at offsets 0–10 (log end offset 11)
+    And N2 has entries at offsets 0–7 (all matching the leader)
+    When N2 sends a Fetch RPC with fetch_offset 8 (N2 has entries [0, 8))
     Then N1 responds with entries at offsets 8–10 (no DivergingEpoch)
     And N2 appends the new entries normally
 ```
@@ -546,9 +583,9 @@ Feature: Snapshot Transfer
     Given N1 has committed entries at offsets 1–200
     And N1 has taken a snapshot at offset 150 and truncated entries 1–150
     And N1's log start offset (LSO) is 151
-    And N2 has only replicated up to offset 50
-    When N2 sends a Fetch RPC with offset 50
-    Then N1 detects that offset 50 < LSO (151)
+    And N2 has only replicated through offset 50 (N2's log end offset is 51)
+    When N2 sends a Fetch RPC with fetch_offset 51
+    Then N1 detects that fetch_offset 51 < LSO (151)
     And N1 responds with a SnapshotId field (offset 150, term 1)
     When N2 sends FetchSnapshot RPCs to download the snapshot
     Then N1 streams the snapshot in chunks
@@ -578,7 +615,7 @@ Feature: Snapshot Transfer
   Scenario: Snapshot transfer for a newly joined observer
     Given N4 joins the cluster as an Observer with an empty log
     And N1's log starts at offset 201 (entries 1–200 compacted)
-    When N4 sends its first Fetch RPC to N1 with offset 0
+    When N4 sends its first Fetch RPC to N1 with fetch_offset 0
     Then N1 responds with SnapshotId (offset 200, term 1)
     And N4 downloads the snapshot via FetchSnapshot
     And N4 restores its state machine from the snapshot
@@ -619,7 +656,7 @@ Feature: Cluster Bootstrap
     Then N1 appends a LeaderChangeMessage (no-op) at offset 0, term 1
     And N1 appends a VotersRecord control entry at offset 1, term 1
       with voter set [N1, N2, N3]
-    When both entries are committed (HW advances to 1)
+    When both entries are committed (HW advances to 2; offsets 0–1 committed)
     Then the cluster is fully bootstrapped
     And subsequent membership changes use AddVoter / RemoveVoter RPCs
 
@@ -635,7 +672,7 @@ Feature: Cluster Bootstrap
     Given the cluster [N1, N2, N3] is running with committed entries 1–100
     And N4 is a new uninitialized node with no log and no snapshot
     When N4 starts (initially in Unattached state) and connects to the cluster
-    Then N4 transitions to Observer role (non-voting)
+    Then N4 transitions to Follower state with Observer membership (non-voting)
     And N4 begins sending Fetch RPCs to the leader
     And if the leader's log starts beyond offset 0, N4 receives a SnapshotId
     And N4 downloads the snapshot via FetchSnapshot before normal replication
@@ -714,26 +751,28 @@ Feature: Dynamic Quorum — Remove Voter
   Scenario: Remove a follower from the cluster
     When a client sends a RemoveVoter RPC for N3 to N1
     Then N1 appends a VotersRecord with voter set [N1, N2]
-    When the VotersRecord is committed (replicated to a majority of the current voter set [N1, N2, N3])
+    When the VotersRecord is committed (replicated to a majority of the NEW voter set [N1, N2])
     Then the new voter set [N1, N2] takes effect
     And the quorum size decreases to 2 (majority of 2)
+    And N3 transitions to Unattached state once it learns of its removal via Fetch
     And N3's Vote RPCs are ignored by the remaining nodes
 
   Scenario: Remove the leader — leader steps down after commit
     When a client sends a RemoveVoter RPC for N1 (the leader itself) to N1
     Then N1 appends a VotersRecord with voter set [N2, N3]
-    And N1 continues serving as leader until the VotersRecord is committed by the current voter set [N1, N2, N3]
-    When the VotersRecord is committed
+    And N1 continues serving as leader until the VotersRecord is committed by the NEW voter set [N2, N3]
+    When the VotersRecord is committed (majority of [N2, N3] have fetched it)
     Then the new voter set [N2, N3] takes effect
-    And N1 steps down to Follower state
+    And N1 steps down to Unattached state (no longer a member of the voter set)
     And N2 or N3 triggers a new election and becomes the new Leader
 
   Scenario: Removed node's vote requests are ignored
     Given N3 has been removed from the voter set
+    And N3 has transitioned to Unattached after learning of its removal
     And a new leader (N2) is active with voter set [N1, N2]
-    When N3 sends Vote RPCs (it has not learned of its removal)
+    When N3 sends Vote RPCs (before it learns of its removal, or if it restarts without the VotersRecord)
     And N1 and N2 have recently heard from the leader
-    Then N1 and N2 reject N3's Vote RPCs
+    Then N1 and N2 reject N3's Vote RPCs (Pre-Vote rejects; N3 not in voter set)
     And the cluster is not disrupted
 
   Scenario: UpdateVoter changes a node's endpoint address

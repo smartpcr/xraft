@@ -52,19 +52,25 @@ network transport, and testing infrastructure.
 
 **Design philosophy.** The proposed consensus core (`xraft-core`) is driven
 by a single-threaded async event loop — no locks, no shared mutable state.
-The event loop processes protocol messages and produces `IoAction` values
-that describe the I/O to perform (append log, send RPC, persist quorum
-state). An `IoStage` executes those actions concurrently via the injected
-async trait objects (`LogStore`, `Transport`, `SnapshotIO`,
-`QuorumStateStore`, `Clock`). The event loop never opens files or sockets
-directly; all concrete I/O is provided by the transport and storage crates
-at construction time. Incoming proposals are staged in a `BatchAccumulator`
-and drained on each tick; client futures are parked in a
-`DeferredCompletionQueue` until the high watermark advances past their
-offset. This mirrors KRaft's `KafkaRaftClient` / `BatchAccumulator` /
-`DeferredEventQueue` architecture and eliminates concurrency bugs in the
-correctness-critical consensus logic while preventing slow I/O from
-delaying Fetch processing and triggering spurious elections.
+The event loop processes protocol messages, mutates `ConsensusState`, and
+invokes application callbacks (`StateMachine::apply`, `Listener`) as
+synchronous in-process calls whenever a commit-visible event occurs (e.g.,
+HW advancement). It then produces `IoAction` values that describe external
+I/O to perform (append log, send RPC, persist quorum state). An `IoStage`
+executes those actions concurrently via the injected async trait objects
+(`LogStore`, `Transport`, `SnapshotIO`, `QuorumStateStore`, `Clock`). The
+event loop never opens files or sockets directly; all concrete external I/O
+is provided by the transport and storage crates at construction time.
+Application callbacks are not external I/O — they are trait-object calls
+that execute within the event loop's thread and always observe fully
+updated protocol state before any `IoAction` is dispatched. Incoming
+proposals are staged in a `BatchAccumulator` and drained on each tick;
+client futures are parked in a `DeferredCompletionQueue` until the high
+watermark advances past their offset. This mirrors KRaft's
+`KafkaRaftClient` / `BatchAccumulator` / `DeferredEventQueue` architecture
+and eliminates concurrency bugs in the correctness-critical consensus logic
+while preventing slow I/O from delaying Fetch processing and triggering
+spurious elections.
 
 ---
 
@@ -79,10 +85,10 @@ loop `await`s trait methods but never opens files or sockets itself.
 | Sub-component | Responsibility |
 |---------------|----------------|
 | **`RaftNode`** | Public API surface. Exposes `propose()`, `read()`, `bootstrap()`, and lifecycle methods. Owns the `EventLoop` and coordinates startup, shutdown, and crash recovery. Accepts a generic `StateMachine` type parameter (monomorphised at compile time). On construction, executes the recovery sequence (§5.10) before accepting any RPCs. |
-| **`EventLoop`** | Single-threaded async loop that processes protocol state transitions without blocking on I/O. The loop drains an inbound message queue (`tokio::sync::mpsc`) and dispatches to the appropriate handler. **I/O staging model:** The loop never directly awaits `LogStore::append()` or `Transport::send()` inline. Instead, handlers produce `IoAction` values (described below) collected into an `IoActionBatch`. After each message is processed, the loop hands the batch to the `IoStage`, which executes storage and network operations concurrently, then returns results. The loop then applies I/O results (e.g., advancing durable offsets, completing client futures) as synchronous state updates. This prevents slow `fsync` calls from delaying Fetch processing and triggering spurious elections. |
-| **`IoStage`** | Executes `IoAction` batches produced by the `EventLoop`. Each action is one of: `PersistQuorumState(QuorumState)`, `AppendLog(Vec<LogEntry>)`, `TruncateSuffix(u64)`, `TruncatePrefix(u64)`, `SendRpc(NodeId, RpcEnvelope)`, `SaveSnapshot(Snapshot)`. The `IoStage` calls the injected trait objects (`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`) concurrently via `tokio::join!` or `FuturesUnordered`. Storage operations complete with `fsync` before the loop processes the next message that depends on them. **Application callbacks** (`StateMachine::apply`, `Listener::handle_commit`, `Listener::handle_leader_change`) are NOT dispatched by the `IoStage` — they are invoked directly by the `EventLoop` after the `IoStage` returns and after state is updated (e.g., HW advanced). This ensures callbacks always see consistent, post-I/O state. |
+| **`EventLoop`** | Single-threaded async loop that processes protocol state transitions without blocking on I/O. The loop drains an inbound message queue (`tokio::sync::mpsc`) and dispatches to the appropriate handler. **Processing order per message:** (1) The handler mutates `ConsensusState` (e.g., updating follower progress, recalculating HW on a Fetch request, or recording appended entries); (2) If the state change triggers application-visible effects — HW advancement, leadership change — the loop invokes callbacks in a fixed order: `StateMachine::apply` (one call per committed command entry), then `Listener::handle_commit` (one batch of committed `AppRecord` values), then `DeferredCompletionQueue::complete` (resolves client futures for committed offsets); (3) The handler collects `IoAction` values into an `IoActionBatch` (e.g., `SendRpc` for the Fetch response, `AppendLog` for newly staged entries); (4) The loop hands the batch to the `IoStage`, which executes storage and network operations concurrently; (5) The loop records I/O results (e.g., advancing the durable offset after `AppendLog` completes). Callbacks in step 2 are synchronous, in-process function calls — not external I/O — and always observe the fully updated protocol state before any IoAction is dispatched. This prevents slow `fsync` calls from delaying Fetch processing and triggering spurious elections. |
+| **`IoStage`** | Executes `IoAction` batches produced by the `EventLoop`. Each action is one of: `PersistQuorumState(QuorumState)`, `AppendLog(Vec<LogEntry>)`, `TruncateSuffix(u64)`, `TruncatePrefix(u64)`, `SendRpc(NodeId, RpcEnvelope)`, `SaveSnapshot(Snapshot)`. The `IoStage` calls the injected trait objects (`LogStore`, `Transport`, `QuorumStateStore`, `SnapshotIO`) concurrently via `tokio::join!` or `FuturesUnordered`. Storage operations complete with `fsync` before the loop processes the next message that depends on them. **Application callbacks** (`StateMachine::apply`, `Listener::handle_commit`, `Listener::handle_leader_change`) are NOT dispatched by the `IoStage` — they are invoked directly by the `EventLoop` during message processing, immediately after a state change triggers them (e.g., HW advancement during Fetch handling). This ensures callbacks execute synchronously within the event loop's single-threaded context and always see consistent, up-to-date protocol state. The event loop produces the `IoAction` batch *after* callbacks have been invoked, so the Fetch response sent via `IoStage` reflects the same HW that callbacks observed. |
 | **`BatchAccumulator`** | Stages incoming `propose()` calls into a batch buffer. On each event-loop tick (or when the batch is full), the accumulated entries are drained into a single `AppendLog` I/O action. This amortises `fsync` cost across multiple proposals (group commit). Analogous to KRaft's `BatchAccumulator`. |
-| **`DeferredCompletionQueue`** | Parks `tokio::sync::oneshot` senders keyed by log offset. When the high watermark advances, the queue completes all futures whose offset is now **< HW** (strictly less than — see §3.2 canonical HW definition). Analogous to KRaft's `DeferredEventQueue` / purgatory. |
+| **`DeferredCompletionQueue`** | Parks `tokio::sync::oneshot` senders keyed by log offset. When the high watermark advances, the queue completes all futures whose offset is now **< HW** (strictly less than — see §3.1 canonical HW definition). Analogous to KRaft's `DeferredEventQueue` / purgatory. |
 | **`ConsensusState`** | The core state: current `term`, `voted_for`, node `role` (Follower / Candidate / Leader / Unattached), the in-memory log index, `high_watermark`, `log_start_offset`, the voter set, and per-follower replication progress (leader only). The `Unattached` role is the initial state before bootstrap or recovery completes. |
 | **`ElectionManager`** | Implements Pre-Vote and Vote protocols. Manages election timeouts (randomised 150–300 ms), vote collection, term advancement, and leader-to-follower step-down on Check Quorum failure. |
 | **`ReplicationManager`** | Handles Fetch request/response processing on both leader and follower sides. On the leader: validates fetch offset against the leader-epoch checkpoint, detects log divergence (populates `DivergingEpoch`), tracks follower progress, and advances the high watermark when a majority has replicated. On the follower: sends periodic Fetch RPCs, processes responses, truncates log on divergence, and updates the local high watermark. |
@@ -132,7 +138,7 @@ reliably with wall-clock time and real I/O.
 
 ## 3. Data Model
 
-### 3.2 Canonical Offset and Commit Semantics
+### 3.1 Canonical Offset and Commit Semantics
 
 These definitions are the single source of truth for commit-related
 semantics throughout this document and sibling planning documents.
@@ -154,7 +160,7 @@ semantics throughout this document and sibling planning documents.
 - **Commit test:** HW=6 → entry at offset 5 is committed (5 < 6 ✓);
   entry at offset 6 is NOT committed (6 < 6 ✗).
 
-### 3.3 Core Entities
+### 3.2 Core Entities
 
 #### `NodeId`
 
@@ -234,7 +240,7 @@ ConsensusState {
     high_watermark: u64             // exclusive upper bound of committed offsets;
                                     // entries with offset < HW are committed.
                                     // HW − 1 is the last committed offset.
-                                    // (see §3.2 for canonical definition)
+                                    // (see §3.1 for canonical definition)
 
     // Voter set (from latest VotersRecord or snapshot)
     voters: HashSet<NodeId>
@@ -341,7 +347,7 @@ AppSnapshot {
 These are newtype wrappers. xraft never interprets their contents; it only
 stores, replicates, and delivers them to the application's `StateMachine`.
 
-### 3.2 RPC Messages
+### 3.3 RPC Messages
 
 All messages include identity and fencing fields:
 
@@ -459,7 +465,7 @@ enum MembershipError {
 }
 ```
 
-### 3.3 Segment File Layout
+### 3.4 Segment File Layout
 
 ```
 data/<cluster_id>/log/
@@ -494,6 +500,27 @@ iterates over newly committed `LogEntry` values, applies control records
 internally (e.g., updating the voter set from a `VotersRecord`, recording
 the leader-epoch from a `LeaderChangeMessage`), and calls
 `StateMachine::apply` only for entries whose `entry_type` is `Command`.
+
+**Three-phase commit notification (fixed ordering).** When HW advances
+during message processing (e.g., when a Fetch request reveals that a
+majority has replicated), the `EventLoop` executes these steps in order
+before producing any `IoAction`:
+
+1. **`StateMachine::apply`** — called once per newly committed command entry.
+   Mutates application state. Control records are filtered and processed
+   internally (e.g., updating the voter set).
+2. **`Listener::handle_commit`** — called once with the full batch of newly
+   committed `AppRecord` values. Used for external notification (metrics,
+   indexing, replication to external systems). Receives only application
+   records; control records are filtered.
+3. **`DeferredCompletionQueue::complete`** — resolves the `oneshot` future
+   for every committed entry whose offset is now `< HW`.
+
+All three steps are **synchronous, in-process function calls** within the
+event loop's single-threaded task — they are not external I/O and are not
+mediated by `IoAction` / `IoStage`. External I/O (sending the Fetch
+response, appending log entries) is dispatched via `IoAction` *after*
+callbacks have completed.
 
 Snapshots are split into two parts:
 - **Consensus metadata** (`SnapshotMetadata` — term, offset, voter set,
@@ -1562,11 +1589,23 @@ leader to provide the authoritative HW via subsequent Fetch responses.
    │ = min(101, 101) = 101.  │        │
    │                         │        │
    │ Apply entries 81..100   │        │
-   │ to state machine:       │        │
-   │ - Command → SM.apply    │        │
+   │ to state machine        │        │
+   │ (three-phase commit     │        │
+   │  notification, §4.1):   │        │
+   │ 1. Command entries →    │        │
+   │    SM.apply (one per    │        │
+   │    entry)               │        │
+   │ 2. Listener.handle_     │        │
+   │    commit (batch)       │        │
+   │ 3. DeferredCompletion   │        │
+   │    Queue (no-op here —  │        │
+   │    no pending client    │        │
+   │    futures post-crash)  │        │
    │ - Control recs →        │        │
-   │   already processed     │        │
-   │   in Phase 2g (skip)    │        │
+   │   filtered out (§4.1:   │        │
+   │   never passed to       │        │
+   │   SM.apply; handled     │        │
+   │   internally by xraft)  │        │
    │                         │        │
    │ Normal operation.       │        │
    └─────┴───────────────────┘        │
@@ -1694,11 +1733,20 @@ All crate names, trait definitions, and module structures below are
   `SnapshotMetadata` (consensus) and `AppSnapshot` (application).
 - **Segment-file log storage** per §6.
 - **I/O staging** per §4.4.1 — the event loop produces `IoAction` values
-  and the `IoStage` executes them via injected trait objects. The loop never
-  directly awaits I/O inline. `BatchAccumulator` stages proposals before
-  draining (group commit); `DeferredCompletionQueue` parks client futures.
-  This matches the tech spec's description of `BatchAccumulator` and
-  `DeferredEventQueue` patterns.
+  and the `IoStage` executes them via injected trait objects for all
+  external I/O (disk, network). The loop never directly awaits external I/O
+  inline. Application callbacks (`StateMachine::apply`, `Listener`) are
+  synchronous in-process calls invoked by the event loop during message
+  processing — they are not external I/O and are not mediated by `IoAction`.
+  `BatchAccumulator` stages proposals before draining (group commit);
+  `DeferredCompletionQueue` parks client futures. This matches the tech
+  spec's description of `BatchAccumulator` and `DeferredEventQueue` patterns.
+  **Note:** The tech spec §6 states that "application callbacks are staged
+  and executed asynchronously outside the loop." This architecture refines
+  that statement: callbacks execute within the event loop's single-threaded
+  context (not on a separate task) to ensure they always see consistent
+  protocol state. They are "staged" in the sense that they are deferred
+  until state is updated — not offloaded to another thread or task.
 - **Timing parameters** (150–300 ms election timeout, 50 ms fetch interval)
   per §4.3.
 - **Quorum math** — majority is `⌊V/2⌋ + 1`; HW advancement uses
