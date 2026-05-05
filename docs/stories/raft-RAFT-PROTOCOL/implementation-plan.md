@@ -250,7 +250,7 @@
 - [ ] Create `xraft-transport/src/channel.rs` implementing `ChannelTransport` — in-process transport using `tokio::sync::mpsc` channels per node pair; exposes `split() -> (Box<dyn TransportSender>, Box<dyn TransportReceiver>)` per architecture §4.4
 - [ ] Implement `TransportSender::send` on `ChannelSender` — serialize envelope, route to destination channel (takes `&self` for concurrent sends)
 - [ ] Implement `TransportReceiver::recv` on `ChannelReceiver` — await the next inbound `RpcEnvelope` from the node's inbound channel (takes `&mut self`, exclusive access per architecture §4.4)
-- [ ] Implement cluster-id and leader-epoch fencing checks in the codec layer (reject envelopes with wrong cluster_id)
+- [ ] Implement cluster-id validation in the codec layer (reject envelopes with wrong `cluster_id` before deserialization reaches the protocol layer); `leader_epoch` fencing is NOT performed at the codec level — it requires node state (current term, leader knowledge) and is handled in the event loop's protocol handlers (Stage 4.1 / Stage 5.2)
 
 #### Test Scenarios
 - [ ] Scenario: Send and receive — Given two nodes connected via `ChannelTransport`, When node A sends a `VoteRequest` to node B, Then node B receives it with all fields intact
@@ -272,6 +272,11 @@
 - [ ] Scenario: Message delay — Given a 200 ms delay on a link, When a message is sent, Then it is delivered after at least 200 ms
 
 ### Stage 3.3: TCP Transport (Production)
+
+> **Note:** This stage is **out of the critical path** for correctness validation.
+> All integration tests and e2e scenarios (Phases 9–10) use `ChannelTransport`
+> from Stage 3.1. Stage 3.3 is parallel-safe with Phases 4–10 and can be
+> deferred until after the consensus logic is proven correct.
 
 #### Implementation Steps
 - [ ] Create `xraft-transport/src/tcp.rs` implementing `TcpTransport` using `tokio::net::TcpListener` and `TcpStream`; exposes `split() -> (Box<dyn TransportSender>, Box<dyn TransportReceiver>)` per architecture §4.4
@@ -309,12 +314,14 @@
 - [ ] Implement `IoActionBatch` collection and `IoStage` executor that dispatches actions to I/O trait objects (`LogStore`, `TransportSender`, `QuorumStateStore`, `SnapshotIO`) concurrently — the `IoStage` does NOT call `Clock` or `TransportReceiver` (architecture §3.2 note: Clock is used by the EventLoop, TransportReceiver by the ReceiverTask)
 - [ ] Create `xraft-core/src/clock.rs` with `WallClock` (production implementation using `tokio::time`) of the `#[async_trait] Clock` trait — implements `now`, `sleep_until`, and `random_election_timeout` per architecture §4.1; `WallClock` implements `#[async_trait] Clock` for object-safe `Box<dyn Clock>` dispatch; `SimulatedClock` is defined in `xraft-test` (Stage 1.8), not in `xraft-core`, to keep test-only code out of the production crate
 - [ ] Implement randomised election timeout generation using `Clock::random_election_timeout` with jitter in [min, max] range
+- [ ] Implement `leader_epoch` fencing in the event loop's RPC dispatch: when an inbound RPC has `leader_epoch > node_state.leader_epoch`, update the node's leader epoch; when an RPC has a stale `leader_epoch` (less than the node's known epoch for that leader), reject it — this fencing requires access to `NodeState` and therefore belongs in the event loop's protocol handlers, NOT in the codec/transport layer (codec only validates `cluster_id`)
 
 #### Test Scenarios
 - [ ] Scenario: NodeState projection — Given a `NodeState` with term=5, role=Leader, HW=42, leader_id=N1, voter_set=[N1,N2,N3], When `project()` is called, Then the returned `ConsensusState` contains exactly those 7 fields (node_id, current_term, role, leader_id, log_end_offset, high_watermark, voter_set) and internal fields (voted_for, observers, pending_membership_change, follower_state, deadlines, vote counters) are not exposed
 - [ ] Scenario: ReceiverTask forwards messages — Given a `ReceiverTask` wired to an in-memory `ChannelTransport` receiver and an mpsc channel, When 3 RPC messages are sent to the transport, Then the ReceiverTask forwards all 3 into the mpsc channel in order, and does not mutate or interpret any protocol fields
 - [ ] Scenario: Simulated clock — Given a `SimulatedClock` (from `xraft-test`, Stage 1.8) at time 0, When advanced by 150 ms, Then `now()` returns 150 ms and no wall-clock time has passed
 - [ ] Scenario: IoStage dispatch — Given an `IoActionBatch` with a `PersistQuorumState` and a `SendRpc`, When executed by `IoStage`, Then both the quorum-state store and transport sender receive the respective calls; `Clock` and `TransportReceiver` are NOT invoked by the `IoStage`
+- [ ] Scenario: Leader epoch fencing — Given node N2 at leader_epoch=3, When it receives an RPC with leader_epoch=2 (stale), Then the RPC is rejected; when it receives an RPC with leader_epoch=4, Then the node updates its leader_epoch to 4 and processes the message
 
 ### Stage 4.2: Election Manager — Vote Request/Response
 
@@ -425,15 +432,19 @@
 - [ ] Create `xraft-core/src/batch_accumulator.rs` implementing `BatchAccumulator` — buffers incoming `propose()` calls, drains to log on tick or when batch is full
 - [ ] Create `xraft-core/src/deferred_completion.rs` implementing `DeferredCompletionQueue` — parks `oneshot::Sender` futures keyed by offset, completes them when HW advances past their offset
 - [ ] Wire HW advancement to the three-phase commit notification per architecture §4.1: when HW advances on the leader, execute in fixed order: (1) `StateMachine::apply` once per newly committed `Command` entry (control records processed internally), (2) `Listener::handle_commit` once with batch of newly committed `AppRecord` values, (3) `DeferredCompletionQueue::complete` for all entries with offset < new HW — all three steps are synchronous in-process calls within the event loop, NOT mediated by `IoAction`/`IoStage`
-- [ ] Implement `propose()` public API on `RaftNode`: accept command, push to `BatchAccumulator`, return a `Future<Result<Offset>>` from `DeferredCompletionQueue`
+- [ ] Implement `propose()` public API on `RaftNode`: accept command, push to `BatchAccumulator`, return a `Future<Result<Offset>>` from `DeferredCompletionQueue`; return `NotLeader { leader_id }` error (including known leader ID for client redirection, or `None` if leader is unknown) if the node is not the current leader
+- [ ] Implement backpressure in `BatchAccumulator`: enforce `max_batch_size` capacity limit; reject `propose()` with `ProposalQueueFull` when the accumulator has `max_batch_size` pending entries; this prevents unbounded memory growth under high write load
+- [ ] Implement pending-proposal cleanup on leadership loss: when a leader steps down (higher term received, Check Quorum failure, or leader self-removal), drain all pending entries from `DeferredCompletionQueue` by completing their futures with `NotLeader { leader_id: None }` error; drain `BatchAccumulator` of un-appended proposals with the same error
+- [ ] Implement pending-proposal cleanup on shutdown: during `RaftNode::shutdown()`, complete all `DeferredCompletionQueue` futures with `Shutdown` error and drain `BatchAccumulator`
 - [ ] Implement `read()` public API on `RaftNode`: return the current committed protocol state as a `ConsensusState` snapshot (current term, role, leader_id, high_watermark, voter set) — `read()` clones the latest value from a `tokio::sync::watch` channel that the event loop updates after each state mutation (architecture §5.11); `read()` never reads the `LogStore` directly, never enters the event loop's message queue, and never contacts other nodes; the returned state reflects the latest HW-committed protocol position because the event loop updates the watch channel after processing commits; linearisable reads (read-index, lease-based) are out of scope per tech-spec §2.2; the high_watermark in the returned state is an exclusive upper bound (entry at offset O is committed when O < HW, per architecture §3.1)
-- [ ] Reject `propose()` with `NotLeader` error if the node is not the current leader
 
 #### Test Scenarios
 - [ ] Scenario: HW advancement — Given a 3-node cluster where leader has `log_end_offset=6` and both followers have `fetch_offset=6` (meaning they've fetched entries [0,6)), When HW is calculated by sorting [6,6,6] descending and taking index ⌊3/2⌋=1, Then HW = 6 (exclusive upper bound: entries 0–5 are committed because 5 < 6)
 - [ ] Scenario: Propose commit notification — Given a client calls `propose(cmd)`, When the entry is appended and HW advances past it after follower fetches, Then the returned Future resolves with the committed offset
 - [ ] Scenario: Two-round commit visibility — Given follower N2 fetches and replicates entry at offset 10, When N2 fetches again (round 2), Then the second response shows HW ≥ 11 (exclusive upper bound: entry 10 is committed because 10 < 11) and N2 executes the three-phase callback: (1) `StateMachine::apply` for the newly committed entry, (2) `Listener::handle_commit` with the batch, (3) `DeferredCompletionQueue::complete`
-- [ ] Scenario: Propose on non-leader — Given follower N2, When `propose()` is called, Then it returns `NotLeader` error immediately
+- [ ] Scenario: Propose on non-leader — Given follower N2 with known leader N1, When `propose()` is called, Then it returns `NotLeader { leader_id: Some(N1) }` error immediately, providing the leader ID for client redirection
+- [ ] Scenario: Backpressure — Given a leader with `max_batch_size = 10` and 10 pending proposals in the `BatchAccumulator`, When an 11th `propose()` is called, Then it returns `ProposalQueueFull` error immediately
+- [ ] Scenario: Pending proposals drained on step-down — Given leader N1 with 5 pending proposals in `DeferredCompletionQueue`, When N1 receives a message with a higher term and steps down, Then all 5 pending futures resolve with `NotLeader` error
 
 ---
 
@@ -453,14 +464,15 @@
 - [ ] Implement recovery phase 2: load latest snapshot (if any) via `SnapshotIO::load_latest()`; call `StateMachine::restore(app_snapshot)` and restore voter set from `snapshot.metadata.voters`; set `log_start_offset` to `snapshot.metadata.last_included_offset + 1` (or 0 if no snapshot)
 - [ ] Implement recovery phase 3: initialise `high_watermark` to `snapshot.metadata.last_included_offset + 1` (or 0 if no snapshot) — HW is never persisted (architecture §5.10 rule 1); entries [0, HW) are known committed from the snapshot; entries beyond HW have unknown committed status
 - [ ] Implement recovery phase 4: scan log from `log_start_offset` to `log_end_offset`, validate CRC-32C per batch, truncate at first corrupt/partial record; do NOT apply any entries to the `StateMachine` (architecture §5.10 rule 2 — committed status unknown; entries may be uncommitted tail from a deposed leader)
-- [ ] Implement recovery phase 5: process control records in the recovered log for bookkeeping only — `VotersRecord` → update voter set, `LeaderChangeMessage` → update leader-epoch checkpoint; these are idempotent consensus metadata updates, not state machine mutations; rebuild full leader-epoch checkpoint from log scan
+- [ ] Implement recovery phase 5: process control records in the recovered log for **bookkeeping only** — scan from `log_start_offset` to `log_end_offset` and handle each control record type as follows: (a) `LeaderChangeMessage` → insert `(term, start_offset)` into the leader-epoch checkpoint (idempotent); (b) `VotersRecord` → store only the **last** one (highest offset) as `pending_membership_change` in `NodeState`; do NOT replace the committed `voter_set` (which comes from the snapshot and is the authoritative set for elections and Check Quorum); earlier `VotersRecord` entries were committed before the next was appended (single-change invariant) but their committed status is unknown during recovery (HW is not persisted); when the leader later provides the authoritative HW via Fetch, the three-phase commit notification (architecture §4.1) promotes `VotersRecord` entries sequentially to the committed `voter_set` as HW advances past each one; if log truncation (divergence) discards the last `VotersRecord`, `pending_membership_change` is cleared — the node reverts to the snapshot's committed voter set (architecture §5.10 rule 3)
 - [ ] Implement recovery phase 6: transition role from `Unattached` to `Follower`, start election timer, begin accepting RPCs — a recovering node never resumes as Leader regardless of prior role; it must win a new election
 - [ ] After recovery, the node sends Fetch requests to the leader; the leader's Fetch response includes the authoritative HW; the node advances local HW to `min(leader_HW, local_log_end_offset)` and executes the three-phase commit notification for entries between old HW and new HW per architecture §4.1: (1) `StateMachine::apply` for each `Command` entry (control records were already processed for bookkeeping during recovery phase 5), (2) `Listener::handle_commit` with batch of newly committed `AppRecord` values, (3) `DeferredCompletionQueue::complete`
 - [ ] Ensure log recovery scan (from Stage 2.2) truncates any partially-written entries before replay
-- [ ] Validate invariants after recovery: `log_start_offset ≤ high_watermark ≤ log_end_offset`, voter set non-empty (from snapshot or bootstrap VotersRecord), term ≥ snapshot term, HW = `snapshot.metadata.last_included_offset + 1` (not `log_end_offset`) — entries between HW and log_end_offset have unknown committed status and must not be applied to the state machine until the leader provides the authoritative HW
+- [ ] Validate invariants after recovery: `log_start_offset ≤ high_watermark ≤ log_end_offset`, voter set non-empty (from snapshot or bootstrap VotersRecord), term ≥ snapshot term, HW = `snapshot.metadata.last_included_offset + 1` (not `log_end_offset`) — entries between HW and log_end_offset have unknown committed status and must not be applied to the state machine until the leader provides the authoritative HW; committed `voter_set` is unchanged from snapshot (not overwritten by any `VotersRecord` found in the log scan); `pending_membership_change` is set only if the log scan found a `VotersRecord`
 
 #### Test Scenarios
-- [ ] Scenario: Clean recovery — Given a node with quorum-state(term=5, voted_for=N1), a snapshot at `last_included_offset=100`, and log entries 101–150, When the node restarts, Then it recovers to term 5 via `Unattached` → `Follower` transition with `high_watermark=101` (`snapshot.metadata.last_included_offset + 1`, not log_end_offset), log entries 101–150 are present on disk but NOT applied to the state machine (committed status unknown), control records in 101–150 are processed for bookkeeping only (VotersRecord → voter set, LeaderChangeMessage → epoch checkpoint), and the node begins sending Fetch requests to learn the authoritative HW from the leader
+- [ ] Scenario: Clean recovery — Given a node with quorum-state(term=5, voted_for=N1), a snapshot at `last_included_offset=100` with voters={N1,N2,N3}, and log entries 101–150 including a `VotersRecord` at offset 130 adding N4, When the node restarts, Then it recovers to term 5 via `Unattached` → `Follower` transition with `high_watermark=101` (`snapshot.metadata.last_included_offset + 1`, not log_end_offset), committed `voter_set` remains {N1,N2,N3} from the snapshot (NOT {N1,N2,N3,N4}), the `VotersRecord` at offset 130 is stored as `pending_membership_change` (not applied to committed `voter_set`), log entries 101–150 are present on disk but NOT applied to the state machine (committed status unknown), and the node begins sending Fetch requests to learn the authoritative HW from the leader
+- [ ] Scenario: Recovery promotes VotersRecord on HW advance — Given a recovered node with committed `voter_set`={N1,N2,N3} and `pending_membership_change` at offset 130 adding N4, When the leader provides HW=135 via Fetch, Then the three-phase commit notification processes entries 101–134, the `VotersRecord` at offset 130 is promoted to committed `voter_set` (now {N1,N2,N3,N4}), and `pending_membership_change` is cleared
 - [ ] Scenario: Recovery after crash mid-write — Given a node that crashed while appending entry 151 (corrupt CRC), When it restarts, Then entries 0–150 are recovered, entry 151 is discarded, and HW is set to `snapshot.metadata.last_included_offset + 1` (not 151)
 - [ ] Scenario: Recovery with no snapshot — Given a node with log entries 0–50 and no snapshot, When it restarts, Then HW is set to 0 (no snapshot → no entries known committed), entries 0–50 are present on disk but NOT applied to the state machine; the node transitions `Unattached` → `Follower` and learns the authoritative HW from the leader via Fetch, at which point the three-phase commit notification executes for entries up to the leader-provided HW
 
@@ -717,4 +729,63 @@
 - [ ] Scenario: CI green — Given all code is committed, When CI runs, Then all build, test, clippy, fmt, and doc steps pass
 - [ ] Scenario: E2E coverage — Given the list of scenarios in `e2e-scenarios.md`, When cross-referenced with test implementations, Then every scenario has at least one corresponding test
 
+---
 
+## Appendix A: E2E Scenario Coverage Matrix
+
+> Maps each feature from [e2e-scenarios.md](./e2e-scenarios.md) to the
+> implementation stages that provide the required logic and the integration
+> test stages that validate the behaviour. A feature is "covered" when its
+> implementation stages are complete AND at least one test stage exercises it.
+
+| # | E2E Feature | Implementation Stages | Test Stages |
+|---|------------|----------------------|-------------|
+| 1 | Leader Election | 4.1, 4.2 | 10.1 |
+| 2 | Pre-Vote Protocol | 4.3 | 10.1 |
+| 3 | Pull-Based Log Replication | 5.1, 5.2 | 10.2 |
+| 4 | High Watermark Advancement | 5.3 | 10.2 |
+| 5 | Log Divergence and Truncation | 5.1 (follower), 5.2 (leader) | 10.2 |
+| 6 | Check Quorum | 4.4 | 10.1, 10.3 |
+| 7 | Persistence and Crash Recovery | 6.1 | 10.3 |
+| 8 | Log Compaction and Snapshots | 7.1 | 10.3 |
+| 9 | Snapshot Transfer | 7.2 | 10.3 |
+| 10 | Cluster Bootstrap | 6.2 | 10.1 |
+| 11 | Dynamic Quorum — Add Voter | 8.1 | 10.3 |
+| 12 | Dynamic Quorum — Remove Voter | 8.2 | 10.3 |
+| 13 | Dynamic Quorum — Observer Promotion | 8.1 (observer tracking), 8.3 | 10.3 |
+| 14 | Identity and Fencing | 3.1 (`cluster_id`), 4.1 (`leader_epoch`) | 10.1 |
+| 15 | Client Interaction | 5.3 (propose, backpressure, pending cleanup) | 10.2 |
+| 16 | Safety Invariants | 9.2 (InvariantChecker) | 10.1, 10.2, 10.3 |
+| 17 | Observability and Metrics | 11.1 | 11.1 |
+| 18 | Graceful Shutdown and Lifecycle | 1.7 (`shutdown()`), 5.3 (proposal cleanup) | 10.3 |
+| 19 | Error Recovery and Fault Tolerance | 1.8 (fault injection), 3.2 (network sim) | 10.3 |
+
+**Coverage notes:**
+
+- **Feature 14 (Identity/Fencing):** `cluster_id` is validated at the codec/transport layer (Stage 3.1). `leader_epoch` fencing requires node state and is handled in the event loop's protocol dispatch (Stage 4.1). Both are exercised by integration tests in Stage 10.1.
+- **Feature 15 (Client Interaction):** `propose()` API, `NotLeader` redirection (with `leader_id`), `ProposalQueueFull` backpressure, and pending-proposal cleanup on step-down/shutdown are all implemented in Stage 5.3.
+- **Feature 18 (Graceful Shutdown):** `begin_shutdown()` callback, proposal draining, and task join are implemented across Stages 1.7 and 5.3. Integration tests in Stage 10.3 verify clean shutdown under various cluster states.
+
+---
+
+## Appendix B: Phase Dependency Summary
+
+> Each phase builds on prior phases. This table shows which phases must
+> complete before a given phase can start.
+
+| Phase | Depends On | Parallel-Safe With |
+|-------|------------|-------------------|
+| 1 — Scaffolding | — (none) | — |
+| 2 — Storage | Phase 1 | Phase 3 |
+| 3 — Transport | Phase 1 | Phase 2 |
+| 4 — Election | Phase 1 (types, traits, test infra via 1.8), Phase 2 (quorum state via 2.3), Stage 3.1 (ChannelTransport) | — |
+| 5 — Replication | Phase 4 | — |
+| 6 — Recovery/Bootstrap | Phases 4, 5 | — |
+| 7 — Snapshots | Phase 5, Stage 2.4 (snapshot store) | — |
+| 8 — Membership | Phases 5, 6, 7 | — |
+| 9 — Test Harness | Phases 4–8, Stage 1.8 | — |
+| 10 — Integration Testing | Phase 9 | Internal stages parallel-safe |
+| 11 — Polish | Phases 1–10 | Internal stages parallel-safe |
+
+> **Stage 3.3 (TCP Transport)** is parallel-safe with Phases 4–10 and can be
+> deferred — all tests use `ChannelTransport` (Stage 3.1).

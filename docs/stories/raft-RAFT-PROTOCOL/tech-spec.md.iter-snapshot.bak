@@ -23,6 +23,22 @@ Kafka clone — it extracts and adapts the consensus layer described in the
 reference material into an independent Rust library and accompanying test
 harness.
 
+> **Document suite.** This tech spec covers problem, scope, constraints, and
+> risks. Structural design lives in [architecture.md](./architecture.md).
+> Phased build-out lives in [implementation-plan.md](./implementation-plan.md).
+> Behavioural acceptance criteria live in
+> [e2e-scenarios.md](./e2e-scenarios.md). Shared concepts use the vocabulary
+> defined in §9 (Glossary).
+>
+> **Terminology convention — term vs. epoch.** The Raft paper uses **term**;
+> KRaft uses **epoch** (specifically `currentLeaderEpoch`). This document
+> uses **term** as the canonical prose word for the monotonically-increasing
+> election counter. The word **epoch** appears only when naming KRaft-derived
+> RPC schema fields (`leader_epoch` in `RpcEnvelope`, `DivergingEpoch`,
+> `SnapshotId`) or when quoting the reference material. If a sentence says
+> "term" and "epoch" side by side, they refer to the same concept. The
+> glossary (§9) records both entries and cross-references them.
+
 ### 1.1 Reference Material Assessment
 
 Each URL in the story description was reviewed for relevance and content:
@@ -72,7 +88,7 @@ implementation of the Raft protocol as described in the reference material.
 
 | Capability | Detail | Reference |
 |------------|--------|-----------|
-| **Node roles** | Three states: Follower, Candidate, Leader. Clean state machine transitions driven by timeouts and RPCs. | Raft paper §5; Red Hat article "Introducing Raft" |
+| **Node roles** | Four roles: **Unattached**, Follower, Candidate, Leader. A node starts as Unattached (no term, no vote, no known leader) and transitions to Follower upon receiving a valid RPC or completing bootstrap/recovery. Clean state machine transitions driven by timeouts and RPCs. The Unattached role is an xraft addition (not in the original Raft paper) that models the pre-bootstrap and post-removal states. | Raft paper §5; Red Hat article "Introducing Raft"; architecture §2.1 |
 | **Leader election** | Term-based election with `Vote` RPC (KRaft terminology for `RequestVote`). Randomised election timeouts (150–300 ms) to prevent split votes. A candidate votes for itself, then requests votes from all other nodes. First candidate to receive a majority wins. | Red Hat article "Leader election" |
 | **Pre-Vote protocol** | Two-phase election: candidates send a pre-vote request to check viability before incrementing the term. Followers that have recently heard from a leader reject pre-vote requests, preventing disruptive elections by isolated or partitioned nodes. | Red Hat article "Network partition" — Pre-Vote |
 | **Check Quorum** | Leader periodically verifies it can communicate with a majority of voters; steps down if quorum is lost. Prevents split-brain during network partitions. | Red Hat article "Network partition" — Check Quorum |
@@ -242,7 +258,7 @@ cannot be relaxed without changing the project's mandate.
 
 | Constraint | Detail | Source |
 |------------|--------|--------|
-| **Rust** | The implementation language is Rust (stable toolchain, latest edition). | Story description: "implement raft using rust". |
+| **Rust** | The implementation language is Rust. Minimum Supported Rust Version (MSRV): **1.75** (the first stable release with `async fn` in traits via `impl Trait`). Rust edition: **2021** (consistent with the `Cargo.toml` workspace settings in the implementation plan). Stable toolchain only — no nightly features. | Story description: "implement raft using rust". |
 | **Repository** | All code lands in `smartpcr/xraft`. | Story description and repository context. |
 
 ### 4.2 Protocol Correctness
@@ -250,6 +266,8 @@ cannot be relaxed without changing the project's mandate.
 | Constraint | Detail | Source |
 |------------|--------|--------|
 | **Raft safety invariants** | The five safety properties from the Raft paper (listed in §2.1.1) must hold under all conditions, including crash-recovery and network partition scenarios. | Raft paper §5.2–5.4; Red Hat article "Safety rules". |
+| **Failure model: crash-recovery + partitions** | xraft assumes the **non-Byzantine, crash-recovery** failure model: nodes may crash and restart (losing only volatile state), messages may be delayed, reordered, duplicated, or lost, and network partitions may occur. Byzantine failures (malicious or arbitrary behaviour) are explicitly out of scope. This is the standard Raft assumption. | Raft paper §2; distributed systems convention. |
+| **Node identity: no NodeId reuse** | Each `NodeId` is unique for the lifetime of a cluster. A node removed via `RemoveVoter` cannot rejoin the same cluster with the same `NodeId`. Replacement nodes must use a new `NodeId`. This eliminates the need for a `DirectoryId` / incarnation counter and simplifies vote-fencing logic. KRaft's `votedDirectoryId` mechanism is intentionally not adopted. | Design decision — simplifies §2.1.3 and recovery. |
 | **Durable persistence before ack** | Log entries and voting state must be `fsync`-ed to disk before any acknowledgement is sent to peers or clients. | Raft paper §5; Red Hat article "Safety rules" — persistence requirements. |
 | **Pull-based replication** | Log replication uses the pull-based (fetch) model where followers request entries from the leader. Push-based `AppendEntries` is not implemented. | Story description reference to KRaft; §3 Non-Goals item 2. |
 | **Timing invariant** | `broadcastTime << electionTimeout << avgTimeBetweenFailures`. | Raft paper §5.6. |
@@ -307,6 +325,39 @@ justification.
 |------------|--------|-----------|
 | **Branch strategy** | Feature branches off `main`, PR-based review. | Standard collaborative development workflow. |
 
+### 4.5 Assumptions
+
+The following assumptions are implicit prerequisites for correctness and
+liveness. If any assumption is violated, the safety or liveness guarantees of
+the protocol may not hold.
+
+| Assumption | Detail | Consequence if violated |
+|------------|--------|------------------------|
+| **Local disk honours `fsync` semantics** | After a successful `fsync()` call, the data is durable on the storage medium. The file system supports atomic rename (write-to-temp, `fsync`, rename) for snapshot commits. | Committed entries or voting state may be silently lost on crash, violating Raft safety. |
+| **Monotonic clocks with bounded drift** | Each node has access to a monotonic clock source (`tokio::time::Instant`) with drift bounded well below `electionTimeout`. Wall-clock synchronisation (NTP) is not required — Raft uses logical clocks (terms). | Unbounded clock regression could cause premature election timeouts or Check Quorum failures, reducing availability (not safety). |
+| **Application callbacks are non-blocking** | `StateMachine::apply`, `Listener::handle_commit`, and other application callbacks return quickly (< 1 ms). Applications that need heavy processing hand off work to their own async tasks. | Blocking callbacks stall the event loop, delaying Fetch responses and risking election-timeout expirations across the cluster. |
+| **Unique `NodeId` provisioning** | `NodeId` values are provisioned externally and are unique within a cluster for its entire lifetime. A removed node never rejoins with the same `NodeId`. | Duplicate `NodeId` would corrupt vote-fencing and follower-progress tracking, violating leader election safety. |
+| **Non-Byzantine failure model** | Nodes may crash and restart (losing only volatile state). Messages may be delayed, reordered, duplicated, or lost. Network partitions may occur. Nodes do not exhibit Byzantine (malicious or arbitrary) behaviour. | Byzantine behaviour (e.g., sending fabricated vote responses) can violate all safety invariants. |
+| **Reliable local storage (no silent corruption)** | Disk sectors do not silently corrupt data without detectable errors. CRC-32C checksums (§6) detect corruption; the assumption is that the underlying hardware reports I/O errors faithfully. | Silent bit-rot undetected by CRC could apply corrupt entries to the state machine. |
+
+### 4.6 Compatibility and Stability Policy
+
+xraft is a new, greenfield implementation. The following stability commitments
+apply during initial development (pre-1.0):
+
+| Surface | Stability | Notes |
+|---------|-----------|-------|
+| **Public Rust API** (`RaftNode`, `StateMachine`, `Listener`, `propose`, `read`) | **Unstable** — may change between minor versions. | Semantic versioning with `0.x.y` during initial development. Breaking changes documented in changelogs. |
+| **On-disk log format** (segment files, CRC layout) | **Unstable** — no backward-compatible migration guaranteed pre-1.0. | Snapshot + log format may evolve. Upgrade path: re-snapshot from running cluster before upgrading. |
+| **On-disk quorum-state format** | **Unstable** — same policy as log format. | Small file; easy to re-derive from cluster state after upgrade. |
+| **Wire format** (RPC serialisation via `serde` + `bincode`) | **Unstable** — `bincode` is not self-describing and not backward-compatible across schema changes. | All nodes in a cluster must run the same xraft version. Rolling upgrades are not supported pre-1.0. |
+| **Metrics struct** | **Unstable** — field names and types may change. | Consumers should not rely on stable field names until 1.0. |
+
+> **Post-1.0 goal:** Establish backward-compatible on-disk and wire formats
+> (potentially switching to a self-describing serialisation format like
+> `postcard` or `protobuf`) to enable rolling upgrades. This is out of scope
+> for the initial implementation.
+
 ---
 
 ## 5. Identified Risks
@@ -319,7 +370,7 @@ justification.
 | R2 | **`fsync` performance on different OSes** — Durable persistence is a hard constraint, but `fsync` latency varies dramatically across platforms and file systems. | Medium | High | Abstract the storage layer behind a trait. Benchmark on Linux ext4/xfs and document minimum requirements. Allow batched `fsync` (group commit) for throughput. |
 | R3 | **Pull-based replication complexity** — KRaft's pull-based model (followers fetch from leader) is less common than the push-based model in the original Raft paper. It introduces subtlety around fetch timing, backpressure, and high-watermark advancement. | Medium | High | Commit to pull-based from the start (see §3 Non-Goals — push-based is explicitly excluded). Invest heavily in integration tests that validate HW advancement under varying fetch rates. Build a deterministic simulation harness early so fetch-timing edge cases are reproducible. Cross-reference `etcd/raft` and `openraft` for replication state-machine patterns, adapted to pull semantics. |
 | R4 | **Snapshot transfer for large state** — Chunked snapshot transfer over the network can be slow and may block normal replication. | Low | Medium | Stream snapshots in chunks with progress tracking. Allow follower to continue fetching log entries that arrive after the snapshot offset while the transfer is in progress. |
-| R5 | **Dynamic quorum correctness** — Adding/removing nodes while elections and replication are in flight is the most error-prone part of Raft. | Medium | Critical | Enforce single-node changes only. Extensive scenario testing covering add-during-election, remove-leader, and add-while-partitioned cases. Consider formal verification of the membership-change state machine (TLA+ spec or Kani model checker for Rust). |
+| R5 | **Dynamic quorum correctness** — Adding/removing nodes while elections and replication are in flight is the most error-prone part of Raft. Concurrent leader election and membership change can create disjoint-majority hazards if the single-change invariant is violated (the Red Hat article explicitly warns: "asynchronous metadata log replication with multiple in-flight quorum changes could create disjoint majorities"). | Medium | Critical | Enforce single-node changes only. Reject any membership RPC while an uncommitted `VotersRecord` exists in the log. Extensive scenario testing covering add-during-election, remove-leader, add-while-partitioned, and simultaneous-add-and-remove-attempt cases. Formal verification: use TLA+ for quorum-transition and state-machine modelling (protocol-level reasoning); use Kani model checker or property-based tests (proptest) for bounded Rust implementation checks. |
 | R6 | **Incomplete reference material** — The third reference URL (`dragotin/kraft`) is an unrelated invoicing application, reducing the available reference implementations to two articles (descriptive, not source code). No Rust reference implementation of KRaft-style Raft exists. | Low | Medium | Supplement with the original Raft paper (Ongaro & Ousterhout, 2014), the `etcd/raft` Go implementation, and the `openraft` Rust crate as cross-references. |
 | R7 | **Log/snapshot corruption and torn writes** — Crash during `fsync` can leave partial writes in the log or snapshot files. Recovery must handle truncated segments, partial records, and corrupt CRC checksums without data loss beyond the uncommitted tail. | Medium | Critical | Every log segment and snapshot chunk includes CRC-32C checksums. On recovery, scan forward and truncate at first corrupt/incomplete record. Use `O_DSYNC` or explicit `fsync` before advancing any durable offset. Write snapshot atomically via rename (write to temp file, `fsync`, rename). |
 | R8 | **Memory/backpressure under load** — Unbounded pending proposals, snapshot transfers in flight, or large fetch-lag deltas can exhaust memory. The pull-based model amplifies this: if followers are slow, the leader accumulates entries with no push-side backpressure. | Medium | High | Bound the proposal queue (reject with `Busy` if full). Cap in-flight snapshot transfers per node. Limit the batch size in `Fetch` responses. Monitor log-end-offset minus HW as a lag metric. |
@@ -386,8 +437,12 @@ The implementation is complete when:
    log divergence, snapshot transfer, and crash-recovery. Zero committed
    entries are lost across any crash/restart matrix.
 4. Dynamic membership changes (add/remove one node) complete without
-   violating safety invariants. Membership change takes effect within a
-   bounded number of fetch rounds after the `VotersRecord` is committed.
+   violating safety invariants. Membership change propagation: the leader
+   applies the new voter set immediately on append; a follower that already
+   holds the `VotersRecord` applies it on the next successful `Fetch` that
+   advances HW past its offset; a follower that has not yet replicated the
+   record requires up to two successful `Fetch` rounds in steady state
+   (one to replicate the record, one to receive the updated HW).
 5. Pre-Vote and Check Quorum mechanisms prevent disruptive elections by
    isolated nodes. Verified by partition simulation tests.
 6. Log compaction via snapshots keeps disk usage bounded: at most one segment
@@ -402,12 +457,34 @@ The implementation is complete when:
 
 ---
 
-## 8. Glossary
+## 8. Cross-Document Consistency
+
+This section tracks alignment with sibling planning documents. Shared
+terminology (RPC names, crate names, role names, offset conventions) is
+defined in this tech spec and consumed by the siblings.
+
+| Topic | This document | Sibling | Status |
+|-------|---------------|---------|--------|
+| Crate names | `xraft-core`, `xraft-storage`, `xraft-transport`, `xraft-test` (§4.4) | architecture.md §2, implementation-plan.md Phase 1 | **Aligned** |
+| RPC names | `Vote`, `Fetch`, `FetchSnapshot`, `AddVoter`, `RemoveVoter`, `UpdateVoter` (§2.1.4) | architecture.md §3, e2e-scenarios.md header | **Aligned** |
+| Roles | Unattached, Follower, Candidate, Leader (§2.1.1) | architecture.md §3.1, e2e-scenarios.md header | **Aligned** |
+| Offset semantics | HW is exclusive upper bound; `fetch_offset` is exclusive (§8 Glossary) | architecture.md §3.1, e2e-scenarios.md offset conventions | **Aligned** |
+| Rust edition | **2021** (§4.1) | implementation-plan.md Stage 1.1: `edition = "2021"` | **Aligned** (fixed in this iteration — was "latest edition") |
+| Term vs. epoch | **term** canonical; **epoch** for KRaft field names only (preamble §1) | architecture.md uses both | **Needs review** — architecture.md should adopt the same convention |
+
+> **Policy:** If a future iteration of any sibling document diverges from the
+> shared vocabulary above, the inconsistency should be flagged in that
+> document's Iteration Summary so the next iteration of either document can
+> reconcile.
+
+---
+
+## 9. Glossary
 
 | Term | Definition |
 |------|-----------|
-| **Term** | Monotonically increasing integer identifying an election cycle. Acts as a logical clock. |
-| **Epoch** | KRaft's name for a term. Used interchangeably in this document. |
+| **Term** | Monotonically increasing integer identifying an election cycle. Acts as a logical clock. This is the canonical word used in xraft prose. See also: *Epoch*. |
+| **Epoch** | KRaft's name for a term. In xraft, **epoch** appears only in KRaft-derived RPC field names (`leader_epoch`, `DivergingEpoch`, `SnapshotId.epoch`) and when quoting reference material. In all other contexts, use **term**. See preamble §1. |
 | **High watermark (HW)** | An exclusive upper bound on committed offsets. Entry at offset O is committed ⟺ `O < HW`. Equivalently, `HW − 1` is the last committed offset. HW = 0 means no entries are committed. See architecture §3.1 for canonical definition. |
 | **Log start offset (LSO)** | The lowest offset still present in the log (entries before this have been compacted/snapshotted). |
 | **Log end offset (LEO)** | The offset of the next entry to be appended. `LEO - 1` is the last entry in the log. |

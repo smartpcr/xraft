@@ -30,7 +30,7 @@
     "title": "Trait Definitions (Storage, Transport, Runtime)",
     "description": "Trait Definitions (Storage, Transport, Runtime) (8 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-trait-definitions-storage-transport-runtime",
-    "contentHash": "4d629dfa16680f262ab7733ecbdb1ea4688dbff07e93d438c434f5c4e2d383e6",
+    "contentHash": "7c797f52941cd3cce176d7dfe1c66f58b035828ac94f8321990829a7f6b3fb2b",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-runtime",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-runtime",
     "status": "planning"
@@ -57,7 +57,7 @@
     "title": "\u0060RaftNode\u0060 Public API Skeleton",
     "description": "\u0060RaftNode\u0060 Public API Skeleton (7 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-raftnode-public-api-skeleton",
-    "contentHash": "40cf08b9504acd9625c0c19ea877c911c092ce67dbd8d42e4e37663aa5706255",
+    "contentHash": "d6281a0a472e9c6cc4d6f0a0f1693efd9e9635e43a2f8f9839b693e7b8540d10",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
     "status": "planning"
@@ -120,7 +120,7 @@
     "title": "RPC Codec and Channel Transport",
     "description": "RPC Codec and Channel Transport (5 steps)",
     "anchor": "phase-transport-layer-xraft-transport/stage-rpc-codec-and-channel-transport",
-    "contentHash": "52bf10af8b7c819fd7fc0db389a6f625770889dcd0df13d9c6c630ee977c15b9",
+    "contentHash": "a9a562b6b6f8cc44de40a4c0f7a6e45da3184915a5a6f9f7a3144d1224f6256a",
     "workstreamId": "ws-raft-raft-protocol-phase-transport-layer-xraft-transport-stage-rpc-codec-and-channel-transport",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-transport-layer-xraft-transport-stage-rpc-codec-and-channel-transport",
     "status": "planning"
@@ -145,9 +145,9 @@
   },
   {
     "title": "Event Loop Skeleton and Timer Infrastructure",
-    "description": "Event Loop Skeleton and Timer Infrastructure (5 steps)",
+    "description": "Event Loop Skeleton and Timer Infrastructure (8 steps)",
     "anchor": "phase-election-and-leader-lifecycle-xraft-core/stage-event-loop-skeleton-and-timer-infrastructure",
-    "contentHash": "f90025fc4ea475efeea99b688b98411d4ef76140f2f14e949412442dbf0263b1",
+    "contentHash": "2ed44f933a8434e943ac953ccda69bf9c05b257b85064d69f0cedc3bde29cf2a",
     "workstreamId": "ws-raft-raft-protocol-phase-election-and-leader-lifecycle-xraft-core-stage-event-loop-skeleton-and-timer-infrastructure",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-election-and-leader-lifecycle-xraft-core-stage-event-loop-skeleton-and-timer-infrastructure",
     "status": "planning"
@@ -199,9 +199,9 @@
   },
   {
     "title": "High Watermark Advancement and Commit Notification",
-    "description": "High Watermark Advancement and Commit Notification (7 steps)",
+    "description": "High Watermark Advancement and Commit Notification (9 steps)",
     "anchor": "phase-pull-based-log-replication-xraft-core/stage-high-watermark-advancement-and-commit-notification",
-    "contentHash": "b7661fe0401b6ba3560360f06cdb37cabca4d2342ee1ebc01371bb225d524a04",
+    "contentHash": "22371cd7553463b9cb01501e13e810cb8282c04ca0fe28a92f80d678650d6ae4",
     "workstreamId": "ws-raft-raft-protocol-phase-pull-based-log-replication-xraft-core-stage-high-watermark-advancement-and-commit-notification",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-pull-based-log-replication-xraft-core-stage-high-watermark-advancement-and-commit-notification",
     "status": "planning"
@@ -210,7 +210,7 @@
     "title": "Crash Recovery Sequence",
     "description": "Crash Recovery Sequence (10 steps)",
     "anchor": "phase-persistence-crash-recovery-and-bootstrap-xraft-core/stage-crash-recovery-sequence",
-    "contentHash": "2a87079dcae396928d74cceb129210de8551e6794745b0e569d28ee4378a4b3e",
+    "contentHash": "52d817071d9ad09efb8470f72f8740896ab1ef812a1133a2d0a7efbca8267ae3",
     "workstreamId": "ws-raft-raft-protocol-phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-crash-recovery-sequence",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-crash-recovery-sequence",
     "status": "planning"
