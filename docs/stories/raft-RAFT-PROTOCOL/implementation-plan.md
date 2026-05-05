@@ -70,7 +70,7 @@
 
 #### Test Scenarios
 - [ ] Scenario: RPC envelope serialisation — Given an `RpcEnvelope` wrapping a `VoteRequest`, When serialised to bincode and deserialised, Then all fields match the original
-- [ ] Scenario: MembershipError variants — Given each `MembershipError` variant, When pattern-matched, Then all six variants are covered exhaustively
+- [ ] Scenario: MembershipError variants — Given each `MembershipError` variant (`NotLeader`, `ChangeInProgress`, `NodeAlreadyVoter`, `NodeNotFound`, `NodeNotCaughtUp`), When pattern-matched, Then all five variants are covered exhaustively
 
 ### Stage 1.4: Trait Definitions (Storage, Transport, Clock)
 
@@ -98,6 +98,33 @@
 #### Test Scenarios
 - [ ] Scenario: Config validation — Given a `RaftConfig` where `election_timeout_min > election_timeout_max`, When validated, Then an error is returned
 - [ ] Scenario: Default config valid — Given `RaftConfig::default()`, When validated, Then it passes and satisfies the Raft timing invariant constraints
+
+### Stage 1.6: Application Record Types and Listener Trait
+
+#### Implementation Steps
+- [ ] Create `xraft-core/src/app_record.rs` defining `AppRecord` (application command payload passed to `StateMachine::apply`) and `AppSnapshot` (application-owned snapshot payload) types with `Serialize`/`Deserialize`
+- [ ] Create `xraft-core/src/listener.rs` defining `Listener` trait with callbacks: `handle_commit(batch: &[AppRecord])`, `handle_load_snapshot(reader: &AppSnapshot)`, `handle_leader_change(leader_id: NodeId, term: Term)`, `begin_shutdown()` — modelled on KRaft's `RaftClient.Listener`
+- [ ] Create `xraft-core/src/listener_event.rs` defining `ListenerEvent` enum with variants matching each `Listener` callback, used by `IoAction::NotifyListener`
+- [ ] Update `xraft-core/src/lib.rs` to re-export `AppRecord`, `AppSnapshot`, `Listener`, and `ListenerEvent`
+
+#### Test Scenarios
+- [ ] Scenario: AppRecord roundtrip — Given an `AppRecord` with a command payload, When serialised with bincode and deserialised, Then the result equals the original
+- [ ] Scenario: ListenerEvent coverage — Given each `ListenerEvent` variant, When pattern-matched, Then all variants are covered exhaustively
+
+### Stage 1.7: `RaftNode` Public API Skeleton
+
+#### Implementation Steps
+- [ ] Create `xraft-core/src/raft_node.rs` defining the `RaftNode<S: StateMachine>` struct with fields: `config: RaftConfig`, `event_loop_handle`, `propose_tx: mpsc::Sender` — this is the public entry point from architecture §2.1
+- [ ] Define `RaftNode::new(config, storage, transport, state_machine) -> Result<Self>` constructor signature (body deferred to Phase 6 recovery/bootstrap)
+- [ ] Define `RaftNode::propose(command: AppRecord) -> Future<Result<Offset>>` method stub returning `NotLeader` until the event loop is wired (Phase 5)
+- [ ] Define `RaftNode::read() -> Result<ConsensusState>` method stub for reading current committed state (linearisable read API from tech-spec §2.1.5)
+- [ ] Define `RaftNode::bootstrap(initial_voters: Vec<VoterInfo>) -> Result<()>` method stub (body implemented in Phase 6)
+- [ ] Define `RaftNode::shutdown() -> Result<()>` lifecycle method
+- [ ] Update `xraft-core/src/lib.rs` to re-export `RaftNode`
+
+#### Test Scenarios
+- [ ] Scenario: RaftNode compiles — Given the `RaftNode` struct with all type parameters, When `cargo check` is run, Then it compiles without errors
+- [ ] Scenario: API surface exists — Given a `RaftNode` instance constructed with mocks, When `propose()`, `read()`, `bootstrap()`, and `shutdown()` are called, Then each returns a typed `Result` (stubs return placeholder errors)
 
 ---
 
@@ -448,12 +475,13 @@
 - [ ] Implement observer registration: new node joins as observer (non-voting), replicates log via Fetch, does not contribute to quorum
 - [ ] Track observer catch-up progress: observer must reach within a configurable threshold of the leader's log end before promotion
 - [ ] On `VotersRecord` commit: update the in-memory voter set, begin counting the new voter for quorum calculations
-- [ ] Return `MembershipChangeResponse` with appropriate errors (`NotLeader`, `ChangeInProgress`, `NodeAlreadyVoter`)
+- [ ] Return `MembershipChangeResponse` with appropriate errors (`NotLeader`, `ChangeInProgress`, `NodeAlreadyVoter`, `NodeNotCaughtUp`) — all variants from `MembershipError` enum defined in architecture §3.2
 
 #### Test Scenarios
 - [ ] Scenario: Add voter — Given a 3-node cluster {N1, N2, N3}, When leader N1 processes `AddVoter(N4)`, Then N4 is added as observer, catches up, a `VotersRecord` is committed, and N4 becomes a voter (quorum changes from 2 to 3)
 - [ ] Scenario: Concurrent change rejected — Given a membership change is in progress, When a second `AddVoter` is requested, Then it returns `ChangeInProgress` error
 - [ ] Scenario: Observer catch-up — Given N4 joins as observer with empty log and leader has 1000 entries, When N4 fetches and reaches within 10 entries of the leader, Then N4 is eligible for promotion
+- [ ] Scenario: Observer not caught up — Given N4 joins as observer but is 500 entries behind the leader, When `AddVoter(N4)` attempts promotion, Then it returns `MembershipError::NodeNotCaughtUp`
 
 ### Stage 8.2: Membership Manager — Remove Voter
 
@@ -466,7 +494,7 @@
 #### Test Scenarios
 - [ ] Scenario: Remove voter — Given a 5-node cluster, When leader removes N5, Then after `VotersRecord` commits, quorum is calculated over 4 nodes
 - [ ] Scenario: Leader self-removal — Given N1 is leader of {N1, N2, N3}, When `RemoveVoter(N1)` is committed, Then N1 steps down and a new election among {N2, N3} occurs
-- [ ] Scenario: Remove non-existent node — Given voter set {N1, N2, N3}, When `RemoveVoter(N4)` is requested, Then `NodeNotFound` error is returned
+- [ ] Scenario: Remove non-existent node — Given voter set {N1, N2, N3}, When `RemoveVoter(N4)` is requested, Then `MembershipError::NodeNotFound` error is returned
 
 ### Stage 8.3: Update Voter and VotersRecord Snapshot Integration
 
