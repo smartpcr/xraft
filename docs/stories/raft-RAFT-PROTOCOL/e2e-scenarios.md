@@ -784,18 +784,25 @@ Feature: Dynamic Quorum — Add Voter
     And N2 responds with the ID of the current leader (N1)
 
   Scenario: AddVoter during network partition
+    # The NEW voter set [N1, N2, N3, N4] is used for quorum (majority = 3 of 4).
+    # N4's fetch_offset counts toward commit (architecture §5.5 Quorum transition).
     Given N3 is partitioned from N1 and N2
+    And N4 is an Observer that has caught up (fetch_offset ≥ HW)
     When a client sends AddVoter for N4 to N1
-    Then N1 can still commit the VotersRecord with N1 + N2 = 2 of 3 (majority of current voters [N1, N2, N3])
-    And N4 replicates the VotersRecord via Fetch as an observer
+    Then N1 appends a VotersRecord [N1, N2, N3, N4]
+    And N4 replicates the VotersRecord via Fetch as an observer-becoming-voter
+    And N1 can commit the VotersRecord with N1 + N2 + N4 = 3 of 4 (majority of NEW set [N1, N2, N3, N4])
+    And N3's fetch_offset is irrelevant — 3 of 4 already achieved without N3
     And when the partition heals, N3 learns the new voter set via Fetch
 
   Scenario: Add voter fails if observer has not caught up
-    Given N4 is an Observer whose log is significantly behind the leader
+    # Per architecture §5.5: leader checks observer's fetch_offset against HW.
+    Given N4 is an Observer whose fetch_offset is 50 and the leader's HW is 100
     When a client sends AddVoter for N4 to N1
-    Then N1 rejects the AddVoter because N4 is not caught up
+    Then N1 checks N4's tracked fetch_offset (50) against its own HW (100)
+    And N1 rejects the AddVoter with MembershipError::NodeNotCaughtUp (fetch_offset < HW)
     And the rejection prevents an availability gap where N4's vote
-      would be needed but N4 cannot meaningfully participate
+      would be needed but N4 has a stale log and cannot quickly participate
 
   Scenario: Uncommitted AddVoter VotersRecord lost on leader crash
     Given a client sends AddVoter for N4 to N1
@@ -816,6 +823,18 @@ Feature: Dynamic Quorum — Add Voter
     Then N2 rejects the request because an uncommitted VotersRecord exists in its log
     And the single-change invariant (architecture §5.5) is enforced even across leader transitions
     And the original VotersRecord must be committed or truncated before a new change is accepted
+
+  Scenario: AddVoter cannot commit when new node becomes unreachable
+    # Because HW advancement uses the NEW voter set, the new node's
+    # fetch_offset matters. If N4 becomes unreachable after AddVoter is appended
+    # but before commit, quorum of [N1, N2, N3, N4] may stall.
+    Given N4 is an Observer that was caught up (fetch_offset ≥ HW)
+    When a client sends AddVoter for N4 to N1
+    And N1 appends a VotersRecord [N1, N2, N3, N4]
+    And N4 becomes unreachable immediately after the VotersRecord is appended
+    Then N1, N2, N3 have the VotersRecord (3 of 4 new voters — a majority)
+    And the VotersRecord can still commit because 3 of 4 is a majority of the NEW set
+    And N4 will learn the new config when the partition heals and it resumes Fetching
 ```
 
 ---
@@ -864,7 +883,7 @@ Feature: Dynamic Quorum — Remove Voter
     And N3's endpoint changes from 10.0.0.3:9000 to 10.0.0.30:9000
     When a client sends an UpdateVoter RPC for N3 with the new endpoint to N1
     Then N1 appends a VotersRecord with updated endpoint for N3
-    When the VotersRecord is committed (by the current voter set)
+    When the VotersRecord is committed (majority of the NEW voter set — same members [N1, N2, N3], 2 of 3)
     Then all nodes update N3's address in their voter configuration
     And N3 remains a voting member with unchanged voting rights
 
@@ -910,10 +929,11 @@ Feature: Dynamic Quorum — Observer Promotion
 
   Scenario: Observer is promoted to Voter after catching up
     Given N4 is an Observer and has replicated all entries up to the leader's log end
+    And N4's fetch_offset ≥ leader's current HW (caught-up threshold met)
     When a client sends AddVoter for N4 to N1
-    Then N1 accepts the request because N4 is caught up
+    Then N1 accepts the request because N4 is caught up (fetch_offset ≥ HW)
     And N1 appends a VotersRecord with voter set [N1, N2, N3, N4]
-    And once committed by the current voter set [N1, N2, N3], N4 becomes a full voting member
+    And once committed by a majority of the NEW voter set [N1, N2, N3, N4] (3 of 4), N4 becomes a full voting member
 
   Scenario: Observer survives leader election
     Given N4 is an Observer replicating from N1
@@ -1061,6 +1081,15 @@ Feature: Client Interaction
     And the duplicate is committed and applied
     And xraft does NOT perform built-in deduplication
     And it is the application's responsibility to make commands idempotent
+
+  Scenario: Read fails during leader failover
+    Given a client calls read() on N1 (Leader for term 1)
+    And N1 appends a read-marker at offset 11
+    When N1 crashes before the read-marker is committed
+    And N2 becomes the new Leader for term 2
+    Then N1's read future never resolves (connection lost)
+    And N2 may truncate the uncommitted read-marker during log reconciliation
+    And the client retries read() against the new leader N2
 
   Scenario: Application-level dedup via request IDs (out of xraft scope)
     Given the application wraps commands with unique request IDs
@@ -1244,13 +1273,13 @@ Feature: Observability and Metrics
 | §2.1.2 Snapshotting | Log Compaction and Snapshots | 4 |
 | §2.1.2 Snapshot transfer | Snapshot Transfer | 4 |
 | §2.1.2 Log truncation / Divergence | Log Divergence and Truncation | 4 |
-| §2.1.3 Single-node changes | Add Voter / Remove Voter / UpdateVoter | 13 |
+| §2.1.3 Single-node changes | Add Voter / Remove Voter / UpdateVoter | 14 |
 | §2.1.3 Non-voting members (observers) | Observer Promotion | 3 |
 | §2.1.3 Leader step-down | Remove Voter (scenario 2) | — |
 | §2.1.4 Identity & fencing | Identity and Fencing | 6 |
 | §2.1.4 Divergence detection | Log Divergence and Truncation | — |
-| §2.1.5 Library API | Client Interaction | 9 |
+| §2.1.5 Library API | Client Interaction | 10 |
 | §2.1.6 Metrics | Observability and Metrics | 7 |
 | §2.1.6 Deterministic simulation | Safety Invariants (scenario 6) | — |
 | §2.1.7 Bootstrap & recovery | Cluster Bootstrap | 5 |
-| **Total** | **17 Features** | **98 Scenarios** |
+| **Total** | **17 Features** | **100 Scenarios** |
