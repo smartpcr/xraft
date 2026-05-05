@@ -457,6 +457,64 @@ AppSnapshot {
 These are newtype wrappers. xraft never interprets their contents; it only
 stores, replicates, and delivers them to the application's `StateMachine`.
 
+#### `RaftConfig` (construction-time configuration)
+
+```
+RaftConfig {
+    election_timeout_min_ms: u64        // lower bound for randomised election timeout (default: 150)
+    election_timeout_max_ms: u64        // upper bound for randomised election timeout (default: 300)
+    fetch_interval_ms: u64              // follower's periodic Fetch RPC interval  (default: 50)
+    max_batch_size: usize               // max entries drained from BatchAccumulator per tick (default: 256)
+    max_fetch_bytes: u32                // max response payload for a single Fetch RPC (default: 1 MiB)
+    snapshot_interval: u64              // committed entries between automatic snapshots (default: 10 000)
+    data_dir: PathBuf                   // root directory for log segments, snapshots, quorum-state
+}
+```
+
+**Validation invariant (checked at construction):**
+`fetch_interval_ms < election_timeout_min_ms < election_timeout_max_ms`.
+This satisfies the Raft timing requirement
+`broadcastTime << electionTimeout << avgTimeBetweenFailures`.
+`RaftConfig` implements `Default` with the values shown above.
+
+#### `XraftError` (public error type)
+
+```
+enum XraftError {
+    StorageError(io::Error)             // log, snapshot, or quorum-state I/O failure
+    TransportError(io::Error)           // network send/recv failure
+    NotLeader { leader_id: Option<NodeId> }  // propose() called on a non-leader node
+    ProposalQueueFull                   // BatchAccumulator back-pressure limit reached
+    InvalidClusterId                    // RPC cluster_id mismatch
+    Shutdown                            // node is shutting down; no new operations accepted
+}
+```
+
+All public APIs (`propose`, `bootstrap`, `shutdown`) return `Result<T, XraftError>`.
+`propose()` returns `NotLeader` when invoked on a follower/candidate, and
+`ProposalQueueFull` when the `BatchAccumulator` has reached `max_batch_size`
+pending entries.
+
+#### `LeaderEpochCheckpoint` (in-memory, rebuilt on recovery)
+
+```
+LeaderEpochCheckpoint {
+    epochs: BTreeMap<Term, u64>         // epoch (term) → start_offset of that leader's tenure
+}
+```
+
+Maintained in memory by the `EventLoop`. Updated whenever a
+`LeaderChangeMessage` control record is committed (the `(term, start_offset)`
+pair is inserted). On recovery, rebuilt by scanning the log for
+`LeaderChangeMessage` entries (§5.10 rule 3f). Used by the
+`ReplicationManager` during Fetch validation to detect log divergence: the
+leader looks up the follower's claimed `last_fetched_epoch`, finds the end
+offset for that epoch, and compares it with the follower's `fetch_offset`. If
+the follower's offset exceeds the epoch's end, a `DivergingEpoch` is returned.
+Also persisted to the `leader-epoch-checkpoint` file by `xraft-storage`
+(§2.2) for fast startup — when the file exists, recovery skips the full log
+scan for `LeaderChangeMessage` entries.
+
 ### 3.3 RPC Messages
 
 All messages include identity and fencing fields:
@@ -1261,6 +1319,18 @@ fetch_offset ≥ 7 → entries 0–6 committed.
 fetch_offset ≥ 5 → entries 0–4 committed.
 
 Only voters count; observers do not contribute to quorum.
+
+**Observer replication (same Fetch, no quorum effect).** Observers use
+the identical Fetch RPC path as voters — they send `FetchRequest` to the
+leader, receive entries and the current HW, and apply committed entries
+to their local state machine. The only differences are: (1) the leader
+tracks an observer's `FollowerProgress` with `is_voter = false`, so the
+observer's `fetch_offset` is excluded from the HW calculation; (2) observers
+do not participate in elections (they never transition to `Candidate` and
+they reject `VoteRequest` RPCs). Observers learn of the committed voter set
+and any membership changes through `VotersRecord` entries replicated in the
+log. A dedicated sequence flow is unnecessary — observer Fetch is identical
+to the voter flow below, minus quorum contribution.
 
 **Two-round commit visibility.** A follower fetches new entries in round 1.
 At that point its `fetch_offset` has not yet increased (the leader recorded
@@ -2335,6 +2405,10 @@ exists, the canonical design is defined by this architecture document.
 | **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state (all 4 fields) → snapshot (restores committed `voter_set`) → log scan from `log_start_offset` to `log_end_offset` (metadata only — no SM replay; last `VotersRecord` by offset stored as `pending_membership_change`, not applied to committed `voter_set`; earlier `VotersRecords` are also not applied — promoted sequentially by three-phase commit when HW advances past them) → resume as follower → learn HW from leader → apply entries via three-phase commit notification. | architecture §5.10, impl plan Phase 6, e2e Crash Recovery. Tech spec §2.1.7's "replaying log entries" refers to log restoration/scanning at a higher level of abstraction (§7.3 R2). Impl plan lists `current_term` and `voted_for` as representative fields; `QuorumStateStore::load()` returns the full `QuorumState` struct (§7.3 R3). Impl plan's recovery step "VotersRecord → update voter set" means recovery bookkeeping (storing as `pending_membership_change` for HW purposes), not replacing the committed voter set used for elections (§7.3 R8). Impl plan Stage 6.1 step 4's scan range `log_start_offset` to `log_end_offset` matches this architecture's §5.10 rule 3. |
 | **`ClusterId` generation** | Generated once by the operator, passed to `bootstrap()` as a parameter, shared by all nodes. | architecture §5.9, impl plan Stage 6.2. Tech spec §2.1.7 says "generated at bootstrap time" — compatible: the operator generates it at bootstrap time and provides it to `bootstrap()` (§7.3 R6). |
 | **Application read-side state** | Applications build their own queryable read-side state from committed records delivered via `Listener::handle_commit`. xraft does not mediate application state reads. | architecture §4.1, e2e Client Interaction |
+| **Configuration entity** | `RaftConfig` with 7 fields: `election_timeout_min_ms`, `election_timeout_max_ms`, `fetch_interval_ms`, `max_batch_size`, `max_fetch_bytes`, `snapshot_interval`, `data_dir`. Validation: `fetch_interval < election_timeout_min < election_timeout_max`. | architecture §3.2, impl plan Stage 1.5, tech spec §4.3 (timing parameters) |
+| **Error type** | `XraftError` with 6 variants: `StorageError`, `TransportError`, `NotLeader`, `ProposalQueueFull`, `InvalidClusterId`, `Shutdown`. | architecture §3.2, impl plan Stage 1.5, architecture §6.3 (error handling) |
+| **Leader-epoch checkpoint** | In-memory `BTreeMap<Term, u64>` mapping epoch → start_offset. Rebuilt on recovery from log scan; used for Fetch divergence detection. Persisted to file by `xraft-storage`. | architecture §2.2 (`LeaderEpochCheckpoint` component), §3.2 (data structure), §5.3 (usage in divergence flow), impl plan Stage 2.3 |
+| **Observer replication** | Observers use the same Fetch RPC path as voters but with `is_voter = false` — their `fetch_offset` is excluded from HW calculation and they do not participate in elections. | architecture §5.2 (observer note), e2e scenarios preamble (observer definition), tech spec §2.1.3 |
 
 ### 7.2 Verified Resolutions
 

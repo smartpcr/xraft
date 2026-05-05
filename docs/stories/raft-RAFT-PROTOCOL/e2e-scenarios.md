@@ -54,6 +54,8 @@
 15. [Feature: Client Interaction](#feature-client-interaction)
 16. [Feature: Safety Invariants](#feature-safety-invariants)
 17. [Feature: Observability and Metrics](#feature-observability-and-metrics)
+18. [Feature: Graceful Shutdown and Lifecycle](#feature-graceful-shutdown-and-lifecycle)
+19. [Feature: Error Recovery and Fault Tolerance](#feature-error-recovery-and-fault-tolerance)
 
 ---
 
@@ -547,6 +549,20 @@ Feature: Persistence and Crash Recovery
     Then N2 does NOT acknowledge the entry
     And N2 reports the error and shuts down gracefully
     And the cluster continues with the remaining nodes
+
+  Scenario: Recovery with pending uncommitted VotersRecord in log
+    Given N1 was Leader for term 3 with voter set [N1, N2, N3]
+    And N1 appended a VotersRecord [N1, N2, N3, N4] at offset 20 that was NOT committed (HW < 21)
+    And N1 has a snapshot at offset 10 with voters [N1, N2, N3]
+    When N1 crashes and restarts
+    Then N1 reads its quorum-state file: currentTerm = 3
+    And N1 loads the latest snapshot: committed voter set = [N1, N2, N3]
+    And N1 scans the log from offset 11 onward (metadata only — no SM replay)
+    And N1 finds the uncommitted VotersRecord at offset 20 and stores it as pending_membership_change
+    And N1 does NOT replace the committed voter set [N1, N2, N3] with [N1, N2, N3, N4]
+    And election quorum uses the committed voter set [N1, N2, N3]
+    And HW advancement for entries at offset ≥ 20 uses the pending voter set [N1, N2, N3, N4]
+    And N1 resumes as Follower and awaits a leader to learn the authoritative HW
 ```
 
 ---
@@ -671,6 +687,16 @@ Feature: Snapshot Transfer
     And N4 calls StateMachine::restore(app_snapshot) to restore its state
     And N4 sets its log_start_offset to 201
     And N4 resumes Fetching entries from offset 201
+
+  Scenario: Listener receives handle_load_snapshot callback after snapshot install
+    Given N2 falls behind and receives a SnapshotId from the leader in a Fetch response
+    And N2 downloads the snapshot via FetchSnapshot and completes the transfer
+    When N2 installs the snapshot (StateMachine::restore succeeds)
+    Then the event loop invokes Listener::handle_load_snapshot(reader) on N2
+    And the SnapshotReader provides access to the snapshot's AppSnapshot payload
+    And the application can use this callback to rebuild read-side state
+    And handle_load_snapshot is called synchronously within the event loop
+    And after the callback, N2 resumes Fetching from the leader normally
 ```
 
 ---
@@ -1032,43 +1058,25 @@ Feature: Identity and Fencing
 ```gherkin
 Feature: Client Interaction
   As a client application embedding the xraft library
-  I need to propose commands and read committed state
+  I need to propose commands and read protocol metadata
   So that I can build a replicated state machine on top of xraft
 
-  # Read API semantics — cross-document reconciliation:
+  # Read API semantics — aligned across all four documents:
   #
-  # These scenarios follow the architecture doc §5.11 canonical design:
-  #   - read() returns S::ReadResult via StateMachine::query()
-  #   - read() is leader-only; followers return Err(NotLeader { leader_id })
-  #   - Leadership proof: a committed current-term entry proves the leader
-  #     was elected by a majority after any prior leader; query() runs after
-  #     all applies up to HW (architecture §5.11 "Why this is linearizable")
-  #   - Consensus metadata is available via RaftNode::metrics() (§6.4),
-  #     NOT via read()
-  #
-  # Linearizability (architecture §5.11): the committed current-term entry
-  # IS the linearizability basis. It proves the leader was elected by a
-  # majority after any prior leader. All apply() calls up to the current HW
-  # have executed before query() runs — the returned state reflects every
-  # write committed before the read was issued. A partitioned leader
-  # eventually steps down via check-quorum (§5.7); after step-down, pending
-  # reads are resolved with Err(NotLeader) and subsequent reads are
-  # rejected. Check-quorum is the step-down/cancellation mechanism — not a
-  # per-read revalidation step.
-  #
-  # Implementation-plan alignment (architecture §7.4, Pending refinement 2):
-  #   The implementation plan currently diverges from §5.11 in three areas:
-  #   - Stage 1.7/5.3: read() -> Result<ConsensusState> should become
-  #     read() -> Result<S::ReadResult> via StateMachine::query()
-  #   - Stage 1.4: StateMachine trait needs type ReadResult and fn query(&self)
-  #   - Stage 5.1/5.3: commit notification should use four phases (adding
-  #     DeferredReadQueue::drain as step 4), not three
-  #   These are pending refinements flagged in architecture §7.4; these
-  #   scenarios follow the architecture's finalized §5.11 design.
-  #
-  # Tech-spec §2.2 marks "linearisable reads" (read-index, lease-based) as
-  # out of scope — those are optimised read paths, not the initial
-  # leadership-proof mechanism defined in architecture §5.11.
+  #   - read() → Result<ConsensusState> — returns a local, non-linearizable
+  #     snapshot of the node's protocol metadata (term, role, leader_id, HW,
+  #     voter set). Callable on any node (leader, follower, candidate, or
+  #     unattached). Does NOT read application state.
+  #   - Applications build their own queryable read-side state from committed
+  #     records delivered via Listener::handle_commit (architecture §4.1).
+  #   - Consensus metadata is available via read(); observability counters
+  #     (latencies, rates) are available via RaftNode::metrics() (§6.4).
+  #   - StateMachine trait has only apply, snapshot, restore — no query() method.
+  #   - Commit notification uses three phases (architecture §4.1):
+  #     (1) StateMachine::apply, (2) Listener::handle_commit,
+  #     (3) DeferredCompletionQueue::complete. No DeferredReadQueue exists.
+  #   - Tech spec §2.2 correctly marks "linearisable reads" (read-index,
+  #     lease-based) as out of scope. read() makes no linearizability claims.
 
   Background:
     Given a 3-node cluster [N1, N2, N3]
@@ -1081,12 +1089,11 @@ Feature: Client Interaction
     And the BatchAccumulator drains the entry to the log via IoAction::AppendLog
     And the propose future is parked in the DeferredCompletionQueue (keyed by offset)
     When followers Fetch and replicate the entry and the HW advances past it
-    Then the event loop invokes the four-phase commit sequence in order (§4.1):
+    Then the event loop invokes the three-phase commit sequence in order (architecture §4.1):
       | Phase | Action                                                                          |
       | 1     | StateMachine::apply("set x=1") — one call per committed command                 |
       | 2     | Listener::handle_commit(batch) — one batch of committed AppRecords              |
       | 3     | DeferredCompletionQueue::complete — resolves the propose future                 |
-      | 4     | DeferredReadQueue::drain — resolves pending read() via query() (no-op if empty) |
     And the propose future resolves with Ok (after phase 3)
     And all callbacks are synchronous in-process calls within the event loop
 
@@ -1100,52 +1107,46 @@ Feature: Client Interaction
     When a client calls propose("set x=1") on N1
     Then N1 returns an error indicating no leader is available
 
-  Scenario: Leader read in steady state (leadership confirmed)
-    # Per architecture §5.11: read() returns S::ReadResult via StateMachine::query()
-    # after the leader confirms its authority (a committed current-term entry).
-    # The leader does NOT append a per-read log entry — it confirms leadership
-    # proof, then invokes query() synchronously within the event loop.
-    # Consensus metadata (term, role, HW, voter_set) is NOT returned by read()
-    # — it is available separately via RaftNode::metrics() -> RaftMetrics (§6.4).
-    #
-    # Per architecture §5.11 "Why this is linearizable": the committed
-    # current-term entry proves the leader holds majority authority, and
-    # all applies up to HW execute before query() runs. In steady state,
-    # no per-read I/O or majority re-verification is needed.
+  Scenario: Read protocol metadata on leader
+    # Per architecture §5.11: read() → Result<ConsensusState> returns a local,
+    # non-linearizable snapshot of protocol metadata. Callable on any node.
+    # Does NOT read application state — applications build their own read-side
+    # state from Listener::handle_commit callbacks (architecture §4.1).
     Given N1 is Leader for term 1
-    And a current-term entry has already been committed (HW has advanced past it)
-    And N1 is still in contact with a majority of voters (check-quorum has not fired)
-    And the StateMachine has state reflecting all committed writes
     When a client calls read() on N1
-    Then the event loop confirms leadership (current-term entry already committed)
-    And the event loop invokes StateMachine::query() synchronously
-    And read() resolves with Ok(S::ReadResult) — the application's query result
-    And the read completes in the same event-loop tick (no I/O, no log append)
+    Then read() returns Ok(ConsensusState) immediately (no I/O, no log append)
+    And the returned ConsensusState contains:
+      | Field          | Value                 |
+      | current_term   | 1                     |
+      | role           | Leader                |
+      | leader_id      | Some(N1)              |
+      | high_watermark | current HW value      |
+      | voter_set      | [N1, N2, N3]          |
+    And the read completes synchronously — it does not enter the event loop's message queue
 
-  Scenario: Read on fresh leader is deferred until leadership is confirmed
-    # Per architecture §5.11 path B: if no current-term entry is committed yet,
-    # the read is parked in the DeferredReadQueue until the LeaderChangeMessage
-    # commits (HW advances past it), at which point query() is invoked.
+  Scenario: Read on fresh leader returns current metadata (no deferral)
+    # Per architecture §5.11: read() returns ConsensusState immediately
+    # regardless of whether a current-term entry has been committed.
+    # The returned metadata may show a stale HW if the LeaderChangeMessage
+    # has not yet committed — this is expected (non-linearizable).
     Given N1 just won election for term 2 and appended a LeaderChangeMessage
     And the LeaderChangeMessage has NOT yet been committed (followers have not fetched it)
     When a client calls read() on N1
-    Then the event loop detects no current-term entry is committed yet
-    And the ReadRequest is parked in the DeferredReadQueue
-    When followers Fetch the LeaderChangeMessage and HW advances past it
-    Then the event loop runs the four-phase commit sequence (§4.1)
-    And then drains the DeferredReadQueue as step 4 of commit notification
-    And for each parked read, the event loop invokes StateMachine::query()
-    And the client's read() future resolves with Ok(S::ReadResult)
+    Then read() returns Ok(ConsensusState) immediately
+    And the returned ConsensusState shows role=Leader, current_term=2
+    And the high_watermark reflects the pre-election committed state (not yet advanced)
 
-  Scenario: Read on follower returns NotLeader error
-    # Per architecture §5.11: read() is leader-only. A follower immediately
-    # returns Err(NotLeader { leader_id }) so the client can redirect.
-    # To inspect protocol metadata on any node, use RaftNode::metrics() (§6.4).
+  Scenario: Read on follower returns local metadata (not an error)
+    # Per architecture §5.11: read() is callable on any node. On a follower,
+    # it returns the follower's local ConsensusState, which may be stale
+    # relative to the leader's authoritative state. No NotLeader error.
     Given N1 is Leader for term 1
     And N2 is a Follower
     When a client calls read() on N2
-    Then read() immediately returns Err(NotLeader { leader_id: Some(N1) })
-    And the client can use leader_id to redirect the read to N1
+    Then read() returns Ok(ConsensusState)
+    And the returned ConsensusState shows role=Follower, leader_id=Some(N1)
+    And the high_watermark may lag behind the leader's HW
+    And the client can use leader_id to direct proposals to N1
 
   Scenario: At-least-once semantics — duplicate proposal after leader failover
     Given a client proposes command "set x=1" to N1 (Leader)
@@ -1158,41 +1159,36 @@ Feature: Client Interaction
     And xraft does NOT perform built-in deduplication
     And it is the application's responsibility to make commands idempotent
 
-  Scenario: Pending reads resolved with error on leader step-down
-    # Per architecture §5.11 cancellation: when the leader steps down (via
-    # check-quorum failure, higher-term RPC, or self-removal), all pending
-    # reads in the DeferredReadQueue are resolved with Err(NotLeader).
-    # Pending reads exist only on a fresh leader whose current-term entry
-    # (LeaderChangeMessage) has NOT yet been committed — once it commits,
-    # DeferredReadQueue is drained as step 4 of commit notification (§4.1).
-    Given N1 just won election for term 2 and appended a LeaderChangeMessage
-    And the LeaderChangeMessage has NOT yet been committed (leadership pending)
-    And clients have called read() — their requests are parked in the DeferredReadQueue
+  Scenario: Read after leader step-down returns updated metadata
+    # Per architecture §5.11: read() always returns local ConsensusState.
+    # After the leader steps down (via higher-term RPC or check-quorum),
+    # read() returns the updated role and leader_id — no DeferredReadQueue,
+    # no error. There are no pending read futures to resolve because read()
+    # is synchronous and returns immediately.
+    Given N1 is Leader for term 2
     When N1 receives a Vote request from N3 at term 3 (higher term)
     Then N1 steps down to Follower (observing higher term)
-    And all pending reads in N1's DeferredReadQueue are resolved with Err(NotLeader { leader_id: None })
-    And subsequent read() calls on N1 return Err(NotLeader { leader_id: None })
+    When a client calls read() on N1
+    Then read() returns Ok(ConsensusState) with role=Follower, current_term=3
+    And leader_id reflects the new leader if known, or None
 
-  Scenario: Partitioned leader steps down via check-quorum and rejects reads
-    # A partitioned leader must not serve stale reads. Check-quorum (§5.7)
-    # is the mechanism that steps down a leader that has lost majority
-    # contact. After step-down, reads are rejected — stale-leader reads
-    # must not be accepted as linearizable. The ordering below is explicit:
-    # the check-quorum deadline fires before any read is served against
-    # stale state.
-    Given N1 is Leader for term 1 and a current-term entry has been committed
+  Scenario: Read on partitioned leader after check-quorum step-down
+    # A partitioned leader steps down via check-quorum (§5.7). After
+    # step-down, read() returns ConsensusState reflecting the new role.
+    # Applications that built read-side state from Listener::handle_commit
+    # will stop receiving new commits, and their state becomes stale —
+    # this is the application's responsibility to handle.
+    Given N1 is Leader for term 1
     When N1 becomes partitioned from N2 and N3
     Then N1's check-quorum deadline fires (within one election timeout interval)
     And N1 checks voter liveness: only {self} has recent Fetch (1 < majority of 2)
     And N1 steps down to Follower (check-quorum failure per §5.7)
-    And all pending reads in N1's DeferredReadQueue are resolved with Err(NotLeader { leader_id: None })
     When a client calls read() on N1 after step-down
-    Then read() returns Err(NotLeader { leader_id: None })
-    And N1 does not serve stale application state
+    Then read() returns Ok(ConsensusState) with role=Follower, leader_id=None
+    And N1's metadata reflects the stale HW (no new commits while partitioned)
     When N2 wins election for term 2 and becomes the new Leader
-    And a client calls read() on N2 (after N2's leadership is confirmed)
-    Then N2 serves the read with linearizability per architecture §5.11
-    And the client must discover N2 as the new leader to read current state
+    And a client calls read() on N2
+    Then read() returns Ok(ConsensusState) with role=Leader, current_term=2
 
   Scenario: Application-level dedup via request IDs (out of xraft scope)
     Given the application wraps commands with unique request IDs
@@ -1208,21 +1204,34 @@ Feature: Client Interaction
     And on N1, the event loop invokes Listener::handle_leader_change(leader_id=N2, term=2)
     And the callback is invoked synchronously within the event loop before IoActions are dispatched
 
-  Scenario: Listener callbacks on commit — four-phase ordering
+  Scenario: Listener callbacks on commit — three-phase ordering
     Given the application has registered a Listener with handle_commit
-    And the application implements StateMachine with apply() and query()
+    And the application implements StateMachine with apply(), snapshot(), and restore()
     When entries at offsets 5–7 are committed (HW advances to 8; offsets < 8 committed)
-    Then the event loop executes the four-phase commit sequence per the architecture doc (§4.1):
+    Then the event loop executes the three-phase commit sequence per the architecture doc (§4.1):
       | Phase | Action                                                                         |
       | 1     | StateMachine::apply — one call per committed command entry (offsets 5, 6, 7)    |
       | 2     | Listener::handle_commit — one batch of committed AppRecords [5, 6, 7]          |
       | 3     | DeferredCompletionQueue::complete — resolves client propose futures (offset<HW) |
-      | 4     | DeferredReadQueue::drain — resolves pending read() requests via query() (§5.11)|
     And control records (if any among 5–7) are handled internally and never reach StateMachine::apply
-    And phase 4 is a no-op in steady state (leadership already confirmed); it only fires
-      when the newly committed entries include the first current-term entry
-    And all four phases are synchronous in-process calls within the event loop
+    And all three phases are synchronous in-process calls within the event loop
     And the Fetch response (via IoStage) reflects the same HW = 8 that the callbacks observed
+
+  Scenario: Leader step-down with pending proposals — futures resolve with error
+    Given N1 is Leader for term 1
+    And a client has proposed "set x=1" to N1 — the entry is appended but HW has not advanced past it
+    And the propose future is parked in the DeferredCompletionQueue
+    When N1 receives a Vote RPC with term 3 (higher term)
+    Then N1 steps down to Follower state
+    And N1 drains the DeferredCompletionQueue, resolving all pending propose futures with Err(NotLeader)
+    And the client can retry the proposal against the new leader
+
+  Scenario: Proposal rejected with ProposalQueueFull when batch accumulator is at capacity
+    Given N1 is Leader for term 1
+    And N1's BatchAccumulator has reached its configured maximum capacity
+    When a client calls propose("set x=1") on N1
+    Then N1 returns Err(ProposalQueueFull) immediately without appending to the log
+    And the client can retry after a backoff
 ```
 
 ---
@@ -1365,6 +1374,152 @@ Feature: Observability and Metrics
 
 ---
 
+## Feature: Graceful Shutdown and Lifecycle
+
+```gherkin
+Feature: Graceful Shutdown and Lifecycle
+  As a cluster operator or application embedding xraft
+  I need nodes to shut down gracefully and transition through
+  well-defined lifecycle states
+  So that resources are cleaned up and the application is notified
+  before the node stops
+
+  # Per architecture doc §4.1 (Listener::begin_shutdown) and §4.4
+  # (ReceiverTask shutdown).
+
+  Background:
+    Given a 3-node cluster [N1, N2, N3]
+    And N1 is Leader for term 1
+    And each node has a registered Listener with begin_shutdown
+
+  Scenario: Graceful shutdown of a follower
+    When the application calls shutdown() on N2
+    Then N2 invokes Listener::begin_shutdown() on the application's Listener
+    And N2 stops the ReceiverTask (ceases receiving inbound RPCs)
+    And N2 completes any pending IoActions in the IoStage
+    And N2 stops the EventLoop
+    And the remaining cluster [N1, N3] continues with N1 as leader
+    And N1 detects N2 as unresponsive (no Fetch RPCs) but maintains quorum with N1 + N3
+
+  Scenario: Graceful shutdown of the leader
+    When the application calls shutdown() on N1 (the leader)
+    Then N1 invokes Listener::begin_shutdown()
+    And N1 stops accepting new proposals (propose() returns Err(Shutdown))
+    And N1 drains the DeferredCompletionQueue, resolving pending futures with Err(Shutdown)
+    And N1 stops the ReceiverTask and EventLoop
+    And N2 and N3 detect the leader's absence (Fetch responses stop arriving)
+    And a new election occurs — one of N2 or N3 becomes the new leader
+
+  Scenario: Shutdown signal interrupts snapshot transfer in progress
+    Given N2 is in the middle of downloading a snapshot from N1 via FetchSnapshot
+    When the application calls shutdown() on N2
+    Then N2 aborts the in-progress snapshot transfer
+    And N2 invokes Listener::begin_shutdown()
+    And N2 shuts down without completing the snapshot install
+    And on restart, N2 will re-initiate the snapshot transfer from the current leader
+
+  Scenario: Unattached node lifecycle — no election, no Fetch, no proposals
+    Given N4 has been removed from the voter set via RemoveVoter
+    And N4 has transitioned to Unattached state after learning of its removal
+    Then N4 does not start election timers
+    And N4 does not send Vote RPCs
+    And N4 does not send Fetch RPCs
+    And propose() on N4 returns Err(NotLeader) — N4 is not part of the cluster
+    And read() on N4 returns ConsensusState with role=Unattached and leader_id=None
+    And N4 remains in Unattached state until it is shut down or reconfigured
+```
+
+---
+
+## Feature: Error Recovery and Fault Tolerance
+
+```gherkin
+Feature: Error Recovery and Fault Tolerance
+  As a Raft node
+  I need to handle errors in storage, state machine, and network
+  gracefully
+  So that correctness is preserved even when components fail
+
+  # Per architecture doc §6.3 error handling strategy. All error
+  # semantics are crash-stop except where explicitly noted.
+
+  Background:
+    Given a 3-node cluster [N1, N2, N3]
+    And N1 is Leader for term 1
+
+  Scenario: StateMachine::apply error triggers crash-stop
+    Given an entry at offset 5 has been committed (HW > 5)
+    When the event loop on N2 calls StateMachine::apply(5, record) during commit processing
+    And apply() returns Err (e.g., corrupt internal state)
+    Then N2's event loop treats the error as irrecoverable
+    And N2 invokes Listener::begin_shutdown()
+    And N2 halts (crash-stop)
+    And N2 does NOT skip the entry — committed entries cannot be skipped
+    And the cluster continues with N1 and N3
+    And on restart, N2 will re-apply the entry (the error must be fixed externally)
+
+  Scenario: StateMachine::snapshot error is non-fatal — retry at next interval
+    Given N1 has committed entries up to offset 100
+    When the snapshot threshold is reached and the event loop calls StateMachine::snapshot()
+    And snapshot() returns Err (e.g., transient serialization failure)
+    Then N1 logs the error but does NOT halt
+    And N1 continues operating normally (no crash-stop)
+    And log compaction is deferred (no prefix truncation occurs)
+    And at the next snapshot interval, StateMachine::snapshot() is retried
+    And if it succeeds, normal compaction resumes
+
+  Scenario: StateMachine::restore error triggers crash-stop
+    Given N2 has received a snapshot via FetchSnapshot
+    When the event loop on N2 calls StateMachine::restore(app_snapshot)
+    And restore() returns Err (e.g., incompatible snapshot format)
+    Then N2's event loop treats the error as irrecoverable
+    And N2 invokes Listener::begin_shutdown()
+    And N2 halts (crash-stop)
+    And the cluster continues with N1 and N3
+
+  Scenario: Listener panic aborts the event loop task
+    Given the application has registered a Listener whose handle_commit panics
+    When entries are committed and the event loop invokes Listener::handle_commit(batch)
+    And the Listener implementation panics
+    Then the panic propagates through the event loop task
+    And the event loop task aborts (crash-stop)
+    And N2 halts — applications must not panic in Listener callbacks
+
+  Scenario: Malformed RPC message is dropped silently
+    Given N1 is Leader and processing incoming RPCs
+    When N1 receives a message that fails deserialization (corrupt or unknown payload)
+    Then N1 drops the malformed message with a warning log
+    And N1 does NOT update any protocol state (term, votedFor, HW, etc.)
+    And N1 continues processing subsequent valid messages normally
+
+  Scenario: Network send failure is tolerated in pull-based model
+    Given N1 is Leader and processing a Fetch request from N2
+    When the IoStage calls TransportSender::send() to deliver the Fetch response to N2
+    And send() fails (e.g., connection reset)
+    Then N1 logs the error but does NOT halt
+    And N1 continues operating normally
+    And N2 will retry its Fetch RPC on the next fetch interval
+    And the pull-based model makes missed responses equivalent to slow followers
+
+  Scenario: Storage I/O failure during log append triggers crash-stop
+    Given a client proposes a command to N1
+    And N1 stages the entry in the BatchAccumulator
+    When the IoStage calls LogStore::append() and it returns Err (disk failure)
+    Then N1's event loop treats the error as irrecoverable
+    And N1 invokes Listener::begin_shutdown()
+    And N1 halts (crash-stop — operating with potentially corrupt state is unsafe)
+    And the cluster elects a new leader from [N2, N3]
+
+  Scenario: QuorumStateStore save failure triggers crash-stop
+    Given N2 receives a Vote RPC and needs to persist its vote
+    When QuorumStateStore::save() returns Err (disk failure)
+    Then N2 does NOT acknowledge the vote (unsafe without durable persistence)
+    And N2 invokes Listener::begin_shutdown()
+    And N2 halts (crash-stop)
+```
+
+---
+
 ## Appendix: Scenario Coverage Matrix
 
 | Tech Spec Section | Feature Covered | Scenario Count |
@@ -1376,17 +1531,19 @@ Feature: Observability and Metrics
 | §2.1.1 Safety invariants | Safety Invariants | 6 |
 | §2.1.1 No-op commit on leader start | High Watermark Advancement (scenario 5) | — |
 | §2.1.1 Check Quorum | Check Quorum | 5 |
-| §2.1.1 Persistence | Persistence and Crash Recovery | 6 |
+| §2.1.1 Persistence | Persistence and Crash Recovery | 7 |
 | §2.1.2 Snapshotting | Log Compaction and Snapshots | 4 |
-| §2.1.2 Snapshot transfer | Snapshot Transfer | 4 |
+| §2.1.2 Snapshot transfer | Snapshot Transfer | 5 |
 | §2.1.2 Log truncation / Divergence | Log Divergence and Truncation | 4 |
 | §2.1.3 Single-node changes | Add Voter / Remove Voter / UpdateVoter | 15 |
 | §2.1.3 Non-voting members (observers) | Observer Promotion | 3 |
 | §2.1.3 Leader step-down | Remove Voter (scenario 2) | — |
 | §2.1.4 Identity & fencing | Identity and Fencing | 6 |
 | §2.1.4 Divergence detection | Log Divergence and Truncation | — |
-| §2.1.5 Library API | Client Interaction | 12 |
+| §2.1.5 Library API | Client Interaction | 14 |
 | §2.1.6 Metrics | Observability and Metrics | 7 |
 | §2.1.6 Deterministic simulation | Safety Invariants (scenario 6) | — |
 | §2.1.7 Bootstrap & recovery | Cluster Bootstrap | 5 |
-| **Total** | **17 Features** | **103 Scenarios** |
+| §4.1 Listener lifecycle | Graceful Shutdown and Lifecycle | 4 |
+| §6.3 Error handling strategy | Error Recovery and Fault Tolerance | 8 |
+| **Total** | **19 Features** | **119 Scenarios** |

@@ -23,13 +23,6 @@ Kafka clone — it extracts and adapts the consensus layer described in the
 reference material into an independent Rust library and accompanying test
 harness.
 
-> **Document suite.** This tech spec covers problem, scope, constraints, and
-> risks. Structural design lives in [architecture.md](./architecture.md).
-> Phased build-out lives in [implementation-plan.md](./implementation-plan.md).
-> Behavioural acceptance criteria live in
-> [e2e-scenarios.md](./e2e-scenarios.md). Shared concepts use the vocabulary
-> defined in §8 (Glossary).
-
 ### 1.1 Reference Material Assessment
 
 Each URL in the story description was reviewed for relevance and content:
@@ -79,7 +72,7 @@ implementation of the Raft protocol as described in the reference material.
 
 | Capability | Detail | Reference |
 |------------|--------|-----------|
-| **Node roles** | Four roles: **Unattached**, Follower, Candidate, Leader. A node starts as Unattached (no term, no vote, no known leader) and transitions to Follower upon receiving a valid RPC or completing bootstrap/recovery. Clean state machine transitions driven by timeouts and RPCs. The Unattached role is an xraft addition (not in the original Raft paper) that models the pre-bootstrap and post-removal states. | Raft paper §5; Red Hat article "Introducing Raft"; architecture §2.1 |
+| **Node roles** | Three states: Follower, Candidate, Leader. Clean state machine transitions driven by timeouts and RPCs. | Raft paper §5; Red Hat article "Introducing Raft" |
 | **Leader election** | Term-based election with `Vote` RPC (KRaft terminology for `RequestVote`). Randomised election timeouts (150–300 ms) to prevent split votes. A candidate votes for itself, then requests votes from all other nodes. First candidate to receive a majority wins. | Red Hat article "Leader election" |
 | **Pre-Vote protocol** | Two-phase election: candidates send a pre-vote request to check viability before incrementing the term. Followers that have recently heard from a leader reject pre-vote requests, preventing disruptive elections by isolated or partitioned nodes. | Red Hat article "Network partition" — Pre-Vote |
 | **Check Quorum** | Leader periodically verifies it can communicate with a majority of voters; steps down if quorum is lost. Prevents split-brain during network partitions. | Red Hat article "Network partition" — Check Quorum |
@@ -257,8 +250,6 @@ cannot be relaxed without changing the project's mandate.
 | Constraint | Detail | Source |
 |------------|--------|--------|
 | **Raft safety invariants** | The five safety properties from the Raft paper (listed in §2.1.1) must hold under all conditions, including crash-recovery and network partition scenarios. | Raft paper §5.2–5.4; Red Hat article "Safety rules". |
-| **Failure model: crash-recovery + partitions** | xraft assumes the **non-Byzantine, crash-recovery** failure model: nodes may crash and restart (losing only volatile state), messages may be delayed, reordered, duplicated, or lost, and network partitions may occur. Byzantine failures (malicious or arbitrary behaviour) are explicitly out of scope. This is the standard Raft assumption. | Raft paper §2; distributed systems convention. |
-| **Node identity: no NodeId reuse** | Each `NodeId` is unique for the lifetime of a cluster. A node removed via `RemoveVoter` cannot rejoin the same cluster with the same `NodeId`. Replacement nodes must use a new `NodeId`. This eliminates the need for a `DirectoryId` / incarnation counter and simplifies vote-fencing logic. KRaft's `votedDirectoryId` mechanism is intentionally not adopted. | Design decision — simplifies §2.1.3 and recovery. |
 | **Durable persistence before ack** | Log entries and voting state must be `fsync`-ed to disk before any acknowledgement is sent to peers or clients. | Raft paper §5; Red Hat article "Safety rules" — persistence requirements. |
 | **Pull-based replication** | Log replication uses the pull-based (fetch) model where followers request entries from the leader. Push-based `AppendEntries` is not implemented. | Story description reference to KRaft; §3 Non-Goals item 2. |
 | **Timing invariant** | `broadcastTime << electionTimeout << avgTimeBetweenFailures`. | Raft paper §5.6. |
