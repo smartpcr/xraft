@@ -224,17 +224,17 @@ Feature: Pull-Based Log Replication
     Given no application entries have been proposed (the log contains only the LeaderChangeMessage at offset 0)
     When a client proposes command "set x=1" to N1
     Then N1 appends "set x=1" at offset 1, term 1 to its log
-    When N2 sends a Fetch RPC to N1 with fetch offset 1
+    When N2 sends a Fetch RPC to N1 with fetch_offset 1
     Then N1 responds with entry [offset 1, term 1, "set x=1"]
     And N2 appends the entry to its local log
-    When N3 sends a Fetch RPC to N1 with fetch offset 1
+    When N3 sends a Fetch RPC to N1 with fetch_offset 1
     Then N1 responds with entry [offset 1, term 1, "set x=1"]
     And N3 appends the entry to its local log
 
   Scenario: Batch replication — multiple entries in one Fetch
     Given the leader N1 has application entries at offsets 1–5 (offset 0 is LeaderChangeMessage)
     And N2 has only replicated up to offset 0
-    When N2 sends a Fetch RPC to N1 with fetch offset 1
+    When N2 sends a Fetch RPC to N1 with fetch_offset 1
     Then N1 responds with entries [1, 2, 3, 4, 5]
     And N2 appends all 5 entries to its local log in order
 
@@ -252,22 +252,25 @@ Feature: Pull-Based Log Replication
     Then N2 transitions to Candidate state
     And N2 initiates a new election
 
-  Scenario: Leader rejects Fetch with stale epoch
+  Scenario: Leader detects stale epoch via leader-epoch checkpoint
     Given N1 is Leader for term 3
-    When N2 sends a Fetch RPC with currentLeaderEpoch = 1
-    Then N1 rejects the Fetch with an error indicating a stale epoch
-    And N2 updates its known epoch to 3
+    And N1's leader-epoch checkpoint maps term 1 → start offset 0, term 3 → start offset 15
+    When N2 sends a Fetch RPC with last_fetched_epoch = 1 and fetch_offset = 20
+    Then N1 consults its leader-epoch checkpoint and determines epoch 1 ended at offset 15
+    And N1 responds with DivergingEpoch { epoch: 1, end_offset: 15 }
+    And N2 truncates its log from offset 15 onward
+    And N2 resumes Fetching from offset 15 with updated last_fetched_epoch
 
-  Scenario: Fetch includes clusterId for identity verification
-    Given the cluster has clusterId "cluster-abc-123"
-    When N2 sends a Fetch RPC with clusterId "cluster-xyz-999"
-    Then N1 rejects the Fetch due to clusterId mismatch
+  Scenario: Fetch includes cluster_id for identity verification
+    Given the cluster has cluster_id "cluster-abc-123"
+    When N2 sends a Fetch RPC with cluster_id "cluster-xyz-999"
+    Then N1 rejects the Fetch due to cluster_id mismatch
     And the rejection prevents cross-cluster contamination
 
   Scenario: Leader responds with leader identity in Fetch response
     Given N1 is Leader for term 3
     When N2 sends a Fetch RPC to N1
-    Then the Fetch response includes leaderId=N1 and leaderEpoch=3
+    Then the Fetch response includes leader_id=N1 and leader_epoch=3
     And N2 can confirm it is Fetching from the correct leader
 ```
 
@@ -390,10 +393,11 @@ Feature: Log Divergence and Truncation
   Scenario: Leader validates Fetch against leader-epoch-checkpoint
     Given N1 is Leader for term 5
     And N1 maintains a leader-epoch-checkpoint mapping epochs to start offsets
-    When N2 sends a Fetch RPC with lastFetchedEpoch = 3 and fetchOffset = 15
+    When N2 sends a Fetch RPC with last_fetched_epoch = 3 and fetch_offset = 15
     Then N1 checks its leader-epoch-checkpoint
     And N1 determines that epoch 3 ended at offset 12
-    And N1 responds with DivergingEpoch so N2 can truncate back to offset 12
+    And N1 responds with DivergingEpoch { epoch: 3, end_offset: 12 }
+    And N2 truncates its log from offset 12 onward and sets fetch_offset to 12
 
   Scenario: No divergence — follower log is a prefix of leader log
     Given N1 is Leader with entries at offsets 0–10 (log end offset 11)
@@ -531,8 +535,8 @@ Feature: Log Compaction and Snapshots
     Given a 3-node cluster [N1, N2, N3]
     And N1 is Leader for term 1
 
-  Scenario: Node takes a snapshot and truncates the log
-    Given N1 has committed entries at offsets 1–100
+  Scenario: Node takes a snapshot and truncates the log prefix
+    Given N1 has committed entries at offsets 0–100
     And N1's state machine has applied all entries up to offset 100
     When the snapshot threshold is reached (e.g., every 100 entries)
     Then N1 writes a snapshot to stable storage containing:
@@ -541,14 +545,18 @@ Feature: Log Compaction and Snapshots
       | last_included_term | 1                           |
       | voterSet         | [N1, N2, N3]                |
       | stateMachineData | <serialised state at offset 100> |
-    And N1 truncates log entries 1–100
+    And N1 performs prefix truncation of entries 0–100 via LogStore::truncate_prefix
     And N1's log start offset (LSO) advances to 101
+    # Prefix truncation is a safe storage operation on committed entries
+    # captured in the snapshot. It does NOT violate the append-only leader
+    # invariant, which prohibits only suffix operations (overwriting entries
+    # or deleting uncommitted tail entries).
 
-  Scenario: Snapshot is consistent because logs are consistent
-    Given N1, N2, and N3 have all committed entries at offsets 1–100
+  Scenario: Snapshot is consistent because committed logs are consistent
+    Given N1, N2, and N3 have all committed entries at offsets 0–100
     When each node independently takes a snapshot at offset 100
     Then all three snapshots contain identical state machine data
-    And each node truncates its own log independently
+    And each node performs prefix truncation on its own log independently
 
   Scenario: Snapshot includes voter set for recovery
     Given the current voter set is [N1, N2, N3]
@@ -556,8 +564,8 @@ Feature: Log Compaction and Snapshots
     Then the snapshot metadata includes the voter set [N1, N2, N3]
     And on crash recovery, N2 can reconstruct the voter configuration from the snapshot
 
-  Scenario: New entries arrive after snapshot
-    Given N1 has taken a snapshot at offset 100 and truncated entries 1–100
+  Scenario: New entries arrive after snapshot and prefix truncation
+    Given N1 has taken a snapshot at offset 100 and performed prefix truncation of entries 0–100
     When a client proposes command "set y=2"
     Then N1 appends the entry at offset 101, term 1
     And the entry is replicated and committed normally
@@ -581,7 +589,7 @@ Feature: Snapshot Transfer
 
   Scenario: Follower receives snapshot when log entries are compacted
     Given N1 has committed entries at offsets 1–200
-    And N1 has taken a snapshot at offset 150 and truncated entries 1–150
+    And N1 has taken a snapshot at offset 150 and performed prefix truncation of entries 1–150
     And N1's log start offset (LSO) is 151
     And N2 has only replicated through offset 50 (N2's log end offset is 51)
     When N2 sends a Fetch RPC with fetch_offset 51
@@ -637,7 +645,7 @@ Feature: Cluster Bootstrap
   Background:
     Given three uninitialized nodes [N1, N2, N3]
     And a bootstrap configuration specifying voter set [N1, N2, N3]
-    And a clusterId UUID "cluster-abc-123" is generated at bootstrap time
+    And a cluster_id UUID "cluster-abc-123" is generated at bootstrap time
 
   Scenario: Fresh cluster bootstrap with static voter set
     Given each node is configured with the initial voter set [N1, N2, N3]
@@ -648,7 +656,7 @@ Feature: Cluster Bootstrap
     And each node transitions from Unattached to Follower state
     And a leader election occurs (one node's election timeout expires first)
     And the winning leader commits a VotersRecord control entry with [N1, N2, N3]
-    And the clusterId "cluster-abc-123" is associated with all subsequent RPCs
+    And the cluster_id "cluster-abc-123" is associated with all subsequent RPCs
 
   Scenario: Bootstrap leader appends initial VotersRecord
     Given N1 wins the initial election for term 1
@@ -677,11 +685,11 @@ Feature: Cluster Bootstrap
     And if the leader's log starts beyond offset 0, N4 receives a SnapshotId
     And N4 downloads the snapshot via FetchSnapshot before normal replication
 
-  Scenario: Bootstrap rejects mismatched clusterId
-    Given the cluster [N1, N2, N3] was bootstrapped with clusterId "cluster-abc-123"
-    And N4 is configured with a different clusterId "cluster-xyz-999"
+  Scenario: Bootstrap rejects mismatched cluster_id
+    Given the cluster [N1, N2, N3] was bootstrapped with cluster_id "cluster-abc-123"
+    And N4 is configured with a different cluster_id "cluster-xyz-999"
     When N4 attempts to send Fetch RPCs to N1
-    Then N1 rejects all RPCs from N4 due to clusterId mismatch
+    Then N1 rejects all RPCs from N4 due to cluster_id mismatch
     And N4 cannot join the cluster
 ```
 
@@ -856,10 +864,27 @@ Feature: Client Interaction
     When a client calls propose("set x=1") on N1
     Then N1 returns an error indicating no leader is available
 
-  Scenario: Read returns committed state
-    Given the state machine has applied entries up to offset 10
-    When a client calls read() on the leader
-    Then the result reflects the state after applying entries 1–10
+  Scenario: Read returns current consensus state (not application state)
+    Given N1 is Leader for term 1 with high watermark 11 (offsets 0–10 committed)
+    And the voter set is [N1, N2, N3]
+    When a client calls read() on N1
+    Then the result is a ConsensusState snapshot containing:
+      | Field           | Value              |
+      | current_term    | 1                  |
+      | role            | Leader             |
+      | leader_id       | N1                 |
+      | high_watermark  | 11                 |
+      | voter_set       | [N1, N2, N3]       |
+    And high_watermark is an exclusive upper bound (entry at offset O is committed when O < HW)
+    And the application reads its own state machine data directly, not through read()
+
+  Scenario: Read on a follower returns local consensus state
+    Given N2 is a Follower with currentTerm 1 and local HW 9
+    And the leader's HW is 11 (N2 has not yet received the latest HW)
+    When a client calls read() on N2
+    Then the result shows current_term=1, role=Follower, leader_id=N1, high_watermark=9
+    And the HW may lag behind the leader's because read() returns local state only
+    And linearisable reads are out of scope (per tech spec §2.2)
 
   Scenario: At-least-once semantics — duplicate proposal after leader failover
     Given a client proposes command "set x=1" to N1 (Leader)
@@ -915,12 +940,18 @@ Feature: Safety Invariants
       because N1 can only get 2 of 5 votes (not a majority)
     And at no point do two leaders exist for the same term
 
-  Scenario: Append-Only Leader — leader never overwrites its own entries
+  Scenario: Append-Only Leader — leader never overwrites or suffix-truncates its own log
     Given N1 is Leader for term 3
     And N1's log contains entries at offsets 1–10
     When N1 appends a new entry at offset 11
-    Then entries at offsets 1–10 are unmodified
-    And N1 never deletes or overwrites any existing log entry
+    Then entries at offsets 1–10 are unmodified in content and position
+    And N1 never overwrites an existing entry with different content
+    And N1 never performs suffix truncation (only followers truncate on divergence)
+    # Note: prefix truncation (compaction) of committed entries after
+    # snapshotting is a separate, safe storage operation (see Feature:
+    # Log Compaction and Snapshots) and does NOT violate this invariant.
+    # The append-only property applies to suffix operations — the leader
+    # only appends new entries at the end and never modifies prior entries.
 
   Scenario: Leader Completeness — new leader has all committed entries
     Given N1 was Leader and committed entries at offsets 1–20
@@ -1029,8 +1060,8 @@ Feature: Observability and Metrics
 | §2.1.3 Leader step-down | Remove Voter (scenario 2) | — |
 | §2.1.4 Identity & fencing | Pull-Based Log Replication (scenarios 5–7) | — |
 | §2.1.4 Divergence detection | Log Divergence and Truncation | — |
-| §2.1.5 Library API | Client Interaction | 8 |
+| §2.1.5 Library API | Client Interaction | 9 |
 | §2.1.6 Metrics | Observability and Metrics | 6 |
 | §2.1.6 Deterministic simulation | Safety Invariants (scenario 6) | — |
 | §2.1.7 Bootstrap & recovery | Cluster Bootstrap | 5 |
-| **Total** | **16 Features** | **86 Scenarios** |
+| **Total** | **16 Features** | **87 Scenarios** |

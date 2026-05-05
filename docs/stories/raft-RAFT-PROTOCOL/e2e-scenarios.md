@@ -645,18 +645,19 @@ Feature: Cluster Bootstrap
   Background:
     Given three uninitialized nodes [N1, N2, N3]
     And a bootstrap configuration specifying voter set [N1, N2, N3]
-    And a cluster_id UUID "cluster-abc-123" is generated at bootstrap time
+    And each node is configured with the same cluster_id "cluster-abc-123"
 
   Scenario: Fresh cluster bootstrap with static voter set
     Given each node is configured with the initial voter set [N1, N2, N3]
+    And each node is configured with cluster_id "cluster-abc-123"
     And each node has an empty log and no snapshot
     When all three nodes start simultaneously
     Then each node starts in Unattached state with term 0
-    And each node loads the bootstrap voter set from configuration
+    And each node loads the bootstrap voter set from its static configuration
     And each node transitions from Unattached to Follower state
     And a leader election occurs (one node's election timeout expires first)
     And the winning leader commits a VotersRecord control entry with [N1, N2, N3]
-    And the cluster_id "cluster-abc-123" is associated with all subsequent RPCs
+    And every RPC includes cluster_id "cluster-abc-123" for identity verification
 
   Scenario: Bootstrap leader appends initial VotersRecord
     Given N1 wins the initial election for term 1
@@ -689,7 +690,7 @@ Feature: Cluster Bootstrap
     Given the cluster [N1, N2, N3] was bootstrapped with cluster_id "cluster-abc-123"
     And N4 is configured with a different cluster_id "cluster-xyz-999"
     When N4 attempts to send Fetch RPCs to N1
-    Then N1 rejects all RPCs from N4 due to cluster_id mismatch
+    Then N1 rejects all RPCs from N4 due to cluster_id mismatch in the RpcEnvelope
     And N4 cannot join the cluster
 ```
 
@@ -846,13 +847,19 @@ Feature: Client Interaction
     And N1 is Leader for term 1
     And each node runs a user-provided StateMachine implementation
 
-  Scenario: Successful command proposal and commit
+  Scenario: Successful command proposal and commit — callback ordering
     When a client calls propose("set x=1") on the leader N1
-    Then N1 appends the entry to its log
-    And followers Fetch and replicate the entry
-    And the HW advances past the entry
-    And the propose future resolves with Ok
-    And all nodes' state machines have applied "set x=1"
+    Then N1 stages the entry in the BatchAccumulator
+    And the BatchAccumulator drains the entry to the log via IoAction::AppendLog
+    And the propose future is parked in the DeferredCompletionQueue (keyed by offset)
+    When followers Fetch and replicate the entry and the HW advances past it
+    Then the event loop invokes the three-phase commit sequence in order:
+      | Phase | Action                                                              |
+      | 1     | StateMachine::apply("set x=1") — one call per committed command     |
+      | 2     | Listener::handle_commit(batch) — one batch of committed AppRecords  |
+      | 3     | DeferredCompletionQueue::complete — resolves the propose future     |
+    And the propose future resolves with Ok (after phases 1–3 complete)
+    And all callbacks are synchronous in-process calls within the event loop
 
   Scenario: Proposal rejected on follower
     When a client calls propose("set x=1") on N2 (a follower)
@@ -864,26 +871,22 @@ Feature: Client Interaction
     When a client calls propose("set x=1") on N1
     Then N1 returns an error indicating no leader is available
 
-  Scenario: Read returns current consensus state (not application state)
+  Scenario: Read returns current committed state via log routing
     Given N1 is Leader for term 1 with high watermark 11 (offsets 0–10 committed)
-    And the voter set is [N1, N2, N3]
+    And the application state machine has applied all committed command entries
     When a client calls read() on N1
-    Then the result is a ConsensusState snapshot containing:
-      | Field           | Value              |
-      | current_term    | 1                  |
-      | role            | Leader             |
-      | leader_id       | N1                 |
-      | high_watermark  | 11                 |
-      | voter_set       | [N1, N2, N3]       |
-    And high_watermark is an exclusive upper bound (entry at offset O is committed when O < HW)
-    And the application reads its own state machine data directly, not through read()
+    Then read() routes through the log for safety (per tech spec §2.1.5)
+    And the result contains the application's committed state machine state
+    And the state reflects all applied command entries through offset 10
+    And consensus metadata (term, role, HW, voter_set) is accessible separately via metrics
+    And linearisable reads are out of scope for the initial implementation (per tech spec §2.2)
 
-  Scenario: Read on a follower returns local consensus state
+  Scenario: Read on a follower returns locally committed state
     Given N2 is a Follower with currentTerm 1 and local HW 9
     And the leader's HW is 11 (N2 has not yet received the latest HW)
     When a client calls read() on N2
-    Then the result shows current_term=1, role=Follower, leader_id=N1, high_watermark=9
-    And the HW may lag behind the leader's because read() returns local state only
+    Then the result contains the state machine state through N2's local HW (offset 8 = last committed)
+    And the state may lag behind the leader's because read() returns state based on local HW
     And linearisable reads are out of scope (per tech spec §2.2)
 
   Scenario: At-least-once semantics — duplicate proposal after leader failover
@@ -907,14 +910,21 @@ Feature: Client Interaction
   Scenario: Listener callbacks on leader change
     Given the application has registered a Listener with handle_leader_change
     When a new leader is elected (N2 for term 2)
-    Then N2's listener receives handle_leader_change(leader_id=N2, term=2)
-    And N1's listener receives handle_leader_change(leader_id=N2, term=2)
+    Then on N2, the event loop invokes Listener::handle_leader_change(leader_id=N2, term=2)
+    And on N1, the event loop invokes Listener::handle_leader_change(leader_id=N2, term=2)
+    And the callback is invoked synchronously within the event loop before IoActions are dispatched
 
-  Scenario: Listener callbacks on commit
+  Scenario: Listener callbacks on commit — three-phase ordering
     Given the application has registered a Listener with handle_commit
-    When entries at offsets 5–7 are committed
-    Then each node's listener receives handle_commit with the batch [5, 6, 7]
-    And the state machine applies those entries in order
+    And the application implements StateMachine with apply()
+    When entries at offsets 5–7 are committed (HW advances past 7)
+    Then the event loop executes the three-phase commit sequence per the architecture doc:
+    And Phase 1: StateMachine::apply is called once per committed command entry (offsets 5, 6, 7 in order)
+    And control records (if any) are handled internally and never reach StateMachine::apply
+    And Phase 2: Listener::handle_commit receives one batch of committed AppRecords [5, 6, 7]
+    And Phase 3: DeferredCompletionQueue::complete resolves client futures for offsets 5–7
+    And all three phases are synchronous in-process calls within the event loop
+    And the Fetch response (via IoStage) reflects the same HW that the callbacks observed
 ```
 
 ---
