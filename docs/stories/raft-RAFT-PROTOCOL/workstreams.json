@@ -57,7 +57,7 @@
     "title": "\u0060RaftNode\u0060 Public API Skeleton",
     "description": "\u0060RaftNode\u0060 Public API Skeleton (7 steps)",
     "anchor": "phase-project-scaffolding-and-core-types/stage-raftnode-public-api-skeleton",
-    "contentHash": "402e6cb29795817adab65dbcdfc06a7e00924a46c3411c36f81df3c77286e8fb",
+    "contentHash": "e5ad10f5400a7a0d08e5e87f12bf60d667785e63795b2ac88a9f8294d927b30e",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
     "status": "planning"
@@ -174,7 +174,7 @@
     "title": "Fetch RPC \u2014 Follower Side",
     "description": "Fetch RPC \u2014 Follower Side (6 steps)",
     "anchor": "phase-pull-based-log-replication-xraft-core/stage-fetch-rpc-follower-side",
-    "contentHash": "4adc24ddc09f951000de898943c80dbbb386ef7d1911a8f2ad150e7463ff15b0",
+    "contentHash": "999e6d19cb37d116f1e9e71b458be6bf9c04464503e37600b566f999b12e6144",
     "workstreamId": "ws-raft-raft-protocol-phase-pull-based-log-replication-xraft-core-stage-fetch-rpc-follower-side",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-pull-based-log-replication-xraft-core-stage-fetch-rpc-follower-side",
     "status": "planning"
@@ -192,16 +192,16 @@
     "title": "High Watermark Advancement and Commit Notification",
     "description": "High Watermark Advancement and Commit Notification (7 steps)",
     "anchor": "phase-pull-based-log-replication-xraft-core/stage-high-watermark-advancement-and-commit-notification",
-    "contentHash": "d6071390f81f458b1a13b514c581c72940937dfe11f7e276099a7ce7ac165eab",
+    "contentHash": "f44a27babc3f8473c4d3325adc23d041bfc246ba611e579f15104a1e6e602f6f",
     "workstreamId": "ws-raft-raft-protocol-phase-pull-based-log-replication-xraft-core-stage-high-watermark-advancement-and-commit-notification",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-pull-based-log-replication-xraft-core-stage-high-watermark-advancement-and-commit-notification",
     "status": "planning"
   },
   {
     "title": "Crash Recovery Sequence",
-    "description": "Crash Recovery Sequence (3 steps)",
+    "description": "Crash Recovery Sequence (4 steps)",
     "anchor": "phase-persistence-crash-recovery-and-bootstrap-xraft-core/stage-crash-recovery-sequence",
-    "contentHash": "c24e8b67d9babba569c3babaad367e930ac4b1ff615e6657002d7d7d01a9cb57",
+    "contentHash": "420fd37c316f67345bab81316f89ce7b39cd5ef10adc6524f6a2397c61cbdeed",
     "workstreamId": "ws-raft-raft-protocol-phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-crash-recovery-sequence",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-crash-recovery-sequence",
     "status": "planning"
@@ -228,7 +228,7 @@
     "title": "Snapshot Transfer via FetchSnapshot RPC",
     "description": "Snapshot Transfer via FetchSnapshot RPC (4 steps)",
     "anchor": "phase-log-compaction-and-snapshot-transfer-xraft-core/stage-snapshot-transfer-via-fetchsnapshot-rpc",
-    "contentHash": "5194bd974e417225a1c6d65ee275be484dd75a63d1c920a83a793abb78e2a7ce",
+    "contentHash": "1310dbb33856c352ba47bdb39c6c89593eeb506cd75115c521858a9ed5959ddc",
     "workstreamId": "ws-raft-raft-protocol-phase-log-compaction-and-snapshot-transfer-xraft-core-stage-snapshot-transfer-via-fetchsnapshot-rpc",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-log-compaction-and-snapshot-transfer-xraft-core-stage-snapshot-transfer-via-fetchsnapshot-rpc",
     "status": "planning"
@@ -309,7 +309,7 @@
     "title": "Partition, Snapshot, and Membership Scenario Tests",
     "description": "Partition, Snapshot, and Membership Scenario Tests (6 steps)",
     "anchor": "phase-integration-testing-and-scenario-validation/stage-partition-snapshot-and-membership-scenario-tests",
-    "contentHash": "35d284415a995617065a19c48314c113769b4b23db62a0ae49ffed6e7005b96b",
+    "contentHash": "d9bf1d898cdb1802e3fcd805ebfde2515f83bba189d6f4b695654b826d926f4f",
     "workstreamId": "ws-raft-raft-protocol-phase-integration-testing-and-scenario-validation-stage-partition-snapshot-and-membership-scenario-tests",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-integration-testing-and-scenario-validation-stage-partition-snapshot-and-membership-scenario-tests",
     "status": "planning"
