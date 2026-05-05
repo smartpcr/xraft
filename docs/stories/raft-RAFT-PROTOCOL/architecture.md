@@ -1934,8 +1934,10 @@ leader to provide the authoritative HW via subsequent Fetch responses.
 
 5. **Always resume as Follower.** A recovering node never resumes as
    leader regardless of its prior role. It must win a new election.
-   `current_term` and `voted_for` are read from the `quorum-state` file
-   before any RPC is processed, preventing double-voting.
+   All four `QuorumState` fields (`current_term`, `voted_for`,
+   `leader_id`, `leader_epoch`) are read from the `quorum-state` file
+   before any RPC is processed, preventing double-voting and restoring
+   fencing state.
 
 6. **Log integrity via CRC-32C.** Each batch in the log is checksummed.
    The first corrupt or incomplete batch triggers truncation of that batch
@@ -1955,14 +1957,19 @@ set). This is a **local, non-linearizable** read of the node's in-memory
 state. It does NOT read application state and does NOT contact other
 nodes.
 
-> **Alignment with sibling documents.**
+> **Sibling-document note.**
 >
-> All four documents are aligned on `read()` semantics. The tech spec,
-> implementation plan, e2e scenarios, and this architecture all define
-> `read() → Result<ConsensusState>` — a local, non-linearizable
+> The tech spec, implementation plan, and e2e scenarios all describe
+> `read() → Result<ConsensusState>` as a local, non-linearizable
 > snapshot of protocol metadata. The tech spec lists "Linearisable
-> reads — Read-index or lease-based reads" as out of scope, which is
-> consistent: `read()` makes no linearizability guarantees.
+> reads — Read-index or lease-based reads" as out of scope.
+> **Active divergence:** The sibling docs enumerate five fields (term,
+> role, leader_id, HW, voter set), whereas this architecture's
+> canonical `ConsensusState` (below) includes two additional fields
+> (`log_end_offset`, `node_id`). The impl-plan (Stage 5.3 / 1.7)
+> says "routes reads through the log for safety" — this architecture
+> specifies a `watch`/`RwLock` snapshot instead; sibling docs should
+> be updated. See §7.2 for full divergence list.
 
 ```
     Client            RaftNode         ConsensusState
@@ -2099,11 +2106,13 @@ pub struct RaftMetrics {
 
 ## 7. Cross-Document Alignment
 
-All four planning documents — this architecture, the tech spec, the
-implementation plan, and the e2e scenarios — are aligned on the core
-design decisions. This section records the shared conventions that
-govern implementation and notes the canonical resolution for areas
-where different documents historically used different phrasing.
+The four planning documents — this architecture, the tech spec, the
+implementation plan, and the e2e scenarios — were authored in **parallel**
+by independent agents. They converge on most core design decisions, but
+some details still diverge. This section records the shared conventions
+and **actively lists every known divergence** so that implementors and
+future iterations of any document can reconcile them. Where a divergence
+exists, the canonical design is defined by this architecture document.
 
 ### 7.1 Shared Conventions (All Four Documents)
 
@@ -2121,13 +2130,13 @@ where different documents historically used different phrasing.
 | **Timing parameters** | 150–300 ms election timeout (randomised), 50 ms fetch interval. | tech spec §4.3 |
 | **Quorum math** | Majority = `⌊V/2⌋ + 1`; HW = descending-sorted voter offsets at index `⌊V/2⌋` (0-indexed). Only voters count. | all docs |
 | **Callback execution model** | Application callbacks (`StateMachine::apply`, `Listener::handle_commit`) are synchronous, in-process calls invoked by the `EventLoop` during message processing, after state mutation but before `IoAction` dispatch. | tech spec §4.4.1, architecture §4.1, impl plan Stages 4.1/5.1, e2e Client Interaction |
-| **High watermark (HW) semantics** | Exclusive upper bound: entry at offset O is committed ⟺ `O < HW`. `HW − 1` is the last committed offset. HW is never persisted. | tech spec §8, architecture §3.1, impl plan Phase 5, e2e preamble |
+| **High watermark (HW) semantics** | Exclusive upper bound: entry at offset O is committed ⟺ `O < HW`. `HW − 1` is the last committed offset. HW is never persisted. | tech spec §8 (glossary), architecture §3.1, impl plan Phase 5, e2e preamble. **Caveat:** tech spec §2.1.1 body still says "entries ≤ N are committed" (inclusive phrasing) — see §7.2 divergence D1. |
 | **Commit notification** | Three-phase: (1) `StateMachine::apply`, (2) `Listener::handle_commit`, (3) `DeferredCompletionQueue::complete`. No `DeferredReadQueue`. | architecture §4.1, impl plan Stages 5.1/5.3, e2e Client Interaction |
-| **`read()` semantics** | `read() → Result<ConsensusState>` — local, non-linearizable snapshot of protocol metadata (term, role, leader_id, HW, voter set). Callable on any node. Does not read application state. No `StateMachine::query()` method. | tech spec §2.1.5, architecture §5.11, impl plan Stages 1.7/5.3, e2e Client Interaction |
+| **`read()` semantics** | `read() → Result<ConsensusState>` — local, non-linearizable snapshot of protocol metadata (term, role, leader_id, HW, log_end_offset, voter set, node_id). Callable on any node. Does not read application state. No `StateMachine::query()` method. | tech spec §2.1.5, architecture §5.11, impl plan Stages 1.7/5.3, e2e Client Interaction. **Caveat:** sibling docs list only 5 fields (omit `log_end_offset`, `node_id`); impl-plan says "routes reads through the log" — see §7.2 divergences D4, D5. |
 | **`StateMachine` trait shape** | `apply(offset, &AppRecord)`, `snapshot()`, `restore()` only. No `query()`, no `ReadResult` associated type. | tech spec §2.1.5, architecture §4.1, impl plan Stage 1.4 |
 | **`LogStore` method receivers** | All methods take `&self` with interior mutability and `Sync` bound. | architecture §4.1, impl plan Stage 1.4 |
-| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state → snapshot → log scan (metadata only — no SM replay) → resume as follower → learn HW from leader → apply entries via three-phase commit notification. | tech spec §2.1.7, architecture §5.10, impl plan Phase 6, e2e Crash Recovery |
-| **`ClusterId` generation** | Generated once by the operator, passed to `bootstrap()` as a parameter, shared by all nodes. | tech spec §2.1.7, architecture §5.9, impl plan Stage 6.2 |
+| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state (all 4 fields) → snapshot → log scan (metadata only — no SM replay) → resume as follower → learn HW from leader → apply entries via three-phase commit notification. | architecture §5.10, impl plan Phase 6, e2e Crash Recovery. **Caveat:** tech spec §2.1.7 says "replaying log entries" and impl-plan Phase 6 only loads 2 of 4 quorum-state fields — see §7.2 divergences D2, D3. |
+| **`ClusterId` generation** | Generated once by the operator, passed to `bootstrap()` as a parameter, shared by all nodes. | architecture §5.9, impl plan Stage 6.2. **Caveat:** tech spec §2.1.7 says "generated at bootstrap time" without specifying operator vs. auto-generation — see §7.2 divergence D6. |
 | **Application read-side state** | Applications build their own queryable read-side state from committed records delivered via `Listener::handle_commit`. xraft does not mediate application state reads. | architecture §4.1, e2e Client Interaction |
 
 ### 7.2 Canonical Resolutions (Historical Divergences — Now Resolved)
