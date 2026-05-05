@@ -98,12 +98,12 @@ callbacks (`StateMachine`, `Listener`), manages timers via the injected
 
 | Sub-component | Responsibility |
 |---------------|----------------|
-| **`RaftNode`** | Public API surface. Exposes `propose()`, `read()` (§5.11), `bootstrap()`, and lifecycle methods. `propose()` appends a command to the log and returns a future resolved on commit. `read()` returns a projected `ConsensusState` — a local, non-linearizable snapshot of selected protocol metadata fields (term, role, leader, HW, voter set, log_end_offset, node_id); callable on any node (§5.11). Owns the `EventLoop`, `ReceiverTask`, and `IoStage`; coordinates startup, shutdown, and crash recovery. Generic over two application-provided types: `S: StateMachine` and `L: Listener` (both monomorphised at compile time for zero-cost dispatch). I/O and runtime traits (`LogStore`, `TransportSender`, `TransportReceiver`, `QuorumStateStore`, `SnapshotIO`, `Clock`) are injected as `Box<dyn ...>` trait objects at construction time. The `IoStage` borrows I/O trait objects via `&self` for concurrent dispatch — no `Arc` needed because all I/O methods take `&self` and require `Sync`. On construction, executes the recovery sequence (§5.10) before accepting any RPCs. |
-| **`EventLoop`** | Single-threaded async loop that processes protocol state transitions without blocking on I/O. The loop drains an inbound message queue (`tokio::sync::mpsc` — fed by the `ReceiverTask`, §4.4, and by `propose()` calls) and dispatches to the appropriate handler. Uses the injected `Clock` directly for timer management (election timeouts, check-quorum deadlines, fetch intervals). **Processing order per message:** (1) The handler mutates `NodeState` (e.g., updating follower progress, recalculating HW on a Fetch request, or recording appended entries); (2) If the state change triggers application-visible effects — HW advancement, leadership change — the loop invokes callbacks in a fixed order: `StateMachine::apply` (one call per committed command entry), then `Listener::handle_commit` (one batch of committed `AppRecord` values), then `DeferredCompletionQueue::complete` (resolves client futures for committed offsets); (3) The handler collects `IoAction` values into an `IoActionBatch` (e.g., `SendRpc` for the Fetch response, `AppendLog` for newly staged entries); (4) The loop hands the batch to the `IoStage`, which executes storage and network-send operations concurrently; (5) The loop records I/O results (e.g., advancing the durable offset after `AppendLog` completes). Callbacks in step 2 are synchronous, in-process function calls — not external I/O — and always observe the fully updated protocol state before any IoAction is dispatched. Callbacks must be lightweight and non-blocking; applications that need heavy processing should hand off work to their own async tasks. This prevents slow `fsync` calls from delaying Fetch processing and triggering spurious elections. `read()` calls are handled outside this pipeline — they return a `ConsensusState` snapshot (the public projected type, §5.11) without entering the message queue (§5.11). |
-| **`IoStage`** | Executes `IoAction` batches produced by the `EventLoop`. Each action is one of: `PersistQuorumState(QuorumState)`, `AppendLog(Vec<LogEntry>)`, `TruncateSuffix(u64)`, `TruncatePrefix(u64)`, `SendRpc(NodeId, RpcEnvelope)`, `SaveSnapshot(Snapshot)`. The `IoStage` holds owned trait objects (`Box<dyn ...>`) for the injected I/O implementations (`LogStore`, `TransportSender`, `QuorumStateStore`, `SnapshotIO`). No `Arc` wrapping is needed — the `IoStage` is the sole owner, and concurrent access within a batch uses shared `&self` borrows (safe because all I/O traits require `Sync`). **Concurrency model:** Within a batch, the `IoStage` partitions actions by trait object and executes *across* trait objects concurrently via `tokio::join!` (e.g., `LogStore::append` runs concurrently with `TransportSender::send` and `QuorumStateStore::save`). Operations on the *same* trait object within one batch are serialised — at most one log-write action (`AppendLog`, `TruncateSuffix`, or `TruncatePrefix`) appears per batch, so no concurrent mutation of a single `LogStore` occurs. All I/O trait methods take `&self` and implementations use interior mutability (e.g., async mutex) for write serialisation. Multiple `SendRpc` actions target different peers and use `TransportSender::send(&self)` concurrently — safe because `TransportSender: Sync`. Storage operations complete with `fsync` before the loop processes the next message that depends on them. **Application callbacks** (`StateMachine::apply`, `Listener::handle_commit`, `Listener::handle_leader_change`) are NOT dispatched by the `IoStage` — they are invoked directly by the `EventLoop` during message processing, immediately after a state change triggers them (e.g., HW advancement during Fetch handling). This ensures callbacks execute synchronously within the event loop's single-threaded context and always see consistent, up-to-date protocol state. The event loop produces the `IoAction` batch *after* callbacks have been invoked, so the Fetch response sent via `IoStage` reflects the same HW that callbacks observed. **Note:** The `IoStage` does NOT call `TransportReceiver` or `Clock` — those are used by the `ReceiverTask` (§4.4) and `EventLoop` respectively. |
+| **`RaftNode`** | Public API surface. Exposes `propose()`, `read()` (§5.11), `bootstrap()`, and lifecycle methods. `propose()` appends a command to the log and returns a future resolved on commit. `read()` clones the latest `ConsensusState` from a `tokio::sync::watch` channel (§5.11) — a local, non-linearizable snapshot of selected protocol metadata fields (term, role, leader, HW, voter set, log_end_offset, node_id); callable on any node. Spawns the `EventLoop` task (which **owns** the `IoStage`), the `ReceiverTask`, and retains a `propose_tx: mpsc::Sender` for submitting proposals plus a `watch::Receiver<ConsensusState>` for `read()`. Coordinates startup, shutdown, and crash recovery. Generic over two application-provided types: `S: StateMachine` and `L: Listener` (both monomorphised at compile time for zero-cost dispatch). I/O and runtime traits (`LogStore`, `TransportSender`, `TransportReceiver`, `QuorumStateStore`, `SnapshotIO`, `Clock`) are injected as `Box<dyn ...>` trait objects at construction time. Storage and network-send trait objects are moved into the `IoStage` (which is then moved into the event loop task); `TransportReceiver` is moved into the `ReceiverTask`; `Clock` is moved into the event loop task. No `Arc` wrapping is needed because each trait object has a single owner and concurrent access within an I/O batch uses shared `&self` borrows (safe because all I/O traits require `Sync`). On construction, executes the recovery sequence (§5.10) before accepting any RPCs. |
+| **`EventLoop`** | Single-threaded async loop that processes protocol state transitions without blocking on I/O. The event loop task **owns** the `IoStage` (moved in at startup) and holds `&self` access to it for executing I/O batches. The loop drains an inbound message queue (`tokio::sync::mpsc` — fed by the `ReceiverTask`, §4.4, and by `propose()` calls) and dispatches to the appropriate handler. Uses the injected `Clock` directly for timer management (election timeouts, check-quorum deadlines, fetch intervals). **Processing order per message:** (1) The handler mutates `NodeState` (e.g., updating follower progress, recalculating HW on a Fetch request, or recording appended entries); (2) If the state change triggers application-visible effects — HW advancement, leadership change — the loop invokes callbacks in a fixed order: `StateMachine::apply` (one call per committed command entry), then `Listener::handle_commit` (one batch of committed `AppRecord` values), then `DeferredCompletionQueue::complete` (resolves client futures for committed offsets); (3) The handler collects `IoAction` values into an `IoActionBatch` (e.g., `SendRpc` for the Fetch response, `AppendLog` for newly staged entries); (4) The loop updates the `tokio::sync::watch` channel with the current `ConsensusState` snapshot (§5.11), so concurrent `read()` callers observe the latest state immediately after steps 1–2; (5) The loop calls `self.io_stage.execute(&batch).await` — a direct async method call, not a message to a separate task — which executes storage and network-send operations concurrently via `tokio::join!`; (6) The loop records I/O results (e.g., advancing the durable offset after `AppendLog` completes). Callbacks in step 2 are synchronous, in-process function calls — not external I/O — and always observe the fully updated protocol state before any IoAction is dispatched. Callbacks must be lightweight and non-blocking; applications that need heavy processing should hand off work to their own async tasks. This prevents slow `fsync` calls from delaying Fetch processing and triggering spurious elections. `read()` calls are handled outside this pipeline — they clone the latest value from the `tokio::sync::watch` channel (§5.11) without entering the message queue. |
+| **`IoStage`** | Executes `IoAction` batches produced by the `EventLoop` via a direct async method call (`io_stage.execute(&batch).await`). The `IoStage` is **owned** by the event loop task (moved into it at startup); the event loop calls `execute(&self, batch: &IoActionBatch)` inline — no separate task, no message queue. Each action is one of: `PersistQuorumState(QuorumState)`, `AppendLog(Vec<LogEntry>)`, `TruncateSuffix(u64)`, `TruncatePrefix(u64)`, `SendRpc(NodeId, RpcEnvelope)`, `SaveSnapshot(Snapshot)`. The `IoStage` holds owned trait objects (`Box<dyn ...>`) for the injected I/O implementations (`LogStore`, `TransportSender`, `QuorumStateStore`, `SnapshotIO`). No `Arc` wrapping is needed — the `IoStage` is the sole owner, and `execute` takes `&self` so concurrent dispatch within a batch uses shared `&self` borrows (safe because all I/O traits require `Sync`). **Concurrency model:** Within a batch, `execute` partitions actions by trait object and runs them concurrently via `tokio::join!` (e.g., `LogStore::append` runs concurrently with `TransportSender::send` and `QuorumStateStore::save`). Operations on the *same* trait object within one batch are serialised — at most one log-write action (`AppendLog`, `TruncateSuffix`, or `TruncatePrefix`) appears per batch, so no concurrent mutation of a single `LogStore` occurs. All I/O trait methods take `&self` and implementations use interior mutability (e.g., async mutex) for write serialisation. Multiple `SendRpc` actions target different peers and use `TransportSender::send(&self)` concurrently — safe because `TransportSender: Sync`. The event loop awaits the full batch completion before processing the next message; total wait time is `max(storage_latency, network_latency)` because actions run concurrently. **Application callbacks** (`StateMachine::apply`, `Listener::handle_commit`, `Listener::handle_leader_change`) are NOT dispatched by the `IoStage` — they are invoked directly by the `EventLoop` during message processing, immediately after a state change triggers them (e.g., HW advancement during Fetch handling). This ensures callbacks execute synchronously within the event loop's single-threaded context and always see consistent, up-to-date protocol state. The event loop produces the `IoAction` batch *after* callbacks have been invoked, so the Fetch response sent via `IoStage` reflects the same HW that callbacks observed. **Note:** The `IoStage` does NOT call `TransportReceiver` or `Clock` — those are used by the `ReceiverTask` (§4.4) and `EventLoop` respectively. |
 | **`BatchAccumulator`** | Stages incoming `propose()` calls into a batch buffer. On each event-loop tick (or when the batch is full), the accumulated entries are drained into a single `AppendLog` I/O action. This amortises `fsync` cost across multiple proposals (group commit). Analogous to KRaft's `BatchAccumulator`. |
 | **`DeferredCompletionQueue`** | Parks `tokio::sync::oneshot` senders keyed by log offset. When the high watermark advances, the queue completes all futures whose offset is now **< HW** (strictly less than — see §3.1 canonical HW definition). Analogous to KRaft's `DeferredEventQueue` / purgatory. |
-| **`NodeState`** | The full **internal** protocol state (`pub(crate)`), containing: current `term`, `voted_for`, node `role` (Unattached / Follower / Candidate / Leader), the in-memory log index, `high_watermark`, `log_start_offset`, `log_end_offset`, the `voter_set` (as `Vec<VoterInfo>`, consistent with `VotersRecord`), observers, and per-follower replication progress (leader only). The `Unattached` role is the initial state before bootstrap or recovery completes. The **public** type `ConsensusState` returned by `RaftNode::read()` (§5.11) is a **separate, smaller struct** containing only a projected subset: `node_id`, `current_term`, `role`, `leader_id`, `log_end_offset`, `high_watermark`, `voter_set` (committed). Internal-only fields are not exposed via `read()`. |
+| **`NodeState`** | The full **internal** protocol state (`pub(crate)`), containing: current `term`, `voted_for`, node `role` (Unattached / Follower / Candidate / Leader), the in-memory log index, `high_watermark`, `log_start_offset`, `log_end_offset`, the `voter_set` (as `Vec<VoterInfo>`, consistent with `VotersRecord`), observers, and per-follower replication progress (leader only). The `Unattached` role is the initial state before bootstrap or recovery completes. The **public** type `ConsensusState` returned by `RaftNode::read()` (§5.11) is a **separate, smaller struct** containing only a projected subset: `node_id`, `current_term`, `role`, `leader_id`, `log_end_offset`, `high_watermark`, `voter_set` (committed). The event loop projects `NodeState` → `ConsensusState` after each state mutation and publishes it via a `tokio::sync::watch` channel that `RaftNode::read()` reads from. Internal-only fields are not exposed via `read()`. |
 | **`ElectionManager`** | Implements Pre-Vote and Vote protocols. Manages election timeouts (randomised 150–300 ms), vote collection, term advancement, and leader-to-follower step-down on Check Quorum failure. |
 | **`ReplicationManager`** | Handles Fetch request/response processing on both leader and follower sides. On the leader: validates fetch offset against the leader-epoch checkpoint, detects log divergence (populates `DivergingEpoch`), tracks follower progress, and advances the high watermark when a majority has replicated. On the follower: sends periodic Fetch RPCs, processes responses, truncates log on divergence, and updates the local high watermark. |
 | **`MembershipManager`** | Processes `AddVoter` / `RemoveVoter` / `UpdateVoter` RPCs. Enforces the **single-change invariant**: rejects any membership RPC while an uncommitted `VotersRecord` exists in the log. On `AddVoter`: validates the observer is caught up (`fetch_offset ≥ leader's current HW`), then appends a `VotersRecord` control entry containing the new voter set and stores it as `pending_membership_change` in `NodeState`. On `RemoveVoter`: appends a `VotersRecord` excluding the target node; if the leader is removing itself, it continues serving until the record commits (using the **new** voter set for HW quorum), then steps down to `Unattached`. On `UpdateVoter`: appends a `VotersRecord` with the updated endpoint. The `VotersRecord` travels through the log like any entry — replicated via Fetch, committed when a majority of the **new** voter set has fetched it. **Dual quorum semantics:** Once appended, HW advancement for entries at or after the `VotersRecord`'s offset immediately uses the **new** (pending) voter set (§5.5 quorum transition). Elections, Check Quorum, and the `voter_set` returned by `read()` continue to use the **committed** voter set until the `VotersRecord` is committed. On commit, `voter_set` is atomically replaced by the new set and `pending_membership_change` is cleared. |
@@ -317,13 +317,15 @@ NodeState {
 ```
 
 **Public projection via `read()`.** The `RaftNode::read()` method (§5.11)
-returns a **separate public struct** named `ConsensusState` containing only:
-`node_id`, `current_term`, `role`, `leader_id`, `log_end_offset`,
-`high_watermark`, and `voter_set` (the **committed** voter set).
-`ConsensusState` (public) is a distinct type from `NodeState` (internal).
-Internal-only fields (`cluster_id`, `voted_for`, `log_start_offset`,
-`observers`, `pending_membership_change`, `follower_state`, election/quorum
-deadlines, vote counters) are not exposed through `read()`.
+clones the latest value from a `tokio::sync::watch` channel that the event
+loop updates after each state mutation. The watch value is a **separate
+public struct** named `ConsensusState` containing only: `node_id`,
+`current_term`, `role`, `leader_id`, `log_end_offset`, `high_watermark`,
+and `voter_set` (the **committed** voter set). `ConsensusState` (public)
+is a distinct type from `NodeState` (internal). Internal-only fields
+(`cluster_id`, `voted_for`, `log_start_offset`, `observers`,
+`pending_membership_change`, `follower_state`, election/quorum deadlines,
+vote counters) are not exposed through `read()`.
 
 #### `PendingMembershipChange` (leader-only, at most one)
 
@@ -415,14 +417,23 @@ enum IoAction {
 The event loop processes each inbound message (RPC, proposal, timer tick)
 in a strict sequence: (1) mutate `NodeState`; (2) invoke application
 callbacks synchronously if needed (see §4.1 three-phase commit notification);
-(3) collect zero or more `IoAction` values into an `IoActionBatch`. After
-callbacks and IoAction collection complete, the batch is handed to the
-`IoStage` for concurrent execution. The event loop `await`s the `IoStage`
-result before processing the next message, ensuring that all external I/O
-for a given message completes before state advances. This staging model
-keeps the consensus state machine and application callbacks purely
-synchronous while allowing external I/O to be parallelised (e.g., `fsync`
-the log and send RPCs concurrently).
+(3) collect zero or more `IoAction` values into an `IoActionBatch`; (4)
+update the `ConsensusState` watch channel (§5.11) so that concurrent
+`read()` callers observe the new state immediately after step (1)–(2)
+complete. After callbacks, IoAction collection, and watch-channel update
+complete, the event loop calls `io_stage.execute(&batch).await` — a
+**direct async method call** on the `IoStage`, not a message to a separate
+task. The `IoStage` is owned by the event loop task (moved into it at
+startup), and `execute` takes `&self` because all I/O trait methods take
+`&self` and require `Sync`. The event loop `await`s the full batch
+(storage + network sends, running concurrently via `tokio::join!` inside
+`IoStage::execute`) before processing the next message. Total wait time
+is `max(storage_latency, network_latency)`, not the sum, because all
+actions in the batch run concurrently. After `execute` returns, the event
+loop records I/O results (e.g., advancing the durable offset). This
+staging model keeps the consensus state machine and application callbacks
+purely synchronous while allowing external I/O to be parallelised (e.g.,
+`fsync` the log and send RPCs concurrently).
 
 #### `AppRecord` and `AppSnapshot` (application-owned types)
 
@@ -588,7 +599,7 @@ Each trait has a single, unambiguous caller — there is no overlap.
 | Category | Traits | Dispatch | Bounds | Caller |
 |----------|--------|----------|--------|--------|
 | **Application** (synchronous) | `StateMachine`, `Listener` | Static (generic type parameters on `RaftNode<S, L>`, monomorphised) | `Send + 'static` | `EventLoop` — invoked synchronously during message processing, before `IoAction` batch is produced. Must be lightweight and non-blocking. |
-| **Storage / Network-Send I/O** (asynchronous) | `LogStore`, `SnapshotIO`, `QuorumStateStore`, `TransportSender` | Dynamic (injected as `Box<dyn ...>` trait objects at construction; the `IoStage` borrows them via `&self` for concurrent dispatch) | `Send + Sync + 'static`, `#[async_trait]`, all methods take `&self` | `IoStage` — invoked concurrently across trait objects when executing `IoAction` batches (`AppendLog`, `SaveSnapshot`, `PersistQuorumState`, `TruncateSuffix`, `TruncatePrefix`, `SendRpc`). Implementations use interior mutability for write serialisation. `Box<dyn T>` suffices (no `Arc` needed) because the `IoStage` is the sole owner and concurrent access within a batch uses shared `&self` borrows (safe due to `Sync` bound). |
+| **Storage / Network-Send I/O** (asynchronous) | `LogStore`, `SnapshotIO`, `QuorumStateStore`, `TransportSender` | Dynamic (injected as `Box<dyn ...>` trait objects at construction; moved into the `IoStage`, which is moved into the event loop task) | `Send + Sync + 'static`, `#[async_trait]`, all methods take `&self` | `IoStage` — invoked concurrently across trait objects via `IoStage::execute(&self, batch)` when executing `IoAction` batches (`AppendLog`, `SaveSnapshot`, `PersistQuorumState`, `TruncateSuffix`, `TruncatePrefix`, `SendRpc`). Implementations use interior mutability for write serialisation. `Box<dyn T>` suffices (no `Arc` needed) because the `IoStage` is the sole owner and concurrent access within a batch uses shared `&self` borrows (safe due to `Sync` bound). |
 | **Runtime** (asynchronous) | `TransportReceiver`, `Clock` | Dynamic (injected as `Box<dyn ...>` trait objects) | `Send + 'static`, `#[async_trait]` | `TransportReceiver`: called by `ReceiverTask` (§4.4) which feeds the `EventLoop`'s mpsc channel. `Clock`: used directly by the `EventLoop` for timer management (election timeouts, check-quorum deadlines). Neither is mediated by `IoAction`. |
 
 This separation ensures that application callbacks always see consistent,
@@ -729,15 +740,16 @@ pub trait LogStore: Send + Sync + 'static {
 
 All `LogStore` mutating methods take `&self` (not `&mut self`), matching
 `SnapshotIO::save(&self)` and `QuorumStateStore::save(&self)`. The `IoStage`
-holds an owned trait object (`Box<dyn LogStore>`) and borrows it via `&self`
-concurrently with `TransportSender::send` calls — safe because `LogStore:
-Sync`. No `Arc` wrapping is needed; the `IoStage` is the sole owner. The
-`LogStore` implementation serialises its own write operations internally
-(e.g., via an async mutex). The `IoStage` guarantees it will never issue two
-`LogStore` write operations (`append`, `truncate_suffix`, `truncate_prefix`)
-concurrently within the same `IoActionBatch` — at most one log-write action
-appears per batch, and truncation is never combined with append in a single
-batch.
+holds an owned trait object (`Box<dyn LogStore>`) and invokes it via
+`&self` in `IoStage::execute` — concurrently with `TransportSender::send`
+calls via `tokio::join!` — safe because `LogStore: Sync`. No `Arc`
+wrapping is needed; the `IoStage` is the sole owner (moved into the event
+loop task at startup). The `LogStore` implementation serialises its own
+write operations internally (e.g., via an async mutex). The `IoStage`
+guarantees it will never issue two `LogStore` write operations (`append`,
+`truncate_suffix`, `truncate_prefix`) concurrently within the same
+`IoActionBatch` — at most one log-write action appears per batch, and
+truncation is never combined with append in a single batch.
 
 #### `TransportSender` (core → network, outbound RPCs)
 
@@ -1867,8 +1879,10 @@ leader to provide the authoritative HW via subsequent Fetch responses.
    │     included in the     │        │
    │     snapshot)            │        │
    │                         │        │
-   │ d. Scan log segments    │        │
-   │    from offset 81.      │        │
+   │ d. Scan log from        │        │
+   │    log_start_offset     │        │
+   │    (here: 81) to        │        │
+   │    log_end_offset.      │        │
    │    Verify CRC per batch.│        │
    │    Truncate at first    │        │
    │    corrupt/partial rec. │        │
@@ -1891,22 +1905,31 @@ leader to provide the authoritative HW via subsequent Fetch responses.
    │    checkpoint from log  │        │
    │    (scan for Leader-    │        │
    │    ChangeMessage entries │        │
-   │    to build epoch →     │        │
+   │    from log_start_off   │        │
+   │    to log_end_offset to │        │
+   │    build epoch →        │        │
    │    start_offset map)    │        │
    │                         │        │
    │ g. Process control recs │        │
-   │    in log (81..95) for  │        │
+   │    in scanned range for │        │
    │    internal bookkeeping │        │
    │    only:                │        │
    │    - VotersRecord →     │        │
-   │      store as pending   │        │
-   │      membership change  │        │
-   │      (do NOT replace    │        │
+   │      store the LAST one │        │
+   │      (highest offset)   │        │
+   │      as pending membshp │        │
+   │      change. Earlier    │        │
+   │      VotersRecords were │        │
+   │      committed before   │        │
+   │      the next was       │        │
+   │      appended (single-  │        │
+   │      change invariant). │        │
+   │      Do NOT replace     │        │
    │      committed voter_   │        │
    │      set — uncommitted  │        │
    │      VotersRecords are  │        │
    │      not effective for  │        │
-   │      elections)          │        │
+   │      elections.          │        │
    │    - LeaderChangeMes. → │        │
    │      update leader-     │        │
    │      epoch checkpoint   │        │
@@ -1992,21 +2015,30 @@ leader to provide the authoritative HW via subsequent Fetch responses.
    Applying them would put the state machine in an incorrect state with
    no rollback mechanism.
 
-3. **Control records are processed for bookkeeping.** `VotersRecord` and
-   `LeaderChangeMessage` entries in the recovered log are scanned for
-   internal metadata. `LeaderChangeMessage` entries rebuild the leader-epoch
-   checkpoint. `VotersRecord` entries are stored as
-   `pending_membership_change` (not applied to the committed `voter_set`)
-   because their committed status is unknown — the committed `voter_set`
-   comes from the snapshot and must not be overwritten by an uncommitted
-   `VotersRecord` that may later be truncated on divergence. This is
-   consistent with the dual-quorum model (§5.5): uncommitted
-   `VotersRecords` affect HW advancement only, not elections or
-   `read().voter_set`. If the log is later truncated due to divergence,
-   `pending_membership_change` is cleared and the node reverts to the
-   committed voter set. If the leader's Fetch confirms the `VotersRecord`
-   is committed (HW advances past it), the three-phase commit notification
-   promotes it to the committed `voter_set`.
+3. **Control records are processed for bookkeeping.** The recovery scan
+   covers the range `[log_start_offset, log_end_offset)` — the physical
+   extent of the on-disk log. Within this range, `LeaderChangeMessage`
+   entries rebuild the leader-epoch checkpoint and `VotersRecord` entries
+   are processed for membership bookkeeping. **Scan bounds:** The scan
+   starts at `log_start_offset` (the first offset physically present in
+   the log after any prior compaction), not at `snapshot.last_included_offset
+   + 1`, because `log_start_offset ≥ snapshot.last_included_offset + 1` by
+   construction (prefix truncation only removes offsets already covered by
+   a snapshot). All entries in this range have **unknown** committed status
+   (HW is not persisted). **VotersRecord handling:** If the scan finds one
+   or more `VotersRecord` entries, only the **last** one (highest offset)
+   is stored as `pending_membership_change`. Earlier `VotersRecord` entries
+   in the range were necessarily committed before the next one was appended
+   (single-change invariant: at most one uncommitted `VotersRecord` at a
+   time), but because HW is unknown during recovery, even these are not
+   applied to the committed `voter_set`. When the leader's Fetch response
+   later advances HW past earlier `VotersRecord` offsets, the three-phase
+   commit notification (§4.1) promotes them sequentially to the committed
+   `voter_set`. The last `VotersRecord` remains as `pending_membership_change`
+   until HW advances past it (promoting it) or until log truncation discards
+   it (clearing it). The committed `voter_set` from the snapshot is never
+   overwritten during recovery — only the three-phase commit notification
+   modifies it, and only after the leader confirms committed status via HW.
 
 4. **Leader provides the authoritative HW.** After resuming as follower,
    the node sends Fetch requests to the leader. The leader's Fetch
@@ -2066,25 +2098,36 @@ does NOT contact other nodes.
 **Read semantics:**
 
 1. **Entry point.** `RaftNode::read()` returns the current `ConsensusState`
-   immediately. It does NOT enter the event loop's message queue. The
-   `ConsensusState` is maintained by the event loop (updated after each
-   state mutation) and exposed to callers via a `tokio::sync::watch`
-   channel. The returned state always reflects the latest HW-committed
-   protocol position.
+   immediately by cloning the latest value from a `tokio::sync::watch`
+   channel. It does NOT enter the event loop's message queue, does NOT
+   read from the `LogStore`, and does NOT contact other nodes. The
+   `RaftNode` struct holds a `watch::Receiver<ConsensusState>`; calling
+   `read()` invokes `receiver.borrow().clone()` — a synchronous, lock-free
+   operation (watch uses an atomic read-write lock internally).
 
-2. **Callable on any node.** Unlike `propose()` (which requires the
+2. **Watch channel update schedule.** The event loop owns the
+   `watch::Sender<ConsensusState>` and calls `sender.send(new_state)` after
+   every state mutation (step 4 in the per-message processing order, §2.1).
+   This happens **after** `NodeState` is mutated and callbacks are invoked
+   (steps 1–2), but **before** the `IoStage` executes external I/O (step 5).
+   The watch channel therefore reflects the event loop's latest committed
+   protocol position — the same state that callbacks just observed. Because
+   the event loop is the sole writer and `watch` provides atomic
+   send/receive, there is no data race.
+
+3. **Callable on any node.** Unlike `propose()` (which requires the
    leader), `read()` is callable on any node — leader, follower,
    candidate, or unattached. The returned metadata reflects that node's
    local view, which may be stale relative to the cluster's authoritative
    state.
 
-3. **No linearizability guarantee.** A partitioned node may return an
+4. **No linearizability guarantee.** A partitioned node may return an
    outdated `leader_id`, `high_watermark`, or `role`. Callers must treat
    the returned state as a best-effort snapshot. For leader discovery,
    callers should retry on a different node if a `propose()` call returns
    `NotLeader`.
 
-4. **Not an application-state read.** `read()` does NOT query the
+5. **Not an application-state read.** `read()` does NOT query the
    `StateMachine`. Applications build their own queryable read-side state
    from committed records delivered via `Listener::handle_commit` (see
    §4.1 application read-side state model). This separation is deliberate:
@@ -2121,9 +2164,16 @@ impl<S: StateMachine, L: Listener> RaftNode<S, L> {
     /// Read the current protocol state. Returns a local, non-linearizable
     /// snapshot of the node's consensus metadata. Callable on any node.
     ///
+    /// Internally clones the latest value from a `tokio::sync::watch` channel
+    /// that the event loop updates after each state mutation. Does NOT enter
+    /// the event loop message queue, does NOT read from the LogStore, and
+    /// does NOT contact other nodes.
+    ///
     /// This does NOT read application state — applications maintain their
     /// own read-side state from Listener::handle_commit callbacks (§4.1).
-    pub fn read(&self) -> Result<ConsensusState> { ... }
+    pub fn read(&self) -> Result<ConsensusState> {
+        Ok(self.state_watch_rx.borrow().clone())
+    }
 }
 ```
 
@@ -2216,7 +2266,7 @@ exists, the canonical design is defined by this architecture document.
 | **Serialisation** | `serde` + `bincode`. | tech spec §6 |
 | **Control record filtering** | `StateMachine::apply` receives only `AppRecord`; `LeaderChangeMessage` and `VotersRecord` are handled internally. | tech spec §2.1.5, impl plan Stage 1.4, e2e Client Interaction |
 | **Snapshot split** | `SnapshotMetadata` (consensus) + `AppSnapshot` (application). | all docs |
-| **I/O trait objects** | Storage / Network-Send I/O traits injected as `Box<dyn ...>` — no `Arc`. `IoStage` borrows via `&self` with `Sync` bound. | impl plan Stage 1.7 |
+| **I/O trait objects** | Storage / Network-Send I/O traits injected as `Box<dyn ...>` — no `Arc`. Trait objects are moved into the `IoStage` at construction; the `IoStage` is moved into the event loop task. `IoStage::execute(&self)` borrows trait objects via `&self` with `Sync` bound for concurrent dispatch. | impl plan Stage 1.7 |
 | **Transport split** | Separate `TransportSender` (`&self`, `Sync`) and `TransportReceiver` (`&mut self`, not `Sync`). `split()` on concrete transports. | impl plan Stage 1.4, architecture §4.4 |
 | **Clock placement** | `Clock` is a Runtime trait, passed to the `EventLoop` (not `IoStage`), not mediated by `IoAction`. | impl plan Stage 1.4/1.7 |
 | **Timing parameters** | 150–300 ms election timeout (randomised), 50 ms fetch interval. | tech spec §4.3 |
@@ -2224,10 +2274,10 @@ exists, the canonical design is defined by this architecture document.
 | **Callback execution model** | Application callbacks (`StateMachine::apply`, `Listener::handle_commit`) are synchronous, in-process calls invoked by the `EventLoop` during message processing, after state mutation but before `IoAction` dispatch. | tech spec §4.4.1, architecture §4.1, impl plan Stages 4.1/5.1, e2e Client Interaction |
 | **High watermark (HW) semantics** | Exclusive upper bound: entry at offset O is committed ⟺ `O < HW`. `HW − 1` is the last committed offset. HW is never persisted. | tech spec §8 (glossary), architecture §3.1, impl plan Phase 5, e2e preamble. Tech spec §2.1.1 body uses inclusive phrasing ("entries ≤ N are committed"); this is a notational equivalence: inclusive HW_N maps to exclusive HW = N + 1, producing the same committed set (§7.3 R1). |
 | **Commit notification** | Three-phase: (1) `StateMachine::apply`, (2) `Listener::handle_commit`, (3) `DeferredCompletionQueue::complete`. No `DeferredReadQueue`. | architecture §4.1, impl plan Stages 5.1/5.3, e2e Client Interaction |
-| **`read()` semantics** | `read() → Result<ConsensusState>` — local, non-linearizable projected subset of protocol metadata (term, role, leader_id, HW, log_end_offset, voter set, node_id). Callable on any node. Does not read application state. No `StateMachine::query()` method. | tech spec §2.1.5, architecture §5.11, e2e Client Interaction. Sibling docs list 5 core fields (term, role, leader_id, HW, voter set); this architecture adds `log_end_offset` and `node_id` as supplementary fields — abbreviated, not contradictory (§7.3 R4). Impl plan's "routes reads through the log" describes the semantic guarantee; same observable behaviour (§7.3 R5). |
+| **`read()` semantics** | `read() → Result<ConsensusState>` — clones the latest value from a `tokio::sync::watch` channel updated by the event loop after each state mutation. Local, non-linearizable projected subset of protocol metadata (term, role, leader_id, HW, log_end_offset, voter set, node_id). Callable on any node. Does NOT read from `LogStore`, does NOT enter the event loop message queue. Does not read application state. No `StateMachine::query()` method. | tech spec §2.1.5, architecture §5.11, e2e Client Interaction. Sibling docs list 5 core fields (term, role, leader_id, HW, voter set); this architecture adds `log_end_offset` and `node_id` as supplementary fields — abbreviated, not contradictory (§7.3 R4). Impl plan's "routes reads through the log" describes the semantic guarantee (state reflects committed log position); the watch channel is the concrete mechanism (§7.3 R5). |
 | **`StateMachine` trait shape** | `apply(offset, &AppRecord)`, `snapshot()`, `restore()` only. No `query()`, no `ReadResult` associated type. | tech spec §2.1.5, architecture §4.1, impl plan Stage 1.4 |
 | **`LogStore` method receivers** | All methods take `&self` with interior mutability and `Sync` bound. | architecture §4.1, impl plan Stage 1.4 |
-| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state (all 4 fields) → snapshot (restores committed `voter_set`) → log scan (metadata only — no SM replay; uncommitted `VotersRecord` stored as `pending_membership_change`, not applied to committed `voter_set`) → resume as follower → learn HW from leader → apply entries via three-phase commit notification. | architecture §5.10, impl plan Phase 6, e2e Crash Recovery. Tech spec §2.1.7's "replaying log entries" refers to log restoration/scanning at a higher level of abstraction (§7.3 R2). Impl plan lists `current_term` and `voted_for` as representative fields; `QuorumStateStore::load()` returns the full `QuorumState` struct (§7.3 R3). Impl plan's recovery step "VotersRecord → update voter set" means recovery bookkeeping (storing as `pending_membership_change` for HW purposes), not replacing the committed voter set used for elections (§7.3 R8). |
+| **Bootstrap & recovery model** | Static voter set → leader commits `VotersRecord`. Recovery: quorum-state (all 4 fields) → snapshot (restores committed `voter_set`) → log scan from `log_start_offset` to `log_end_offset` (metadata only — no SM replay; last `VotersRecord` by offset stored as `pending_membership_change`, not applied to committed `voter_set`; earlier `VotersRecords` are also not applied — promoted sequentially by three-phase commit when HW advances past them) → resume as follower → learn HW from leader → apply entries via three-phase commit notification. | architecture §5.10, impl plan Phase 6, e2e Crash Recovery. Tech spec §2.1.7's "replaying log entries" refers to log restoration/scanning at a higher level of abstraction (§7.3 R2). Impl plan lists `current_term` and `voted_for` as representative fields; `QuorumStateStore::load()` returns the full `QuorumState` struct (§7.3 R3). Impl plan's recovery step "VotersRecord → update voter set" means recovery bookkeeping (storing as `pending_membership_change` for HW purposes), not replacing the committed voter set used for elections (§7.3 R8). Impl plan Stage 6.1 step 4's scan range `log_start_offset` to `log_end_offset` matches this architecture's §5.10 rule 3. |
 | **`ClusterId` generation** | Generated once by the operator, passed to `bootstrap()` as a parameter, shared by all nodes. | architecture §5.9, impl plan Stage 6.2. Tech spec §2.1.7 says "generated at bootstrap time" — compatible: the operator generates it at bootstrap time and provides it to `bootstrap()` (§7.3 R6). |
 | **Application read-side state** | Applications build their own queryable read-side state from committed records delivered via `Listener::handle_commit`. xraft does not mediate application state reads. | architecture §4.1, e2e Client Interaction |
 
@@ -2256,10 +2306,10 @@ any of the four documents without encountering contradictory requirements.
 | ID | Area | This architecture's detail | Sibling-doc phrasing | Reconciliation |
 |----|------|---------------------------|---------------------|----------------|
 | **R1** | **HW notation** | Exclusive upper bound: entry committed ⟺ `O < HW` (§3.1). | Tech spec §2.1.1 body says "entries ≤ N are committed" (inclusive notation). Tech spec §8 glossary and impl plan Phase 5 both use exclusive notation. E2e preamble confirms exclusive. | **Notational equivalence.** Inclusive `HW_N` maps to exclusive `HW = N + 1`, producing the same committed set. The impl plan (Phase 5 header) already documents this mapping: "tech-spec HW_inclusive + 1 = architecture HW_exclusive." Implementation uses exclusive throughout. No behavioural difference. |
-| **R2** | **Recovery "replay" wording** | No `StateMachine::apply` during recovery. Log entries between snapshot and LEO are scanned for control-record metadata only (§5.10 rules 2–4). HW is learned from the leader via Fetch. | Tech spec §2.1.7 step (3) says "replaying log entries after the snapshot offset." | **Precision difference.** The tech spec uses "replaying" at a high level to describe the recovery phase that processes log entries. This architecture specifies the exact semantics: "replay" means scanning for consensus metadata (voter set from `VotersRecord`, epoch checkpoint from `LeaderChangeMessage`) — NOT calling `StateMachine::apply`. The impl plan Stage 6.1 step 4 confirms: "do NOT apply any entries to the `StateMachine`." Both documents describe the same recovery flow; this architecture provides implementation-level precision. |
+| **R2** | **Recovery "replay" wording** | No `StateMachine::apply` during recovery. Log entries in the range `[log_start_offset, log_end_offset)` are scanned for control-record metadata only (§5.10 rules 2–4). HW is learned from the leader via Fetch. | Tech spec §2.1.7 step (3) says "replaying log entries after the snapshot offset." | **Precision difference.** The tech spec uses "replaying" at a high level to describe the recovery phase that processes log entries. This architecture specifies the exact semantics: "replay" means scanning from `log_start_offset` to `log_end_offset` for consensus metadata (voter set from `VotersRecord`, epoch checkpoint from `LeaderChangeMessage`) — NOT calling `StateMachine::apply`. The impl plan Stage 6.1 step 4 confirms the same scan range (`log_start_offset` to `log_end_offset`) and "do NOT apply any entries to the `StateMachine`." Both documents describe the same recovery flow; this architecture provides implementation-level precision. |
 | **R3** | **Quorum-state field count** | Recovery loads **all 4** `QuorumState` fields: `current_term`, `voted_for`, `leader_id`, `leader_epoch` (§5.10 rule 5). | Impl plan Stage 6.1 step 2 says "load quorum-state file for `current_term` and `voted_for`" — listing 2 of 4 fields. | **Abbreviation.** The impl plan names the two most critical fields for brevity. The `QuorumStateStore::load()` trait (impl plan Stage 1.4) returns `Option<QuorumState>`, and `QuorumState` is defined with all 4 fields (impl plan Stage 1.2). The full struct is loaded — the step description is abbreviated, not incorrect. |
 | **R4** | **`read()` field count** | `read()` returns 7 fields: `current_term`, `role`, `leader_id`, `high_watermark`, `log_end_offset`, `voter_set`, `node_id` (§5.11). | Tech spec §2.1.5, e2e scenarios, and impl plan list 5 core fields (term, role, leader ID, HW, voter set). | **Abbreviation.** The 5-field list is the core subset common to all docs. `log_end_offset` and `node_id` are supplementary fields that are trivially available from the same `ConsensusState` struct. The sibling docs abbreviate the field list; they do not assert the struct has *only* 5 fields. No implementation conflict. |
-| **R5** | **`read()` implementation path** | `read()` returns node-local protocol metadata maintained by the event loop, exposed via a `tokio::sync::watch` channel that the event loop updates after each state mutation (§5.11). | Impl plan Stages 1.7 and 5.3 say "routes reads through the log for safety, meaning the returned state reflects the latest HW-committed position in the log." | **Same guarantee, different abstraction level.** The impl plan describes the *semantic* guarantee: the returned state reflects the latest HW-committed position. This architecture describes the *mechanism*: a `watch` channel updated by the event loop (which itself processes log commits). Both produce identical observable behaviour — `read()` returns state that reflects committed log entries without the caller querying the log directly. The two descriptions are compatible. |
+| **R5** | **`read()` implementation path** | `read()` clones the latest `ConsensusState` from a `tokio::sync::watch` channel. The event loop is the sole writer (updates the channel after each state mutation, step 4 in §2.1). `read()` never reads the `LogStore` directly, never enters the event loop's message queue, and never contacts other nodes. The returned state reflects the latest HW-committed protocol position because the event loop updates the watch channel after processing log commits (§5.11). | Impl plan Stages 1.7 and 5.3 say "routes reads through the log for safety, meaning the returned state reflects the latest HW-committed position in the log." | **Semantic guarantee vs. concrete mechanism.** The impl plan describes the *correctness property*: the returned state reflects committed log entries. This architecture specifies the *mechanism* that achieves it: a `watch` channel updated by the event loop (which processes log commits). `read()` does NOT call `LogStore::read()` — "routes through the log" means the event loop *derives* the `ConsensusState` from the log-committed protocol position, then publishes it via the watch channel. The impl plan's phrasing should be read as a semantic guarantee, not a literal implementation directive. Both produce identical observable behaviour. |
 | **R6** | **`ClusterId` generation source** | `ClusterId` UUID is generated once by the operator, passed to `bootstrap()` as a parameter (§5.9). | Tech spec §2.1.7 says "generated at bootstrap time." | **Compatible.** "Generated at bootstrap time" accurately describes when the UUID is created — the operator generates it at bootstrap time and passes it to all nodes. The tech spec is ambiguous about *who* generates it; this architecture resolves the ambiguity: the operator generates it (not auto-generated by the code). No conflict. |
 | **R7** | **Voter-set dual-quorum semantics** | This architecture distinguishes **committed** `voter_set` (elections, Check Quorum, `read()`) from **pending** `pending_membership_change` (HW advancement only). `NodeState` tracks both fields (§3.2); the public `ConsensusState` exposes only the committed `voter_set`. | E2e scenarios correctly describe the dual semantics: "HW uses new voter set on append, elections on commit." Impl plan and tech spec describe the same behaviour without modelling `pending_membership_change` as a separate field. | **Modelling granularity.** All four documents agree on the *behaviour*: HW advancement switches to the new voter set on append, elections switch on commit. This architecture introduces the `pending_membership_change` field as the implementation-level mechanism. Impl plan and tech spec operate at a higher level where the behaviour is described without naming the internal field. No contradiction — this is implementation detail vs. spec-level description. |
 | **R8** | **Recovery VotersRecord handling** | On recovery, uncommitted `VotersRecord` entries are stored as `pending_membership_change` — they do NOT replace the committed `voter_set` from the snapshot (§5.10 rule 3). | Impl plan Stage 6.1 step 5 says "VotersRecord → update voter set." Tech spec §2.1.7 step (3) says "replaying log entries." | **Terminology difference.** The impl plan's "update voter set" refers to recovery-time bookkeeping — storing the `VotersRecord` as `pending_membership_change` so that HW advancement can use it if/when the leader confirms it is committed. It does NOT mean replacing the committed `voter_set` used for elections. The impl plan Stage 8.1 and e2e quorum-transition scenario both confirm that uncommitted `VotersRecord` entries are not effective for elections. This architecture provides the precise semantics: "update" means "store as pending change for HW purposes." |
