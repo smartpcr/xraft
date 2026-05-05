@@ -529,14 +529,14 @@
 
 #### Implementation Steps
 - [ ] Create `xraft-core/src/membership.rs` implementing `MembershipManager`
-- [ ] Implement `handle_add_voter(request)` on leader: validate no other membership change is in-flight, validate node is not already a voter, append `VotersRecord` control entry to log — the `VotersRecord` is committed using the **current** voter set for quorum (i.e., the new voter does NOT count towards the majority needed to commit this VotersRecord, per architecture §5.5)
+- [ ] Implement `handle_add_voter(request)` on leader: validate no other membership change is in-flight, validate node is not already a voter, append `VotersRecord` control entry to log — once appended, HW advancement immediately uses the **new** voter set for quorum calculation (i.e., the new voter's `fetch_offset` counts towards the majority needed to commit this VotersRecord — per architecture §5.5 Quorum transition); this is safe because the observer was required to be caught up before `AddVoter` was accepted
 - [ ] Implement observer registration: new node joins as observer (non-voting), replicates log via Fetch, does not contribute to quorum
 - [ ] Track observer catch-up progress: observer must reach within a configurable threshold of the leader's log end before promotion
-- [ ] On `VotersRecord` commit: update the in-memory voter set, begin counting the new voter for quorum calculations
+- [ ] On `VotersRecord` append: immediately switch HW advancement to use the **new** voter set for entries at or after the `VotersRecord`'s offset (architecture §3.1 `VotersRecord` semantics); on `VotersRecord` commit: finalize the in-memory voter set so the new voter participates in elections, Check Quorum, and all subsequent quorum calculations
 - [ ] Return `MembershipChangeResponse` with appropriate errors: `NotLeader { leader_id }` (with `leader_id` field for client redirection), `ChangeInProgress`, `NodeAlreadyVoter`, `NodeNotFound`, `NodeNotCaughtUp` — all five variants from `MembershipError` enum defined in architecture §3.2
 
 #### Test Scenarios
-- [ ] Scenario: Add voter — Given a 3-node cluster {N1, N2, N3}, When leader N1 processes `AddVoter(N4)`, Then N4 is added as observer, catches up, a `VotersRecord` is committed, and N4 becomes a voter (quorum changes from 2 to 3)
+- [ ] Scenario: Add voter — Given a 3-node cluster {N1, N2, N3} and N4 is an observer that has caught up (fetch_offset ≥ HW), When leader N1 processes `AddVoter(N4)` and appends `VotersRecord` [N1,N2,N3,N4], Then HW advancement immediately uses the **new** voter set (majority = 3 of 4), N4's `fetch_offset` counts toward commit of the `VotersRecord` itself, and once committed N4 becomes a full voting member
 - [ ] Scenario: Concurrent change rejected — Given a membership change is in progress, When a second `AddVoter` is requested, Then it returns `ChangeInProgress` error
 - [ ] Scenario: Observer catch-up — Given N4 joins as observer with empty log and leader has 1000 entries, When N4 fetches and reaches within 10 entries of the leader, Then N4 is eligible for promotion
 - [ ] Scenario: Observer not caught up — Given N4 joins as observer but is 500 entries behind the leader, When `AddVoter(N4)` attempts promotion, Then it returns `MembershipError::NodeNotCaughtUp`
@@ -545,7 +545,7 @@
 
 #### Implementation Steps
 - [ ] Implement `handle_remove_voter(request)` on leader: validate no other change in-flight, validate node exists in voter set, append `VotersRecord` without the removed node — the `VotersRecord` is committed using the **new** voter set for quorum (i.e., the removed voter does NOT count towards the majority, per architecture §5.6), ensuring the new configuration is durable on a majority of the new membership before taking effect
-- [ ] On `VotersRecord` commit: update in-memory voter set, exclude removed node from quorum calculations
+- [ ] On `VotersRecord` append: immediately switch HW advancement to use the **new** voter set (excluding the removed node) for entries at or after the `VotersRecord`'s offset; on `VotersRecord` commit: finalize the in-memory voter set, exclude removed node from elections and Check Quorum
 - [ ] Handle leader self-removal: if the leader is the removed node, continue serving (processing Fetch requests, advancing HW) until the `VotersRecord` commits, then step down to `Unattached` (not `Follower`, because the leader is no longer a member of the voter set — per architecture §5.6 leader self-removal rules)
 - [ ] Handle removed follower: when the removed node learns of its removal (by fetching and applying the `VotersRecord` that excludes it), it transitions to `Unattached` and stops participating in elections; Pre-Vote and voter-set-aware vote rejection prevent the removed node from disrupting the cluster (architecture §5.6)
 
