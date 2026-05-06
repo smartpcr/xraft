@@ -1,15 +1,17 @@
+use crate::app_record::AppRecord;
+use crate::types::Term;
+use crate::voter::VotersRecord;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Offset, Term};
-
-/// Type of log entry.
+/// Discriminator for log entry types.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryType {
-    /// Application command (forwarded to StateMachine).
+    /// Application-level command wrapping an AppRecord.
     Command,
-    /// Control record appended on leader election.
+    /// No-op appended by new leader to establish commit state.
     LeaderChangeMessage,
-    /// Control record for voter-set changes.
+    /// Membership change record encoding complete new voter set.
     VotersRecord,
 }
 
@@ -18,6 +20,48 @@ pub enum EntryType {
 pub struct LogEntry {
     pub offset: Offset,
     pub term: Term,
+    /// Type discriminator.
     pub entry_type: EntryType,
-    pub payload: Vec<u8>,
+    /// Serialised payload.
+    pub payload: Bytes,
+}
+
+impl LogEntry {
+    /// Create a Command entry wrapping an AppRecord.
+    pub fn command(offset: u64, term: Term, record: &AppRecord) -> Self {
+        LogEntry {
+            offset,
+            term,
+            entry_type: EntryType::Command,
+            payload: record.data.clone(),
+        }
+    }
+
+    /// Create a LeaderChangeMessage (no-op) entry.
+    pub fn leader_change(offset: u64, term: Term) -> Self {
+        LogEntry {
+            offset,
+            term,
+            entry_type: EntryType::LeaderChangeMessage,
+            payload: Bytes::new(),
+        }
+    }
+
+    /// Create a VotersRecord entry.
+    pub fn voters_record(offset: u64, term: Term, record: &VotersRecord) -> Self {
+        let data = bincode::serialize(record).expect("VotersRecord serialisation");
+        LogEntry {
+            offset,
+            term,
+            entry_type: EntryType::VotersRecord,
+            payload: Bytes::from(data),
+        }
+    }
+
+    /// Extract AppRecord from a Command entry. Panics if not Command type.
+    pub fn as_app_record(&self) -> AppRecord {
+        AppRecord {
+            data: self.payload.clone(),
+        }
+    }
 }
