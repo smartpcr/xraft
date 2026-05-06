@@ -1,5 +1,3 @@
-use crate::app_record::AppRecord;
-use crate::types::{Offset, Term};
 use serde::{Deserialize, Serialize};
 
 /// The type of a log entry.
@@ -13,6 +11,7 @@ pub enum EntryType {
     VotersRecord,
 }
 
+/// A single entry in the replicated log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
     /// The offset of this entry in the log.
@@ -26,12 +25,24 @@ pub struct LogEntry {
 }
 
 impl LogEntry {
-    pub fn command(offset: Offset, term: Term, record: &AppRecord) -> Self {
-        Self {
+    /// Create a VotersRecord log entry at the given offset and term.
+    pub fn voters_record(offset: u64, term: Term, record: &VotersRecord) -> Self {
+        let payload = bincode::serialize(record).expect("VotersRecord serialisation");
+        LogEntry {
+            offset,
+            term,
+            entry_type: EntryType::VotersRecord,
+            payload,
+        }
+    }
+
+    /// Create a Command log entry.
+    pub fn command(offset: u64, term: Term, data: Vec<u8>) -> Self {
+        LogEntry {
             offset,
             term,
             entry_type: EntryType::Command,
-            payload: record.data.to_vec(),
+            payload: data,
         }
     }
 }

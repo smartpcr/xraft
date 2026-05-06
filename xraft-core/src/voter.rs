@@ -10,6 +10,6 @@ pub struct VoterInfo {
 /// A record of the current voter set, appended to the log on membership changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VotersRecord {
-    pub version: u64,
+    pub version: u32,
     pub voters: Vec<VoterInfo>,
 }
