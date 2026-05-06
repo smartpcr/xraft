@@ -1,251 +1,169 @@
-//! In-process channel transport for testing.
+//! In-process channel-based transport for deterministic testing.
 //!
-//! Uses in-memory message queues to simulate network communication between
-//! Raft nodes. Supports deterministic message ordering and fault injection
-//! (message drop, delay, partition).
+//! Uses `tokio::sync::mpsc` channels to deliver `RpcEnvelope` messages
+//! between nodes without any network I/O. Each node gets a
+//! `ChannelTransportSender` (can send to any peer) and a
+//! `ChannelTransportReceiver` (receives inbound messages).
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use xraft_core::rpc::RpcEnvelope;
+use xraft_core::traits::{TransportReceiver, TransportSender};
+use xraft_core::types::NodeId;
 
-use serde::{Deserialize, Serialize};
-use xraft_core::log_entry::LogEntry;
-use xraft_core::types::{NodeId, Term};
-
-/// Messages exchanged between Raft nodes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RaftMessage {
-    /// Leader sends entries to followers.
-    AppendEntries {
-        leader_id: NodeId,
-        term: Term,
-        prev_log_offset: u64,
-        prev_log_term: Term,
-        entries: Vec<LogEntry>,
-        leader_commit: u64,
-    },
-    /// Follower acknowledges append.
-    AppendEntriesResponse {
-        node_id: NodeId,
-        term: Term,
-        success: bool,
-        match_offset: u64,
-    },
-    /// Candidate requests vote.
-    VoteRequest {
-        candidate_id: NodeId,
-        term: Term,
-        last_log_offset: u64,
-        last_log_term: Term,
-    },
-    /// Node responds to vote request.
-    VoteResponse {
-        node_id: NodeId,
-        term: Term,
-        granted: bool,
-    },
-}
-
-/// Internal shared state for the transport.
-#[derive(Debug)]
-struct TransportInner {
-    /// Queues of messages: `(from, to) -> queue`.
-    queues: HashMap<(NodeId, NodeId), VecDeque<RaftMessage>>,
-    /// Set of node IDs in the cluster.
-    nodes: Vec<NodeId>,
-    /// Partitioned node pairs — messages between these are dropped.
-    partitions: Vec<(NodeId, NodeId)>,
-}
-
-/// In-process transport using message queues per node pair.
+/// Channel-based transport sender that routes messages to peers via mpsc channels.
 ///
-/// Thread-safe via `Arc<Mutex<...>>` so it can be shared across nodes.
-/// Provides `send()` and `recv()` for deterministic message passing.
-#[derive(Debug, Clone)]
-pub struct ChannelTransport {
-    inner: Arc<Mutex<TransportInner>>,
+/// Implements `TransportSender` with `&self` (shared reference) because the
+/// `IoStage` may send to multiple peers concurrently. Thread-safe via `Arc`.
+pub struct ChannelTransportSender {
+    /// Map from target NodeId to that node's inbound channel sender.
+    peers: Arc<HashMap<NodeId, mpsc::Sender<RpcEnvelope>>>,
 }
 
-impl ChannelTransport {
-    /// Create a transport for the given set of nodes.
-    pub fn new(nodes: Vec<NodeId>) -> Self {
-        let mut queues = HashMap::new();
-        for &from in &nodes {
-            for &to in &nodes {
-                if from != to {
-                    queues.insert((from, to), VecDeque::new());
-                }
-            }
-        }
+impl ChannelTransportSender {
+    /// Create a new sender with access to all peer channels.
+    pub fn new(peers: HashMap<NodeId, mpsc::Sender<RpcEnvelope>>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(TransportInner {
-                queues,
-                nodes,
-                partitions: Vec::new(),
-            })),
+            peers: Arc::new(peers),
         }
     }
+}
 
-    /// Send a message from one node to another. Messages to partitioned
-    /// nodes are silently dropped.
-    pub fn send(&self, from: NodeId, to: NodeId, msg: RaftMessage) {
-        let mut inner = self.inner.lock().unwrap();
-        // Check partition
-        if inner
-            .partitions
-            .iter()
-            .any(|&(a, b)| (a == from && b == to) || (a == to && b == from))
-        {
-            return; // message dropped due to partition
-        }
-        if let Some(queue) = inner.queues.get_mut(&(from, to)) {
-            queue.push_back(msg);
-        }
+#[async_trait]
+impl TransportSender for ChannelTransportSender {
+    async fn send(
+        &self,
+        target: NodeId,
+        message: RpcEnvelope,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tx = self
+            .peers
+            .get(&target)
+            .ok_or_else(|| format!("no channel for target {:?}", target))?;
+        tx.send(message)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        Ok(())
+    }
+}
+
+/// Channel-based transport receiver for inbound messages.
+///
+/// Implements `TransportReceiver` with `&mut self` (exclusive access) because
+/// only the `ReceiverTask` reads from the network per architecture §4.4.
+pub struct ChannelTransportReceiver {
+    rx: mpsc::Receiver<RpcEnvelope>,
+}
+
+impl ChannelTransportReceiver {
+    /// Create a new receiver wrapping an mpsc receiver.
+    pub fn new(rx: mpsc::Receiver<RpcEnvelope>) -> Self {
+        Self { rx }
+    }
+}
+
+#[async_trait]
+impl TransportReceiver for ChannelTransportReceiver {
+    async fn recv(&mut self) -> Result<RpcEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        self.rx
+            .recv()
+            .await
+            .ok_or_else(|| "channel closed".into())
+    }
+}
+
+/// Create a fully-connected channel network for N nodes.
+///
+/// Returns a map from NodeId to (sender, receiver) pairs. Each sender can
+/// route messages to any other node in the network.
+pub fn create_channel_network(
+    node_ids: &[NodeId],
+) -> HashMap<NodeId, (ChannelTransportSender, ChannelTransportReceiver)> {
+    let buffer_size = 1024;
+
+    // Create one inbound channel per node
+    let mut inbound_txs: HashMap<NodeId, mpsc::Sender<RpcEnvelope>> = HashMap::new();
+    let mut inbound_rxs: HashMap<NodeId, mpsc::Receiver<RpcEnvelope>> = HashMap::new();
+
+    for &nid in node_ids {
+        let (tx, rx) = mpsc::channel(buffer_size);
+        inbound_txs.insert(nid, tx);
+        inbound_rxs.insert(nid, rx);
     }
 
-    /// Receive all pending messages for a node, returning `(from, message)`.
-    pub fn recv(&self, to: NodeId) -> Vec<(NodeId, RaftMessage)> {
-        let mut inner = self.inner.lock().unwrap();
-        let mut messages = Vec::new();
-        let nodes: Vec<NodeId> = inner.nodes.clone();
-        for from in nodes {
-            if from == to {
-                continue;
+    // Each node gets a sender with access to all other nodes' inbound channels
+    let mut result = HashMap::new();
+    for &nid in node_ids {
+        let mut peer_map = HashMap::new();
+        for (&peer_id, tx) in &inbound_txs {
+            if peer_id != nid {
+                peer_map.insert(peer_id, tx.clone());
             }
-            if let Some(queue) = inner.queues.get_mut(&(from, to)) {
-                while let Some(msg) = queue.pop_front() {
-                    messages.push((from, msg));
-                }
-            }
         }
-        messages
+        let sender = ChannelTransportSender::new(peer_map);
+        let receiver = ChannelTransportReceiver::new(inbound_rxs.remove(&nid).unwrap());
+        result.insert(nid, (sender, receiver));
     }
 
-    /// Drain and return all pending messages across all queues.
-    pub fn drain_all(&self) -> Vec<(NodeId, NodeId, RaftMessage)> {
-        let mut inner = self.inner.lock().unwrap();
-        let mut messages = Vec::new();
-        for (&(from, to), queue) in &mut inner.queues {
-            while let Some(msg) = queue.pop_front() {
-                messages.push((from, to, msg));
-            }
-        }
-        messages
-    }
-
-    /// Add a network partition between two nodes.
-    pub fn add_partition(&self, a: NodeId, b: NodeId) {
-        self.inner.lock().unwrap().partitions.push((a, b));
-    }
-
-    /// Remove all partitions.
-    pub fn clear_partitions(&self) {
-        self.inner.lock().unwrap().partitions.clear();
-    }
-
-    /// Return the number of pending messages across all queues.
-    pub fn pending_count(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
-        inner.queues.values().map(|q| q.len()).sum()
-    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xraft_core::rpc::{RpcPayload, VoteRequest};
+    use xraft_core::types::Term;
 
-    #[test]
-    fn send_and_receive() {
+    #[tokio::test]
+    async fn send_and_receive_between_nodes() {
         let nodes = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let transport = ChannelTransport::new(nodes);
+        let mut network = create_channel_network(&nodes);
 
-        transport.send(
-            NodeId(1),
-            NodeId(2),
-            RaftMessage::VoteRequest {
-                candidate_id: NodeId(1),
+        let (sender_1, _) = network.remove(&NodeId(1)).unwrap();
+        let (_, mut receiver_2) = network.remove(&NodeId(2)).unwrap();
+
+        let envelope = RpcEnvelope {
+            cluster_id: "test-cluster".to_string(),
+            source: NodeId(1),
+            leader_epoch: 1,
+            payload: RpcPayload::VoteRequest(VoteRequest {
                 term: Term(1),
+                candidate_id: NodeId(1),
                 last_log_offset: 0,
                 last_log_term: Term(0),
-            },
-        );
+                is_pre_vote: false,
+            }),
+        };
 
-        let msgs = transport.recv(NodeId(2));
-        assert_eq!(msgs.len(), 1);
-        let (from, msg) = &msgs[0];
-        assert_eq!(*from, NodeId(1));
-        match msg {
-            RaftMessage::VoteRequest { candidate_id, term, .. } => {
-                assert_eq!(*candidate_id, NodeId(1));
-                assert_eq!(*term, Term(1));
-            }
-            _ => panic!("expected VoteRequest"),
-        }
-
-        // Node 3 has no messages
-        assert!(transport.recv(NodeId(3)).is_empty());
+        sender_1.send(NodeId(2), envelope).await.unwrap();
+        let received = receiver_2.recv().await.unwrap();
+        assert_eq!(received.source, NodeId(1));
+        assert_eq!(received.leader_epoch, 1);
+        assert_eq!(received.cluster_id, "test-cluster");
     }
 
-    #[test]
-    fn partition_drops_messages() {
+    #[tokio::test]
+    async fn send_to_unknown_peer_returns_error() {
         let nodes = vec![NodeId(1), NodeId(2)];
-        let transport = ChannelTransport::new(nodes);
+        let mut network = create_channel_network(&nodes);
+        let (sender_1, _) = network.remove(&NodeId(1)).unwrap();
 
-        transport.add_partition(NodeId(1), NodeId(2));
-
-        transport.send(
-            NodeId(1),
-            NodeId(2),
-            RaftMessage::VoteRequest {
-                candidate_id: NodeId(1),
+        let envelope = RpcEnvelope {
+            cluster_id: "test-cluster".to_string(),
+            source: NodeId(1),
+            leader_epoch: 1,
+            payload: RpcPayload::VoteRequest(VoteRequest {
                 term: Term(1),
+                candidate_id: NodeId(1),
                 last_log_offset: 0,
                 last_log_term: Term(0),
-            },
-        );
+                is_pre_vote: false,
+            }),
+        };
 
-        // Message should be dropped
-        assert!(transport.recv(NodeId(2)).is_empty());
-
-        // Clear partition and try again
-        transport.clear_partitions();
-        transport.send(
-            NodeId(1),
-            NodeId(2),
-            RaftMessage::VoteResponse {
-                node_id: NodeId(1),
-                term: Term(1),
-                granted: true,
-            },
-        );
-        assert_eq!(transport.recv(NodeId(2)).len(), 1);
-    }
-
-    #[test]
-    fn drain_all_returns_everything() {
-        let nodes = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let transport = ChannelTransport::new(nodes);
-
-        transport.send(
-            NodeId(1),
-            NodeId(2),
-            RaftMessage::VoteResponse {
-                node_id: NodeId(1),
-                term: Term(1),
-                granted: true,
-            },
-        );
-        transport.send(
-            NodeId(2),
-            NodeId(3),
-            RaftMessage::VoteResponse {
-                node_id: NodeId(2),
-                term: Term(1),
-                granted: false,
-            },
-        );
-
-        let all = transport.drain_all();
-        assert_eq!(all.len(), 2);
-        assert_eq!(transport.pending_count(), 0);
+        let result = sender_1.send(NodeId(99), envelope).await;
+        assert!(result.is_err());
     }
 }

@@ -1,8 +1,18 @@
-use crate::quorum_state::QuorumState;
 use async_trait::async_trait;
-use std::time::{Duration, Instant};
+use crate::types::{NodeId, Term, AppRecord, AppSnapshot};
+use crate::log_entry::LogEntry;
+use crate::rpc::RpcEnvelope;
 
-pub type Result<T> = std::result::Result<T, crate::error::XraftError>;
+/// Trait for log storage.
+#[async_trait]
+pub trait LogStore: Send + Sync + 'static {
+    async fn append(&self, entries: &[LogEntry]) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn truncate_suffix(&self, from_offset: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    fn log_start_offset(&self) -> u64;
+    fn log_end_offset(&self) -> u64;
+    async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>, Box<dyn std::error::Error + Send + Sync>>;
+}
 
 /// Durable, append-only log store.
 ///
