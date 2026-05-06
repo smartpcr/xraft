@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use crate::types::{Term, AppRecord};
 
 use crate::types::{Offset, Term};
 
@@ -9,7 +8,7 @@ use crate::types::{Offset, Term};
 pub enum EntryType {
     /// Application-level state machine command (wraps an `AppRecord`).
     Command,
-    /// No-op entry appended by new leader at start of term.
+    /// Control record appended on leader election.
     LeaderChangeMessage,
     /// Encodes the complete new voter set for membership changes.
     VotersRecord,
@@ -18,9 +17,7 @@ pub enum EntryType {
 /// A single entry in the replicated log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
-    /// Position in the log (0-indexed).
-    pub offset: u64,
-    /// Term when the entry was created.
+    pub offset: Offset,
     pub term: Term,
     /// Discriminator for entry content.
     pub entry_type: EntryType,
