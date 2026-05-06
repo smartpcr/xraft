@@ -6,5 +6,5 @@ use crate::types::NodeId;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoterInfo {
     pub node_id: NodeId,
-    pub endpoint: Endpoint,
+    pub endpoint: String,
 }
