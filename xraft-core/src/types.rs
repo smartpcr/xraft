@@ -23,6 +23,16 @@ impl fmt::Display for NodeId {
     }
 }
 
+/// Monotonically increasing logical clock identifying an election cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+pub struct Term(pub u64);
+
+impl Term {
+    pub fn next(self) -> Term {
+        Term(self.0 + 1)
+    }
+}
+
 impl fmt::Display for Term {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "T{}", self.0)
@@ -33,4 +43,32 @@ impl fmt::Display for Offset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "@{}", self.0)
     }
+}
+
+/// Opaque application snapshot payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AppSnapshot {
+    pub data: Vec<u8>,
+}
+
+/// Node role in the Raft state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Role {
+    Unattached,
+    Follower,
+    Candidate,
+    Leader,
+}
+
+impl Default for Role {
+    fn default() -> Self {
+        Role::Unattached
+    }
+}
+
+/// Information about a voter in the cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoterInfo {
+    pub node_id: NodeId,
+    pub endpoint: String,
 }
