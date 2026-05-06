@@ -1,7 +1,5 @@
 pub mod config;
 pub mod error;
-pub mod log_entry;
-pub mod traits;
 pub mod types;
 
 pub use config::RaftConfig;
