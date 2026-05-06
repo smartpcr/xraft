@@ -3,12 +3,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{Offset, Term};
 
-/// A single entry in the replicated log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A single log entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
     pub offset: u64,
     pub term: Term,
-    /// Type discriminator.
     pub entry_type: EntryType,
     pub payload: Bytes,
 }

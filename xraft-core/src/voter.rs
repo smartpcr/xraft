@@ -1,12 +1,10 @@
 use crate::types::NodeId;
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 /// Network-addressable voter identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoterInfo {
     pub node_id: NodeId,
-    pub endpoint: SocketAddr,
+    pub endpoint: String,
 }
 
 /// Complete voter set — committed via the log as a control record.
