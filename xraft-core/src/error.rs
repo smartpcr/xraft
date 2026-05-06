@@ -1,0 +1,55 @@
+use crate::types::NodeId;
+use std::fmt;
+use std::io;
+
+/// Public error type for all xraft operations.
+#[derive(Debug)]
+pub enum XraftError {
+    /// Log, snapshot, or quorum-state I/O failure.
+    StorageError(io::Error),
+    /// Network send/recv failure.
+    TransportError(io::Error),
+    /// propose() called on a non-leader node.
+    NotLeader { leader_id: Option<NodeId> },
+    /// BatchAccumulator back-pressure limit reached.
+    ProposalQueueFull,
+    /// RPC cluster_id mismatch.
+    InvalidClusterId,
+    /// Malformed or invalid RPC response.
+    InvalidResponse(String),
+    /// State machine apply failed (crash-stop semantics).
+    StateMachineApplyError(String),
+    /// Node is shutting down.
+    Shutdown,
+}
+
+impl fmt::Display for XraftError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            XraftError::StorageError(e) => write!(f, "storage error: {e}"),
+            XraftError::TransportError(e) => write!(f, "transport error: {e}"),
+            XraftError::NotLeader { leader_id } => {
+                write!(f, "not leader (leader: {leader_id:?})")
+            }
+            XraftError::ProposalQueueFull => write!(f, "proposal queue full"),
+            XraftError::InvalidClusterId => write!(f, "invalid cluster id"),
+            XraftError::InvalidResponse(msg) => write!(f, "invalid response: {msg}"),
+            XraftError::StateMachineApplyError(msg) => {
+                write!(f, "state machine apply error: {msg}")
+            }
+            XraftError::Shutdown => write!(f, "node is shutting down"),
+        }
+    }
+}
+
+impl std::error::Error for XraftError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            XraftError::StorageError(e) | XraftError::TransportError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Convenience Result alias.
+pub type Result<T> = std::result::Result<T, XraftError>;

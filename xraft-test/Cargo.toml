@@ -1,0 +1,12 @@
+[package]
+name = "xraft-test"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+xraft-core = { path = "../xraft-core" }
+xraft-storage = { path = "../xraft-storage" }
+xraft-transport = { path = "../xraft-transport" }
+
+[lints]
+workspace = true
