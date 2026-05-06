@@ -17,11 +17,11 @@ use crate::types::{Offset, Term};
 /// the application's `StateMachine`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EntryType {
-    /// Application command (forwarded to StateMachine).
+    /// Application-level command wrapping an AppRecord.
     Command,
-    /// Control record appended on leader election.
+    /// No-op appended by new leader to establish commit state.
     LeaderChangeMessage,
-    /// Control record for voter-set changes.
+    /// Membership change record encoding complete new voter set.
     VotersRecord,
 }
 
@@ -30,6 +30,7 @@ pub enum EntryType {
 pub struct LogEntry {
     pub offset: Offset,
     pub term: Term,
+    /// Type discriminator.
     pub entry_type: EntryType,
     /// Serialised command or control record payload.
     pub payload: Bytes,
