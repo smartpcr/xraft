@@ -1,4 +1,4 @@
-use thiserror::Error;
+use std::fmt;
 
 use crate::types::NodeId;
 
