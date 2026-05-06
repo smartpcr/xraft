@@ -1,5 +1,7 @@
 pub mod app_record;
 pub mod config;
+pub mod consensus_state;
+pub mod election;
 pub mod error;
 pub mod log_entry;
 pub mod quorum_state;
