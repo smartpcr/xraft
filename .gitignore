@@ -2,4 +2,4 @@
 **/*.rs.bk
 Cargo.lock
 **/*.rs.bk
-*.pdb
+Cargo.lock
