@@ -3,9 +3,6 @@ name = "xraft-transport"
 edition.workspace = true
 version.workspace = true
 
-[lints]
-workspace = true
-
 [dependencies]
 xraft-core = { path = "../xraft-core" }
 tokio = { version = "1", features = ["full"] }
