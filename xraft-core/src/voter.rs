@@ -2,8 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 use crate::types::NodeId;
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 /// Information about a voter in the cluster.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

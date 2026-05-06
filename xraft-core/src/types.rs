@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Unique numeric identifier for a node within a cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
