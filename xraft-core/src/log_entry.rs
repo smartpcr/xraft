@@ -1,48 +1,46 @@
-use serde::{Deserialize, Serialize};
-use crate::types::{Term, AppRecord};
+use crate::app_record::AppRecord;
+use crate::types::Term;
+use crate::voter::VotersRecord;
 
-/// Types of log entries.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Entry type discriminator.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum EntryType {
-    /// Application command (wraps an AppRecord).
     Command,
-    /// No-op entry appended by new leader at start of term.
     LeaderChangeMessage,
-    /// Membership change record.
     VotersRecord,
 }
 
-/// A single entry in the replicated log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A single log entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
-    /// Position in the log (0-indexed).
     pub offset: u64,
-    /// Term when the entry was created.
     pub term: Term,
-    /// Entry type discriminator.
     pub entry_type: EntryType,
-    /// Entry payload — for Command entries this is a serialized AppRecord.
-    pub data: Vec<u8>,
+    pub payload: Option<AppRecord>,
 }
 
 impl LogEntry {
-    /// Create a command log entry.
-    pub fn command(offset: u64, term: Term, record: &AppRecord) -> Self {
-        Self {
-            offset,
-            term,
-            entry_type: EntryType::Command,
-            data: record.data.clone(),
+    /// Decode a `VotersRecord` from a `VotersRecord`-typed entry's payload.
+    ///
+    /// Returns `None` if the entry is not a `VotersRecord` type or if the
+    /// payload is missing/malformed.
+    pub fn decode_voters_record(&self) -> Option<VotersRecord> {
+        match self.entry_type {
+            EntryType::VotersRecord => {
+                let payload = self.payload.as_ref()?;
+                serde_json::from_slice(&payload.data).ok()
+            }
+            _ => None,
         }
     }
 
-    /// Create a leader change message (no-op) log entry.
-    pub fn leader_change(offset: u64, term: Term) -> Self {
-        Self {
-            offset,
-            term,
-            entry_type: EntryType::LeaderChangeMessage,
-            data: Vec::new(),
+    /// For a `LeaderChangeMessage` entry, the entry's term **is** the
+    /// leader epoch (architecture §5.4 — a leader-change record is
+    /// committed at the start of a new leader's term).
+    pub fn leader_epoch(&self) -> Option<Term> {
+        match self.entry_type {
+            EntryType::LeaderChangeMessage => Some(self.term),
+            _ => None,
         }
     }
 }
