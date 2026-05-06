@@ -1,4 +1,6 @@
+use crate::types::NodeId;
 use std::fmt;
+use std::io;
 
 /// Public error type for xraft operations.
 #[derive(Debug)]

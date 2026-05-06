@@ -3,9 +3,13 @@ use std::path::PathBuf;
 /// Construction-time configuration for a Raft node.
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
+    /// Lower bound for randomised election timeout (default: 150ms).
     pub election_timeout_min: Duration,
+    /// Upper bound for randomised election timeout (default: 300ms).
     pub election_timeout_max: Duration,
+    /// Follower's periodic Fetch RPC interval (default: 50ms).
     pub fetch_interval: Duration,
+    /// Max entries drained from BatchAccumulator per tick (default: 256).
     pub max_batch_size: usize,
     pub max_fetch_bytes: u32,
     pub snapshot_interval: u64,
@@ -33,17 +37,19 @@ impl Default for RaftConfig {
 }
 
 impl RaftConfig {
-    /// Validates that timing constraints are consistent.
+    /// Validate timing invariants per architecture spec.
     pub fn validate(&self) -> Result<(), String> {
-        if self.election_timeout_min >= self.election_timeout_max {
-            return Err(
-                "election_timeout_min must be less than election_timeout_max".into(),
-            );
-        }
         if self.fetch_interval >= self.election_timeout_min {
-            return Err(
-                "fetch_interval must be less than election_timeout_min".into(),
-            );
+            return Err(format!(
+                "fetch_interval ({:?}) must be < election_timeout_min ({:?})",
+                self.fetch_interval, self.election_timeout_min
+            ));
+        }
+        if self.election_timeout_min >= self.election_timeout_max {
+            return Err(format!(
+                "election_timeout_min ({:?}) must be < election_timeout_max ({:?})",
+                self.election_timeout_min, self.election_timeout_max
+            ));
         }
         Ok(())
     }

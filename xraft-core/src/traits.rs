@@ -1,17 +1,25 @@
-use async_trait::async_trait;
-use crate::types::{NodeId, Term, AppRecord, AppSnapshot};
+use crate::app_record::{AppRecord, AppSnapshot};
+use crate::error::Result;
 use crate::log_entry::LogEntry;
 use crate::rpc::RpcEnvelope;
+use crate::snapshot::{Snapshot, SnapshotWriter};
+use crate::types::{NodeId, Term};
+use crate::rpc::SnapshotId;
+use async_trait::async_trait;
+use bytes::Bytes;
+use std::time::Duration;
+use tokio::time::Instant;
 
-/// Trait for log storage.
+/// Durable append-only log storage.
 #[async_trait]
 pub trait LogStore: Send + Sync + 'static {
-    async fn append(&self, entries: &[LogEntry]) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>, Box<dyn std::error::Error + Send + Sync>>;
-    async fn truncate_suffix(&self, from_offset: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn append(&self, entries: &[LogEntry]) -> Result<()>;
+    async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>>;
+    async fn truncate_suffix(&self, from_offset: u64) -> Result<()>;
+    async fn truncate_prefix(&self, up_to_offset: u64) -> Result<()>;
     fn log_start_offset(&self) -> u64;
     fn log_end_offset(&self) -> u64;
-    async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>>;
 }
 
 /// Durable, append-only log store.
