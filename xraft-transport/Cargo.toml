@@ -3,9 +3,10 @@ name = "xraft-transport"
 version = "0.1.0"
 edition.workspace = true
 
-[dependencies]
-xraft-core = { path = "../xraft-core" }
-serde = { version = "1", features = ["derive"] }
-
 [lints]
 workspace = true
+
+[dependencies]
+xraft-core = { path = "../xraft-core" }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"

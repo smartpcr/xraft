@@ -1,29 +1,25 @@
-use std::fmt;
+use thiserror::Error;
 
-/// Errors produced by xraft operations.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum XraftError {
+    #[error("storage error: {0}")]
     StorageError(String),
+
+    #[error("transport error: {0}")]
     TransportError(String),
+
+    #[error("not leader")]
     NotLeader,
+
+    #[error("proposal queue full")]
     ProposalQueueFull,
+
+    #[error("invalid cluster id")]
     InvalidClusterId,
+
+    #[error("shutdown")]
     Shutdown,
+
+    #[error("io error: {0}")]
+    IoError(#[from] std::io::Error),
 }
-
-impl fmt::Display for XraftError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            XraftError::StorageError(msg) => write!(f, "storage error: {msg}"),
-            XraftError::TransportError(msg) => write!(f, "transport error: {msg}"),
-            XraftError::NotLeader => write!(f, "not leader"),
-            XraftError::ProposalQueueFull => write!(f, "proposal queue full"),
-            XraftError::InvalidClusterId => write!(f, "invalid cluster id"),
-            XraftError::Shutdown => write!(f, "node shut down"),
-        }
-    }
-}
-
-impl std::error::Error for XraftError {}
-
-pub type Result<T> = std::result::Result<T, XraftError>;
