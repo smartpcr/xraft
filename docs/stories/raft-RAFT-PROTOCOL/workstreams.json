@@ -33,7 +33,7 @@
     "contentHash": "7c797f52941cd3cce176d7dfe1c66f58b035828ac94f8321990829a7f6b3fb2b",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-runtime",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-trait-definitions-storage-transport-runtime",
-    "status": "active"
+    "status": "review"
   },
   {
     "title": "Error Types and Configuration",
@@ -87,7 +87,7 @@
     "contentHash": "9e3028dd082589743856c443332137ab84761cda9bd90429408a4b7c0a7b6dc2",
     "workstreamId": "ws-raft-raft-protocol-phase-storage-layer-xraft-storage-stage-segment-log-read-and-truncation",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-storage-layer-xraft-storage-stage-segment-log-read-and-truncation",
-    "status": "active"
+    "status": "review"
   },
   {
     "title": "Quorum State File and Leader-Epoch Checkpoint",
@@ -105,7 +105,7 @@
     "contentHash": "9fdd95010497debbf10f1ddf00153510492362a869e641d9694895e1f0ef3f49",
     "workstreamId": "ws-raft-raft-protocol-phase-storage-layer-xraft-storage-stage-snapshot-store",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-storage-layer-xraft-storage-stage-snapshot-store",
-    "status": "active"
+    "status": "review"
   },
   {
     "title": "Storage Integration and \u0060StorageEngine\u0060 Facade",
@@ -114,7 +114,7 @@
     "contentHash": "fea289456c0194c44bf2911949e923c9097ee945170268e71a1444bd7816e4a0",
     "workstreamId": "ws-raft-raft-protocol-phase-storage-layer-xraft-storage-stage-storage-integration-and-storageengine-facade",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-storage-layer-xraft-storage-stage-storage-integration-and-storageengine-facade",
-    "status": "active"
+    "status": "review"
   },
   {
     "title": "RPC Codec and Channel Transport",
@@ -123,7 +123,7 @@
     "contentHash": "a9a562b6b6f8cc44de40a4c0f7a6e45da3184915a5a6f9f7a3144d1224f6256a",
     "workstreamId": "ws-raft-raft-protocol-phase-transport-layer-xraft-transport-stage-rpc-codec-and-channel-transport",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-transport-layer-xraft-transport-stage-rpc-codec-and-channel-transport",
-    "status": "active"
+    "status": "review"
   },
   {
     "title": "Network Simulator (Fault Injection)",
