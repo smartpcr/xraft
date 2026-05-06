@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use crate::types::{NodeId, Term};
+use crate::log_entry::LogEntry;
 
 use crate::log_entry::LogEntry;
 use crate::types::{NodeId, Term};
@@ -185,4 +187,35 @@ impl MembershipChangeResponse {
             error: Some(error),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchRequest {
+    pub replica_id: NodeId,
+    pub fetch_offset: u64,
+    pub last_fetched_epoch: u64,
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchResponse {
+    pub leader_id: NodeId,
+    pub leader_epoch: u64,
+    pub high_watermark: u64,
+    pub log_start_offset: u64,
+    pub entries: Vec<LogEntry>,
+    pub diverging_epoch: Option<DivergingEpoch>,
+    pub snapshot_id: Option<SnapshotId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DivergingEpoch {
+    pub epoch: u64,
+    pub end_offset: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotId {
+    pub end_offset: u64,
+    pub epoch: u64,
 }

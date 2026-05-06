@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::types::{Term, AppRecord};
 
 use crate::types::Term;
 use crate::voter::VotersRecord;
