@@ -168,7 +168,7 @@
     "contentHash": "4f75d312cac3118f47e1b6e9d4d8beb7ff14ea1d73f05044f90f45519506c405",
     "workstreamId": "ws-raft-raft-protocol-phase-election-and-leader-lifecycle-xraft-core-stage-pre-vote-protocol",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-election-and-leader-lifecycle-xraft-core-stage-pre-vote-protocol",
-    "status": "active"
+    "status": "complete"
   },
   {
     "title": "Check Quorum and Leader Step-Down",
@@ -186,7 +186,7 @@
     "contentHash": "fb3acaf13319f865c21529255c8b778bc5d36c163d3e09c5d85e5637ae87d925",
     "workstreamId": "ws-raft-raft-protocol-phase-pull-based-log-replication-xraft-core-stage-fetch-rpc-follower-side",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-pull-based-log-replication-xraft-core-stage-fetch-rpc-follower-side",
-    "status": "active"
+    "status": "complete"
   },
   {
     "title": "Fetch RPC \u2014 Leader Side",
@@ -231,7 +231,7 @@
     "contentHash": "5f713d00a225c43c60089fbd843a626bbc02c69fb9e9f695f0e0fd31d4c9e881",
     "workstreamId": "ws-raft-raft-protocol-phase-log-compaction-and-snapshot-transfer-xraft-core-stage-periodic-snapshotting-and-log-truncation",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-log-compaction-and-snapshot-transfer-xraft-core-stage-periodic-snapshotting-and-log-truncation",
-    "status": "active"
+    "status": "complete"
   },
   {
     "title": "Snapshot Transfer via FetchSnapshot RPC",
