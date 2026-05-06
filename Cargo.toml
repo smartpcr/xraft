@@ -1,8 +1,5 @@
 [workspace]
-members = [
-    "xraft-core",
-    "xraft-test",
-]
+members = ["xraft-core"]
 resolver = "2"
 
 [workspace.package]

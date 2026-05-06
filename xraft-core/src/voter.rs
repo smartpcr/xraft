@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Information about a voter in the cluster.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VoterInfo {
     pub node_id: u64,
     pub endpoint: String,

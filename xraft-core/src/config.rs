@@ -3,13 +3,9 @@ use std::path::PathBuf;
 /// Configuration for the Raft node.
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
-    /// Lower bound for randomised election timeout (default: 150ms).
-    pub election_timeout_min: Duration,
-    /// Upper bound for randomised election timeout (default: 300ms).
-    pub election_timeout_max: Duration,
-    /// Follower's periodic Fetch RPC interval (default: 50ms).
-    pub fetch_interval: Duration,
-    /// Max entries drained from BatchAccumulator per tick (default: 256).
+    pub election_timeout_min_ms: u64,
+    pub election_timeout_max_ms: u64,
+    pub fetch_interval_ms: u64,
     pub max_batch_size: usize,
     pub max_fetch_bytes: u32,
     pub snapshot_interval: u64,
@@ -23,7 +19,7 @@ impl Default for RaftConfig {
             election_timeout_max_ms: 300,
             fetch_interval_ms: 50,
             max_batch_size: 256,
-            max_fetch_bytes: 1024 * 1024,
+            max_fetch_bytes: 1024 * 1024, // 1 MiB
             snapshot_interval: 10_000,
             data_dir: PathBuf::from("data"),
         }
