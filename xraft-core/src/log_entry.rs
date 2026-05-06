@@ -8,16 +8,15 @@ use crate::types::{Offset, Term};
 pub enum EntryType {
     /// Application-level state machine command (wraps an `AppRecord`).
     Command,
-    /// No-op appended by new leader to establish commit state.
     LeaderChangeMessage,
     /// Encodes the complete new voter set for membership changes.
     VotersRecord,
 }
 
-/// A single entry in the replicated log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A single log entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
-    pub offset: Offset,
+    pub offset: u64,
     pub term: Term,
     /// Discriminator for entry content.
     pub entry_type: EntryType,
