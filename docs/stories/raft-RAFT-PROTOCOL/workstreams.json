@@ -42,7 +42,7 @@
     "contentHash": "e18f47f261cee34d8fcba596bc72495a725b0bd71c59cccdf23b691ad5e6c15d",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-error-types-and-configuration",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-error-types-and-configuration",
-    "status": "active"
+    "status": "complete"
   },
   {
     "title": "Listener Trait and ListenerEvent",
@@ -78,7 +78,7 @@
     "contentHash": "c7d56e4152015257a869603fab4433f0d3c32ee77cd129f1170ddae0cffaa247",
     "workstreamId": "ws-raft-raft-protocol-phase-storage-layer-xraft-storage-stage-segment-log-write-path",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-storage-layer-xraft-storage-stage-segment-log-write-path",
-    "status": "active"
+    "status": "complete"
   },
   {
     "title": "Segment Log \u2014 Read and Truncation",
@@ -159,7 +159,7 @@
     "contentHash": "0c5f925ef80eef1d15753ccb6d6e5d8c76bc5479dec07625ac67e3f9f9d4db11",
     "workstreamId": "ws-raft-raft-protocol-phase-election-and-leader-lifecycle-xraft-core-stage-election-manager-vote-request-response",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-election-and-leader-lifecycle-xraft-core-stage-election-manager-vote-request-response",
-    "status": "active"
+    "status": "complete"
   },
   {
     "title": "Pre-Vote Protocol",
@@ -249,7 +249,7 @@
     "contentHash": "0db39f6d35358ce21f5f656bf0c53142a7549bb7880d75c35205b740264fdc10",
     "workstreamId": "ws-raft-raft-protocol-phase-dynamic-quorum-membership-changes-stage-membership-manager-add-voter",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-dynamic-quorum-membership-changes-stage-membership-manager-add-voter",
-    "status": "active"
+    "status": "complete"
   },
   {
     "title": "Membership Manager \u2014 Remove Voter",
@@ -303,7 +303,7 @@
     "contentHash": "17620d0c4997b5da24c4d3bce204e3843eee55353cb280f35e2949609a76924a",
     "workstreamId": "ws-raft-raft-protocol-phase-integration-testing-and-scenario-validation-stage-replication-and-commit-scenario-tests",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-integration-testing-and-scenario-validation-stage-replication-and-commit-scenario-tests",
-    "status": "active"
+    "status": "complete"
   },
   {
     "title": "Partition, Snapshot, and Membership Scenario Tests",
