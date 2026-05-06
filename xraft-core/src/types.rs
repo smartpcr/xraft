@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Unique identifier for a node in the Raft cluster.
@@ -19,23 +18,13 @@ pub struct ClusterId(pub u64);
 
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "N{}", self.0)
-    }
-}
-
-/// Monotonically increasing logical clock identifying an election cycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
-pub struct Term(pub u64);
-
-impl Term {
-    pub fn next(self) -> Term {
-        Term(self.0 + 1)
+        write!(f, "Node({})", self.0)
     }
 }
 
 impl fmt::Display for Term {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "T{}", self.0)
+        write!(f, "Term({})", self.0)
     }
 }
 
