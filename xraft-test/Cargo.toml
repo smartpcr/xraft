@@ -1,12 +1,16 @@
 [package]
 name = "xraft-test"
-version = "0.1.0"
 edition.workspace = true
-
-[lints]
-workspace = true
+version.workspace = true
 
 [dependencies]
 xraft-core = { path = "../xraft-core" }
 xraft-storage = { path = "../xraft-storage" }
 xraft-transport = { path = "../xraft-transport" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
