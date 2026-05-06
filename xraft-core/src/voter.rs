@@ -1,16 +1,14 @@
 use crate::types::NodeId;
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 /// Information about a voter in the cluster.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VoterInfo {
     pub node_id: NodeId,
-    pub endpoint: SocketAddr,
+    pub endpoint: String,
 }
 
-/// Complete voter set record (not a delta).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A voters record, stored as a control entry in the log.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VotersRecord {
     pub version: u64,
     pub voters: Vec<VoterInfo>,

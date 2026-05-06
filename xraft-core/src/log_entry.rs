@@ -9,10 +9,10 @@ pub struct AppRecord {
     pub data: Bytes,
 }
 
-/// A single entry in the replicated log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A single log entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
-    pub offset: Offset,
+    pub offset: u64,
     pub term: Term,
     /// Discriminates command vs. control records.
     pub entry_type: EntryType,
