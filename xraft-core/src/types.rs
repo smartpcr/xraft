@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +21,16 @@ pub struct Offset(pub u64);
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Node({})", self.0)
+    }
+}
+
+/// Monotonically increasing logical clock (epoch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Term(pub u64);
+
+impl Term {
+    pub fn next(self) -> Term {
+        Term(self.0 + 1)
     }
 }
 
