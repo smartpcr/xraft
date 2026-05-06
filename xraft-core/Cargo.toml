@@ -1,0 +1,16 @@
+[package]
+name = "xraft-core"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bincode = "1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "serde"] }
