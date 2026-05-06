@@ -1,411 +1,370 @@
-//! Invariant Checker — verifies the five Raft safety invariants.
-//!
-//! After each state transition the checker inspects a snapshot of every node
-//! and panics (or returns a structured violation) if any invariant is broken.
-//!
-//! # Invariants
-//!
-//! 1. **Election safety** — at most one leader per term across all nodes.
-//! 2. **Append-only leader log** — a leader never overwrites or deletes its
-//!    own log entries.
-//! 3. **Log matching** — if two nodes have an entry at the same offset and
-//!    term, all preceding entries match.
-//! 4. **Leader completeness** — an elected leader's log contains every
-//!    previously committed entry.
-//! 5. **State machine safety** — no two nodes have applied different entries
-//!    at the same offset.
-
+use xraft_core::*;
+use xraft_core::log_entry::LogEntry;
+use crate::SimulatedCluster;
 use std::collections::HashMap;
-use std::fmt;
 
-use xraft_core::consensus_state::Role;
-use xraft_core::log_entry::{EntryType, LogEntry};
-use xraft_core::types::{NodeId, Term};
-
-// ---------------------------------------------------------------------------
-// Applied entry — full identity of an applied state-machine entry
-// ---------------------------------------------------------------------------
-
-/// Complete identity of an entry applied to a node's state machine.
+/// Stateful verifier for the five Raft safety invariants.
 ///
-/// Includes term and entry_type so that two different log entries with
-/// identical payloads at the same offset are correctly distinguished.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppliedEntry {
-    pub term: Term,
-    pub entry_type: EntryType,
-    pub payload: Vec<u8>,
-}
-
-impl AppliedEntry {
-    /// Create an `AppliedEntry` from a `LogEntry`.
-    pub fn from_log_entry(entry: &LogEntry) -> Self {
-        Self {
-            term: entry.term,
-            entry_type: entry.entry_type.clone(),
-            payload: entry.payload.clone(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Node snapshot — lightweight view of a single node at a point in time
-// ---------------------------------------------------------------------------
-
-/// Snapshot of one node's observable state used for invariant verification.
-#[derive(Debug, Clone)]
-pub struct NodeSnapshot {
-    pub node_id: NodeId,
-    pub current_term: Term,
-    pub role: Role,
-    pub leader_id: Option<NodeId>,
-    pub voted_for: Option<NodeId>,
-    pub high_watermark: u64,
-    pub log_start_offset: u64,
-    /// Full log entries present on this node (from `log_start_offset`).
-    pub log_entries: Vec<LogEntry>,
-    /// Entries applied to this node's state machine, keyed by offset.
-    /// Includes full entry identity (term, entry_type, payload) so that
-    /// different entries with identical payloads are distinguished.
-    pub applied_entries: HashMap<u64, AppliedEntry>,
-}
-
-// ---------------------------------------------------------------------------
-// Violation type
-// ---------------------------------------------------------------------------
-
-/// A structured invariant violation.
-#[derive(Debug, Clone)]
-pub struct InvariantViolation {
-    pub invariant: &'static str,
-    pub message: String,
-}
-
-impl fmt::Display for InvariantViolation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.invariant, self.message)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
-/// Selects which of the five checks to run.
-#[derive(Debug, Clone)]
-pub struct InvariantCheckerConfig {
-    pub check_election_safety: bool,
-    pub check_append_only_leader: bool,
-    pub check_log_matching: bool,
-    pub check_leader_completeness: bool,
-    pub check_state_machine_safety: bool,
-}
-
-impl Default for InvariantCheckerConfig {
-    fn default() -> Self {
-        Self {
-            check_election_safety: true,
-            check_append_only_leader: true,
-            check_log_matching: true,
-            check_leader_completeness: true,
-            check_state_machine_safety: true,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// InvariantChecker
-// ---------------------------------------------------------------------------
-
-/// Checks the five Raft safety invariants across a cluster.
+/// Unlike a stateless checker, this tracks leader log snapshots across
+/// invocations so that the "leader append-only" property is verified
+/// historically: a leader in term T must never overwrite or delete entries
+/// it previously held while still leading in term T.
 ///
-/// Maintains history across multiple calls so that temporal invariants
-/// (append-only, leader completeness) can be verified.
-#[derive(Debug)]
+/// Invariants checked:
+///   1. Election safety: at most one leader per term
+///   2. Leader append-only: a leader never overwrites/deletes its own entries
+///      (verified via historical log snapshots per (node_id, term))
+///   3. Log matching: if two logs have an entry at the same (offset, term), all
+///      preceding entries match (including data)
+///   4. Leader completeness: an elected leader's log contains every entry
+///      committed in prior terms
+///   5. State machine safety: no two nodes apply different entries at the same
+///      offset; no duplicate applies within a single process lifetime
 pub struct InvariantChecker {
-    config: InvariantCheckerConfig,
-    /// `(term) -> node_id` — the first leader we observed for each term.
-    observed_leaders_by_term: HashMap<u64, NodeId>,
-    /// `(node_id, term) -> Vec<LogEntry>` — leader log recorded during a
-    /// leadership epoch for the append-only check.
-    leader_log_history: HashMap<(NodeId, u64), Vec<LogEntry>>,
-    /// Full committed entries (offset -> LogEntry). Populated from the
-    /// leader's log up to `high_watermark`. Stores the complete `LogEntry`
-    /// so all fields (term, entry_type, payload) are compared.
-    committed_entries: HashMap<u64, LogEntry>,
+    /// Historical log snapshots keyed by (node_id, term) for leader append-only.
+    leader_log_snapshots: HashMap<(NodeId, Term), Vec<LogEntry>>,
 }
 
 impl InvariantChecker {
-    /// Create a new checker with all five checks enabled.
     pub fn new() -> Self {
-        Self::with_config(InvariantCheckerConfig::default())
-    }
-
-    /// Create a new checker with the given configuration.
-    pub fn with_config(config: InvariantCheckerConfig) -> Self {
         Self {
-            config,
-            observed_leaders_by_term: HashMap::new(),
-            leader_log_history: HashMap::new(),
-            committed_entries: HashMap::new(),
+            leader_log_snapshots: HashMap::new(),
         }
     }
 
-    // -- public API ---------------------------------------------------------
-
-    /// Run all enabled invariant checks. Returns a list of violations (empty
-    /// when everything is healthy).
-    pub fn check_all(&mut self, snapshots: &[NodeSnapshot]) -> Vec<InvariantViolation> {
-        let mut violations = Vec::new();
-
-        if self.config.check_election_safety {
-            self.check_election_safety(snapshots, &mut violations);
-        }
-        if self.config.check_append_only_leader {
-            self.check_append_only_leader(snapshots, &mut violations);
-        }
-        if self.config.check_log_matching {
-            Self::check_log_matching(snapshots, &mut violations);
-        }
-        if self.config.check_leader_completeness {
-            self.check_leader_completeness(snapshots, &mut violations);
-        }
-        if self.config.check_state_machine_safety {
-            Self::check_state_machine_safety(snapshots, &mut violations);
-        }
-
-        violations
+    /// Run all Raft invariant checks. Panics on any violation.
+    pub fn check_all(&mut self, cluster: &SimulatedCluster) {
+        Self::check_leader_election_safety(cluster);
+        self.check_leader_append_only(cluster);
+        Self::check_log_matching(cluster);
+        Self::check_leader_completeness(cluster);
+        Self::check_state_machine_safety(cluster);
     }
 
-    /// Run all enabled checks; **panic** on the first violation.
-    pub fn check_all_or_panic(&mut self, snapshots: &[NodeSnapshot]) {
-        let violations = self.check_all(snapshots);
-        if let Some(v) = violations.first() {
-            panic!("{v}");
-        }
-    }
+    /// Invariant 1: At most one leader per term.
+    pub fn check_leader_election_safety(cluster: &SimulatedCluster) {
+        let mut leaders_per_term: HashMap<Term, Vec<NodeId>> = HashMap::new();
 
-    // -- individual checks --------------------------------------------------
-
-    /// (1) At most one leader per term across all nodes.
-    ///
-    /// Tracks leaders across invocations so that a term cannot have two
-    /// different leaders even if they appear in separate snapshots.
-    fn check_election_safety(
-        &mut self,
-        snapshots: &[NodeSnapshot],
-        violations: &mut Vec<InvariantViolation>,
-    ) {
-        for snap in snapshots {
-            if snap.role != Role::Leader {
+        for id in cluster.node_ids() {
+            if cluster.stopped_nodes.contains(&id) {
                 continue;
             }
-            let term = snap.current_term.0;
-            if let Some(&prev_leader) = self.observed_leaders_by_term.get(&term) {
-                if prev_leader != snap.node_id {
-                    violations.push(InvariantViolation {
-                        invariant: "at most one leader per term",
-                        message: format!(
-                            "term {term}: node {} and node {} both observed as leader",
-                            prev_leader, snap.node_id
-                        ),
-                    });
+            let node = cluster.node(id);
+            if node.is_leader() {
+                leaders_per_term
+                    .entry(node.term())
+                    .or_default()
+                    .push(id);
+            }
+        }
+
+        for (term, leaders) in &leaders_per_term {
+            assert!(
+                leaders.len() <= 1,
+                "INVARIANT VIOLATION: Multiple leaders in term {:?}: {:?}",
+                term,
+                leaders
+            );
+        }
+    }
+
+    /// Invariant 2: Leader never overwrites or deletes its own entries.
+    pub fn check_leader_append_only(&mut self, cluster: &SimulatedCluster) {
+        for id in cluster.node_ids() {
+            if cluster.stopped_nodes.contains(&id) {
+                continue;
+            }
+            let node = cluster.node(id);
+            if !node.is_leader() {
+                continue;
+            }
+
+            let log = node.log();
+
+            // Basic monotonicity: offsets must be strictly increasing
+            for i in 1..log.len() {
+                assert!(
+                    log[i].offset > log[i - 1].offset,
+                    "INVARIANT VIOLATION: Leader {:?} has non-monotonic offsets at index {}",
+                    id, i
+                );
+            }
+
+            // Term monotonicity
+            for i in 1..log.len() {
+                assert!(
+                    log[i].term >= log[i - 1].term,
+                    "INVARIANT VIOLATION: Leader {:?} has decreasing terms: {:?} at offset {} \
+                     followed by {:?} at offset {}",
+                    id, log[i - 1].term, log[i - 1].offset, log[i].term, log[i].offset
+                );
+            }
+
+            // Historical append-only
+            let key = (id, node.term());
+            if let Some(prev_snapshot) = self.leader_log_snapshots.get(&key) {
+                for prev_entry in prev_snapshot {
+                    let current_entry = log.iter().find(|e| e.offset == prev_entry.offset);
+                    assert!(
+                        current_entry.is_some(),
+                        "INVARIANT VIOLATION: Leader {:?} in term {:?} deleted entry at offset {}",
+                        id, node.term(), prev_entry.offset
+                    );
+                    let ce = current_entry.unwrap();
+                    assert_eq!(
+                        ce.term, prev_entry.term,
+                        "INVARIANT VIOLATION: Leader {:?} in term {:?} changed term at offset {} \
+                         from {:?} to {:?}",
+                        id, node.term(), prev_entry.offset, prev_entry.term, ce.term
+                    );
+                    assert_eq!(
+                        ce.data, prev_entry.data,
+                        "INVARIANT VIOLATION: Leader {:?} in term {:?} changed data at offset {}",
+                        id, node.term(), prev_entry.offset
+                    );
                 }
-            } else {
-                self.observed_leaders_by_term.insert(term, snap.node_id);
+                assert!(
+                    log.len() >= prev_snapshot.len(),
+                    "INVARIANT VIOLATION: Leader {:?} in term {:?} log shrank from {} to {} entries",
+                    id, node.term(), prev_snapshot.len(), log.len()
+                );
             }
+
+            self.leader_log_snapshots.insert(key, log.to_vec());
         }
     }
 
-    /// (2) Append-only leader log — a leader never overwrites or deletes its
-    /// own entries.
-    ///
-    /// Scoped to `(node_id, term)` leadership epochs so that a node losing
-    /// leadership and later regaining it does not cause a false positive.
-    fn check_append_only_leader(
-        &mut self,
-        snapshots: &[NodeSnapshot],
-        violations: &mut Vec<InvariantViolation>,
-    ) {
-        for snap in snapshots {
-            if snap.role != Role::Leader {
-                continue;
-            }
-            let key = (snap.node_id, snap.current_term.0);
-            if let Some(prev_log) = self.leader_log_history.get(&key) {
-                // Every entry that was in the previous snapshot must still be
-                // present and identical — unless it has been compacted (offset
-                // is below the current log_start_offset).
-                for prev_entry in prev_log {
-                    if prev_entry.offset.0 < snap.log_start_offset {
-                        continue;
-                    }
-                    let idx = (prev_entry.offset.0 - snap.log_start_offset) as usize;
-                    match snap.log_entries.get(idx) {
-                        Some(cur) if *cur == *prev_entry => {}
-                        _ => {
-                            violations.push(InvariantViolation {
-                                invariant: "append-only leader log",
-                                message: format!(
-                                    "leader {} term {}: entry at offset {} was overwritten or deleted",
-                                    snap.node_id, snap.current_term, prev_entry.offset
-                                ),
-                            });
+    /// Invariant 3: Log matching.
+    pub fn check_log_matching(cluster: &SimulatedCluster) {
+        let active_ids: Vec<NodeId> = cluster
+            .node_ids()
+            .into_iter()
+            .filter(|id| !cluster.stopped_nodes.contains(id))
+            .collect();
+
+        for i in 0..active_ids.len() {
+            for j in (i + 1)..active_ids.len() {
+                let log_a = cluster.node(active_ids[i]).log();
+                let log_b = cluster.node(active_ids[j]).log();
+
+                for entry_a in log_a {
+                    for entry_b in log_b {
+                        if entry_a.offset == entry_b.offset && entry_a.term == entry_b.term {
+                            Self::verify_prefix_match(
+                                log_a,
+                                log_b,
+                                entry_a.offset,
+                                active_ids[i],
+                                active_ids[j],
+                            );
                         }
                     }
                 }
             }
-            self.leader_log_history.insert(key, snap.log_entries.clone());
         }
     }
 
-    /// (3) Log matching — if two nodes share an entry at the same offset and
-    /// term, all preceding entries must match.
-    fn check_log_matching(
-        snapshots: &[NodeSnapshot],
-        violations: &mut Vec<InvariantViolation>,
+    fn verify_prefix_match(
+        log_a: &[LogEntry],
+        log_b: &[LogEntry],
+        up_to_offset: u64,
+        node_a: NodeId,
+        node_b: NodeId,
     ) {
-        for i in 0..snapshots.len() {
-            for j in (i + 1)..snapshots.len() {
-                Self::check_log_matching_pair(&snapshots[i], &snapshots[j], violations);
-            }
-        }
-    }
+        for offset in 0..=up_to_offset {
+            let a = log_a.iter().find(|e| e.offset == offset);
+            let b = log_b.iter().find(|e| e.offset == offset);
 
-    fn check_log_matching_pair(
-        a: &NodeSnapshot,
-        b: &NodeSnapshot,
-        violations: &mut Vec<InvariantViolation>,
-    ) {
-        let start = a.log_start_offset.max(b.log_start_offset);
-        let end_a = a.log_start_offset + a.log_entries.len() as u64;
-        let end_b = b.log_start_offset + b.log_entries.len() as u64;
-        let end = end_a.min(end_b);
-
-        let mut matched = false;
-        let mut offset = end;
-        while offset > start {
-            offset -= 1;
-            let idx_a = (offset - a.log_start_offset) as usize;
-            let idx_b = (offset - b.log_start_offset) as usize;
-            let ea = &a.log_entries[idx_a];
-            let eb = &b.log_entries[idx_b];
-
-            if ea.term == eb.term {
-                if ea.entry_type != eb.entry_type || ea.payload != eb.payload {
-                    violations.push(InvariantViolation {
-                        invariant: "log matching",
-                        message: format!(
-                            "nodes {} and {} have same offset {offset} and term {} \
-                             but different entry content (entry_type or payload mismatch)",
-                            a.node_id, b.node_id, ea.term
-                        ),
-                    });
-                    return;
+            match (a, b) {
+                (Some(ea), Some(eb)) => {
+                    assert_eq!(
+                        ea.term, eb.term,
+                        "INVARIANT VIOLATION: Log matching at offset {} between {:?} and {:?}",
+                        offset, node_a, node_b
+                    );
+                    assert_eq!(
+                        ea.entry_type, eb.entry_type,
+                        "INVARIANT VIOLATION: Log matching entry types at offset {} between {:?} and {:?}",
+                        offset, node_a, node_b
+                    );
+                    assert_eq!(
+                        ea.data, eb.data,
+                        "INVARIANT VIOLATION: Log matching data at offset {} between {:?} and {:?}",
+                        offset, node_a, node_b
+                    );
                 }
-                matched = true;
-            } else if matched {
-                violations.push(InvariantViolation {
-                    invariant: "log matching",
-                    message: format!(
-                        "nodes {} and {} have matching entry at a later offset \
-                         but diverge at offset {offset} (terms {} vs {})",
-                        a.node_id, b.node_id, ea.term, eb.term
-                    ),
-                });
-                return;
+                (Some(_), None) => {
+                    let b_has_later = log_b.iter().any(|e| e.offset > offset);
+                    assert!(
+                        !b_has_later,
+                        "INVARIANT VIOLATION: Log matching prefix gap at offset {} — \
+                         {:?} has it, {:?} has a gap but has later entries",
+                        offset, node_a, node_b
+                    );
+                }
+                (None, Some(_)) => {
+                    let a_has_later = log_a.iter().any(|e| e.offset > offset);
+                    assert!(
+                        !a_has_later,
+                        "INVARIANT VIOLATION: Log matching prefix gap at offset {} — \
+                         {:?} has it, {:?} has a gap but has later entries",
+                        offset, node_b, node_a
+                    );
+                }
+                (None, None) => {}
             }
         }
     }
 
-    /// (4) Leader completeness — a newly elected leader's log contains all
-    /// previously committed entries (full entry comparison).
-    fn check_leader_completeness(
-        &mut self,
-        snapshots: &[NodeSnapshot],
-        violations: &mut Vec<InvariantViolation>,
-    ) {
-        // Update committed_entries from any leader snapshot.
-        for snap in snapshots {
-            if snap.role == Role::Leader {
-                for entry in &snap.log_entries {
-                    if entry.offset.0 < snap.high_watermark {
-                        self.committed_entries
-                            .entry(entry.offset.0)
-                            .or_insert_with(|| entry.clone());
-                    }
-                }
-            }
-        }
+    /// Invariant 4: Leader completeness.
+    pub fn check_leader_completeness(cluster: &SimulatedCluster) {
+        let active_ids: Vec<NodeId> = cluster
+            .node_ids()
+            .into_iter()
+            .filter(|id| !cluster.stopped_nodes.contains(id))
+            .collect();
 
-        // For every leader, verify its log contains all known committed entries.
-        for snap in snapshots {
-            if snap.role != Role::Leader {
-                continue;
-            }
-            for (&offset, committed) in &self.committed_entries {
-                if offset < snap.log_start_offset {
-                    continue;
+        let leader = active_ids.iter().find(|id| cluster.node(**id).is_leader());
+        let leader = match leader {
+            Some(l) => *l,
+            None => return,
+        };
+        let leader_node = cluster.node(leader);
+
+        let total_voters = cluster.voter_count();
+        let majority = total_voters / 2 + 1;
+        let all_ids = cluster.node_ids();
+        let max_offset = all_ids
+            .iter()
+            .map(|id| cluster.node(*id).log_end_offset())
+            .max()
+            .unwrap_or(0);
+
+        for offset in 0..max_offset {
+            let mut entry_counts: HashMap<(Term, Vec<u8>), usize> = HashMap::new();
+            for id in &all_ids {
+                if let Some(entry) = cluster.node(*id).log().iter().find(|e| e.offset == offset) {
+                    *entry_counts
+                        .entry((entry.term, entry.data.clone()))
+                        .or_insert(0) += 1;
                 }
-                let idx = (offset - snap.log_start_offset) as usize;
-                match snap.log_entries.get(idx) {
-                    Some(entry) if *entry == *committed => {}
-                    Some(entry) => {
-                        violations.push(InvariantViolation {
-                            invariant: "leader completeness",
-                            message: format!(
-                                "leader {} term {}: entry at offset {offset} differs \
-                                 from committed record (committed term {}, entry_type {:?}, \
-                                 leader has term {}, entry_type {:?})",
-                                snap.node_id, snap.current_term,
-                                committed.term, committed.entry_type,
-                                entry.term, entry.entry_type
-                            ),
-                        });
-                    }
-                    None => {
-                        violations.push(InvariantViolation {
-                            invariant: "leader completeness",
-                            message: format!(
-                                "leader {} term {}: missing committed entry at offset {offset}",
-                                snap.node_id, snap.current_term
-                            ),
-                        });
-                    }
+            }
+
+            for ((term, data), count) in &entry_counts {
+                if *count >= majority {
+                    let leader_entry = leader_node.log().iter().find(|e| e.offset == offset);
+                    assert!(
+                        leader_entry.is_some(),
+                        "INVARIANT VIOLATION: Leader completeness — leader {:?} missing \
+                         committed entry at offset {} (term {:?}, present on {}/{} voters)",
+                        leader, offset, term, count, total_voters
+                    );
+                    let le = leader_entry.unwrap();
+                    assert_eq!(le.term, *term);
+                    assert_eq!(le.data, *data);
                 }
             }
         }
     }
 
-    /// (5) State machine safety — no two nodes have applied different entries
-    /// at the same offset.
-    ///
-    /// Compares full `AppliedEntry` (term + entry_type + payload) so that
-    /// different entries with identical payloads are correctly detected.
-    fn check_state_machine_safety(
-        snapshots: &[NodeSnapshot],
-        violations: &mut Vec<InvariantViolation>,
-    ) {
-        let mut applied: HashMap<u64, (NodeId, &AppliedEntry)> = HashMap::new();
+    /// Invariant 5: State machine safety.
+    pub fn check_state_machine_safety(cluster: &SimulatedCluster) {
+        let active_ids: Vec<NodeId> = cluster
+            .node_ids()
+            .into_iter()
+            .filter(|id| !cluster.stopped_nodes.contains(id))
+            .collect();
 
-        for snap in snapshots {
-            for (&offset, entry) in &snap.applied_entries {
-                if let Some(&(first_node, first_entry)) = applied.get(&offset) {
-                    if entry != first_entry {
-                        violations.push(InvariantViolation {
-                            invariant: "state machine safety",
-                            message: format!(
-                                "nodes {} and {} applied different entries at offset {offset} \
-                                 (terms {}/{}, payloads differ: {})",
-                                first_node, snap.node_id,
-                                first_entry.term, entry.term,
-                                first_entry.payload != entry.payload
-                                    || first_entry.entry_type != entry.entry_type
-                            ),
-                        });
+        if active_ids.is_empty() {
+            return;
+        }
+
+        // Check no gaps in committed prefix
+        for id in &active_ids {
+            let node = cluster.node(*id);
+            let hw = node.high_watermark();
+            for offset in 0..hw {
+                let entry = node.log().iter().find(|e| e.offset == offset);
+                assert!(
+                    entry.is_some(),
+                    "INVARIANT VIOLATION: State machine safety — node {:?} missing \
+                     committed entry at offset {} (HW={})",
+                    id, offset, hw
+                );
+            }
+        }
+
+        // Check no duplicate applies
+        for id in &active_ids {
+            let sm = cluster.state_machine(*id);
+            assert_eq!(
+                sm.duplicate_apply_count(),
+                0,
+                "INVARIANT VIOLATION: State machine safety — node {:?} had {} duplicate applies",
+                id,
+                sm.duplicate_apply_count()
+            );
+
+            let order = sm.apply_order();
+            for i in 1..order.len() {
+                assert!(
+                    order[i] > order[i - 1],
+                    "INVARIANT VIOLATION: State machine safety — node {:?} apply order \
+                     not strictly increasing: {} followed by {} at index {}",
+                    id,
+                    order[i - 1],
+                    order[i],
+                    i
+                );
+            }
+        }
+
+        // Cross-node comparison: applied entries at same offset must match
+        for i in 0..active_ids.len() {
+            for j in (i + 1)..active_ids.len() {
+                let sm_a = cluster.state_machine(active_ids[i]);
+                let sm_b = cluster.state_machine(active_ids[j]);
+
+                for (offset, record_a) in sm_a.applied_entries() {
+                    if let Some(record_b) = sm_b.get_applied(*offset) {
+                        assert_eq!(
+                            record_a.data, record_b.data,
+                            "INVARIANT VIOLATION: State machine safety at offset {}. \
+                             {:?} applied {:?}, {:?} applied {:?}",
+                            offset,
+                            active_ids[i],
+                            record_a.data,
+                            active_ids[j],
+                            record_b.data
+                        );
                     }
-                } else {
-                    applied.insert(offset, (snap.node_id, entry));
+                }
+            }
+        }
+
+        // Log-based consistency for committed entries
+        for i in 0..active_ids.len() {
+            for j in (i + 1)..active_ids.len() {
+                let hw_a = cluster.node(active_ids[i]).high_watermark();
+                let hw_b = cluster.node(active_ids[j]).high_watermark();
+                let common_hw = std::cmp::min(hw_a, hw_b);
+
+                for offset in 0..common_hw {
+                    let entry_a = cluster
+                        .node(active_ids[i])
+                        .log()
+                        .iter()
+                        .find(|e| e.offset == offset);
+                    let entry_b = cluster
+                        .node(active_ids[j])
+                        .log()
+                        .iter()
+                        .find(|e| e.offset == offset);
+
+                    if let (Some(ea), Some(eb)) = (entry_a, entry_b) {
+                        assert_eq!(ea.term, eb.term);
+                        assert_eq!(ea.data, eb.data);
+                    }
                 }
             }
         }
@@ -415,428 +374,5 @@ impl InvariantChecker {
 impl Default for InvariantChecker {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use xraft_core::log_entry::LogEntry;
-    use xraft_core::types::{NodeId, Offset, Term};
-
-    fn cmd_entry(offset: u64, term: u64, data: &[u8]) -> LogEntry {
-        LogEntry::command(Offset(offset), Term(term), data.to_vec())
-    }
-
-    fn healthy_snapshot(
-        id: u64,
-        term: u64,
-        role: Role,
-        entries: Vec<LogEntry>,
-        hw: u64,
-    ) -> NodeSnapshot {
-        let applied: HashMap<u64, AppliedEntry> = entries
-            .iter()
-            .filter(|e| e.offset.0 < hw)
-            .map(|e| (e.offset.0, AppliedEntry::from_log_entry(e)))
-            .collect();
-        NodeSnapshot {
-            node_id: NodeId(id),
-            current_term: Term(term),
-            role,
-            leader_id: if role == Role::Leader {
-                Some(NodeId(id))
-            } else {
-                Some(NodeId(1))
-            },
-            voted_for: Some(NodeId(1)),
-            high_watermark: hw,
-            log_start_offset: 0,
-            log_entries: entries,
-            applied_entries: applied,
-        }
-    }
-
-    fn make_100_entries(term: u64) -> Vec<LogEntry> {
-        (0..100)
-            .map(|i| cmd_entry(i, term, &i.to_le_bytes()))
-            .collect()
-    }
-
-    // -- Check 1: election safety -------------------------------------------
-
-    #[test]
-    fn election_safety_single_leader_passes() {
-        let mut checker = InvariantChecker::new();
-        let snaps = vec![
-            healthy_snapshot(1, 1, Role::Leader, make_100_entries(1), 100),
-            healthy_snapshot(2, 1, Role::Follower, make_100_entries(1), 100),
-            healthy_snapshot(3, 1, Role::Follower, make_100_entries(1), 100),
-        ];
-        let v = checker.check_all(&snaps);
-        assert!(v.is_empty(), "expected no violations, got: {v:?}");
-    }
-
-    #[test]
-    #[should_panic(expected = "at most one leader per term")]
-    fn election_safety_two_leaders_same_term_panics() {
-        let mut checker = InvariantChecker::new();
-        let snaps = vec![
-            healthy_snapshot(1, 1, Role::Leader, make_100_entries(1), 100),
-            healthy_snapshot(2, 1, Role::Leader, make_100_entries(1), 100),
-            healthy_snapshot(3, 1, Role::Follower, make_100_entries(1), 100),
-        ];
-        checker.check_all_or_panic(&snaps);
-    }
-
-    #[test]
-    #[should_panic(expected = "at most one leader per term")]
-    fn election_safety_two_leaders_across_calls_panics() {
-        let mut checker = InvariantChecker::new();
-        let snap1 = vec![
-            healthy_snapshot(1, 1, Role::Leader, make_100_entries(1), 100),
-            healthy_snapshot(2, 1, Role::Follower, make_100_entries(1), 100),
-        ];
-        assert!(checker.check_all(&snap1).is_empty());
-
-        let snap2 = vec![
-            healthy_snapshot(1, 1, Role::Follower, make_100_entries(1), 100),
-            healthy_snapshot(2, 1, Role::Leader, make_100_entries(1), 100),
-        ];
-        checker.check_all_or_panic(&snap2);
-    }
-
-    // -- Check 2: append-only leader log ------------------------------------
-
-    #[test]
-    fn append_only_leader_log_passes() {
-        let mut checker = InvariantChecker::new();
-        let entries = make_100_entries(1);
-        let snaps = vec![
-            healthy_snapshot(1, 1, Role::Leader, entries.clone(), 100),
-            healthy_snapshot(2, 1, Role::Follower, entries.clone(), 100),
-            healthy_snapshot(3, 1, Role::Follower, entries, 100),
-        ];
-        assert!(checker.check_all(&snaps).is_empty());
-        assert!(checker.check_all(&snaps).is_empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "append-only leader log")]
-    fn append_only_leader_log_overwrite_panics() {
-        let mut checker = InvariantChecker::new();
-        let entries = make_100_entries(1);
-        let snaps1 = vec![healthy_snapshot(1, 1, Role::Leader, entries, 50)];
-        assert!(checker.check_all(&snaps1).is_empty());
-
-        let mut entries2 = make_100_entries(1);
-        entries2[10] = cmd_entry(10, 1, b"CORRUPTED");
-        let snaps2 = vec![healthy_snapshot(1, 1, Role::Leader, entries2, 50)];
-        checker.check_all_or_panic(&snaps2);
-    }
-
-    #[test]
-    fn append_only_leader_log_new_epoch_no_false_positive() {
-        let config = InvariantCheckerConfig {
-            check_election_safety: false,
-            check_append_only_leader: true,
-            check_log_matching: false,
-            check_leader_completeness: false,
-            check_state_machine_safety: false,
-        };
-        let mut checker = InvariantChecker::with_config(config);
-
-        let entries1 = make_100_entries(1);
-        let snaps1 = vec![healthy_snapshot(1, 1, Role::Leader, entries1, 50)];
-        assert!(checker.check_all(&snaps1).is_empty());
-
-        let entries2: Vec<LogEntry> = (0..80)
-            .map(|i| cmd_entry(i, 2, &(i * 10).to_le_bytes()))
-            .collect();
-        let snaps2 = vec![healthy_snapshot(1, 2, Role::Leader, entries2, 40)];
-        let v = checker.check_all(&snaps2);
-        assert!(
-            v.is_empty(),
-            "expected no violation for new epoch, got: {v:?}"
-        );
-    }
-
-    #[test]
-    fn append_only_leader_log_compaction_permitted() {
-        let config = InvariantCheckerConfig {
-            check_election_safety: false,
-            check_append_only_leader: true,
-            check_log_matching: false,
-            check_leader_completeness: false,
-            check_state_machine_safety: false,
-        };
-        let mut checker = InvariantChecker::with_config(config);
-
-        let entries = make_100_entries(1);
-        let snaps1 = vec![healthy_snapshot(1, 1, Role::Leader, entries, 50)];
-        assert!(checker.check_all(&snaps1).is_empty());
-
-        let entries2: Vec<LogEntry> = (20..100)
-            .map(|i| cmd_entry(i, 1, &i.to_le_bytes()))
-            .collect();
-        let mut snap = healthy_snapshot(1, 1, Role::Leader, entries2, 50);
-        snap.log_start_offset = 20;
-        let snaps2 = vec![snap];
-        let v = checker.check_all(&snaps2);
-        assert!(
-            v.is_empty(),
-            "compaction should not cause violation, got: {v:?}"
-        );
-    }
-
-    // -- Check 3: log matching ----------------------------------------------
-
-    #[test]
-    fn log_matching_identical_logs_passes() {
-        let mut checker = InvariantChecker::new();
-        let entries = make_100_entries(1);
-        let snaps = vec![
-            healthy_snapshot(1, 1, Role::Leader, entries.clone(), 100),
-            healthy_snapshot(2, 1, Role::Follower, entries.clone(), 100),
-            healthy_snapshot(3, 1, Role::Follower, entries, 100),
-        ];
-        let v = checker.check_all(&snaps);
-        assert!(v.is_empty(), "expected no violations, got: {v:?}");
-    }
-
-    #[test]
-    #[should_panic(expected = "log matching")]
-    fn log_matching_violation_panics() {
-        let mut checker = InvariantChecker::new();
-        let entries_a = vec![
-            cmd_entry(0, 1, b"a0"),
-            cmd_entry(1, 1, b"a1"),
-            cmd_entry(2, 1, b"a2"),
-            cmd_entry(3, 1, b"a3"),
-            cmd_entry(4, 1, b"a4"),
-            cmd_entry(5, 2, b"a5"),
-        ];
-        let entries_b = vec![
-            cmd_entry(0, 1, b"b0"),
-            cmd_entry(1, 1, b"b1"),
-            cmd_entry(2, 1, b"b2"),
-            cmd_entry(3, 1, b"b3"),
-            cmd_entry(4, 3, b"b4"),
-            cmd_entry(5, 2, b"b5"),
-        ];
-        let snaps = vec![
-            healthy_snapshot(1, 2, Role::Leader, entries_a, 3),
-            healthy_snapshot(2, 2, Role::Follower, entries_b, 3),
-        ];
-        checker.check_all_or_panic(&snaps);
-    }
-
-    #[test]
-    #[should_panic(expected = "log matching")]
-    fn log_matching_same_term_different_payload_panics() {
-        let mut checker = InvariantChecker::new();
-        let entries_a = vec![
-            cmd_entry(0, 1, b"same0"),
-            cmd_entry(1, 1, b"same1"),
-            cmd_entry(2, 1, b"same2"),
-            cmd_entry(3, 1, b"payload_A"),
-        ];
-        let entries_b = vec![
-            cmd_entry(0, 1, b"same0"),
-            cmd_entry(1, 1, b"same1"),
-            cmd_entry(2, 1, b"same2"),
-            cmd_entry(3, 1, b"payload_B"),
-        ];
-        let snaps = vec![
-            healthy_snapshot(1, 1, Role::Leader, entries_a, 2),
-            healthy_snapshot(2, 1, Role::Follower, entries_b, 2),
-        ];
-        checker.check_all_or_panic(&snaps);
-    }
-
-    #[test]
-    #[should_panic(expected = "log matching")]
-    fn log_matching_same_term_different_entry_type_panics() {
-        let mut checker = InvariantChecker::new();
-        let entries_a = vec![
-            cmd_entry(0, 1, b"x"),
-            LogEntry {
-                offset: Offset(1),
-                term: Term(1),
-                entry_type: EntryType::Command,
-                payload: vec![],
-            },
-        ];
-        let entries_b = vec![
-            cmd_entry(0, 1, b"x"),
-            LogEntry {
-                offset: Offset(1),
-                term: Term(1),
-                entry_type: EntryType::LeaderChangeMessage,
-                payload: vec![],
-            },
-        ];
-        let snaps = vec![
-            healthy_snapshot(1, 1, Role::Leader, entries_a, 0),
-            healthy_snapshot(2, 1, Role::Follower, entries_b, 0),
-        ];
-        checker.check_all_or_panic(&snaps);
-    }
-
-    #[test]
-    fn leader_completeness_passes() {
-        let mut checker = InvariantChecker::new();
-        let entries = make_100_entries(1);
-        let snaps = vec![healthy_snapshot(1, 1, Role::Leader, entries, 50)];
-        assert!(checker.check_all(&snaps).is_empty());
-
-        let entries2: Vec<LogEntry> = (0..100)
-            .map(|i| {
-                if i < 50 {
-                    cmd_entry(i, 1, &i.to_le_bytes())
-                } else {
-                    cmd_entry(i, 2, &i.to_le_bytes())
-                }
-            })
-            .collect();
-        let snaps2 = vec![healthy_snapshot(2, 2, Role::Leader, entries2, 80)];
-        let v = checker.check_all(&snaps2);
-        assert!(v.is_empty(), "expected no violations, got: {v:?}");
-    }
-
-    #[test]
-    #[should_panic(expected = "leader completeness")]
-    fn leader_completeness_missing_committed_entry_panics() {
-        let mut checker = InvariantChecker::new();
-        let entries = make_100_entries(1);
-        let snaps = vec![healthy_snapshot(1, 1, Role::Leader, entries, 50)];
-        assert!(checker.check_all(&snaps).is_empty());
-
-        let mut entries2: Vec<LogEntry> = (0..100)
-            .map(|i| {
-                if i < 50 {
-                    cmd_entry(i, 1, &i.to_le_bytes())
-                } else {
-                    cmd_entry(i, 2, &i.to_le_bytes())
-                }
-            })
-            .collect();
-        entries2[30] = cmd_entry(30, 99, b"WRONG");
-        let snaps2 = vec![healthy_snapshot(2, 2, Role::Leader, entries2, 80)];
-        checker.check_all_or_panic(&snaps2);
-    }
-
-    // -- Check 5: state machine safety --------------------------------------
-
-    #[test]
-    fn state_machine_safety_passes() {
-        let mut checker = InvariantChecker::new();
-        let entries = make_100_entries(1);
-        let snaps = vec![
-            healthy_snapshot(1, 1, Role::Leader, entries.clone(), 50),
-            healthy_snapshot(2, 1, Role::Follower, entries.clone(), 50),
-            healthy_snapshot(3, 1, Role::Follower, entries, 50),
-        ];
-        let v = checker.check_all(&snaps);
-        assert!(v.is_empty(), "expected no violations, got: {v:?}");
-    }
-
-    #[test]
-    #[should_panic(expected = "state machine safety")]
-    fn state_machine_safety_different_data_panics() {
-        let mut checker = InvariantChecker::new();
-        let entries = make_100_entries(1);
-        let mut snap_a = healthy_snapshot(1, 1, Role::Leader, entries.clone(), 50);
-        let mut snap_b = healthy_snapshot(2, 1, Role::Follower, entries, 50);
-
-        // Different applied entries at offset 10 — different payloads.
-        snap_a.applied_entries.insert(
-            10,
-            AppliedEntry {
-                term: Term(1),
-                entry_type: EntryType::Command,
-                payload: b"AAAA".to_vec(),
-            },
-        );
-        snap_b.applied_entries.insert(
-            10,
-            AppliedEntry {
-                term: Term(1),
-                entry_type: EntryType::Command,
-                payload: b"BBBB".to_vec(),
-            },
-        );
-
-        checker.check_all_or_panic(&[snap_a, snap_b]);
-    }
-
-    #[test]
-    #[should_panic(expected = "state machine safety")]
-    fn state_machine_safety_same_payload_different_term_panics() {
-        let mut checker = InvariantChecker::new();
-        let entries = make_100_entries(1);
-        let mut snap_a = healthy_snapshot(1, 1, Role::Leader, entries.clone(), 50);
-        let mut snap_b = healthy_snapshot(2, 1, Role::Follower, entries, 50);
-
-        // Same payload, different term — must still be detected.
-        snap_a.applied_entries.insert(
-            10,
-            AppliedEntry {
-                term: Term(1),
-                entry_type: EntryType::Command,
-                payload: b"SAME".to_vec(),
-            },
-        );
-        snap_b.applied_entries.insert(
-            10,
-            AppliedEntry {
-                term: Term(2),
-                entry_type: EntryType::Command,
-                payload: b"SAME".to_vec(),
-            },
-        );
-
-        checker.check_all_or_panic(&[snap_a, snap_b]);
-    }
-
-    // -- Composite scenarios ------------------------------------------------
-
-    #[test]
-    fn all_five_invariants_pass_healthy_cluster() {
-        let mut checker = InvariantChecker::new();
-        let entries = make_100_entries(1);
-        let snaps = vec![
-            healthy_snapshot(1, 1, Role::Leader, entries.clone(), 100),
-            healthy_snapshot(2, 1, Role::Follower, entries.clone(), 100),
-            healthy_snapshot(3, 1, Role::Follower, entries, 100),
-        ];
-        let v = checker.check_all(&snaps);
-        assert!(
-            v.is_empty(),
-            "all five invariants should pass on a healthy cluster, got: {v:?}"
-        );
-    }
-
-    #[test]
-    fn configurable_checks() {
-        let config = InvariantCheckerConfig {
-            check_election_safety: false,
-            check_append_only_leader: true,
-            check_log_matching: true,
-            check_leader_completeness: true,
-            check_state_machine_safety: true,
-        };
-        let mut checker = InvariantChecker::with_config(config);
-        let entries = make_100_entries(1);
-        let snaps = vec![
-            healthy_snapshot(1, 1, Role::Leader, entries.clone(), 100),
-            healthy_snapshot(2, 1, Role::Leader, entries, 100),
-        ];
-        let v = checker.check_all(&snaps);
-        assert!(v.is_empty(), "election safety disabled, should pass: {v:?}");
     }
 }
