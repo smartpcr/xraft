@@ -9,7 +9,6 @@ pub enum XraftError {
     ProposalQueueFull,
     InvalidClusterId,
     Shutdown,
-}
 
 impl fmt::Display for XraftError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
