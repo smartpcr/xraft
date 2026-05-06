@@ -1,7 +1,11 @@
 pub mod app_record;
 pub mod error;
+pub mod follower_progress;
+pub mod io_action;
 pub mod log_entry;
 pub mod rpc;
+pub mod snapshot;
+pub mod traits;
 pub mod types;
 pub mod voter;
 
