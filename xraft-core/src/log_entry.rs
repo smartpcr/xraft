@@ -1,0 +1,27 @@
+use serde::{Deserialize, Serialize};
+
+use crate::types::Term;
+
+/// Discriminates application records from consensus control records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntryType {
+    /// Application-level state machine command (wraps an AppRecord).
+    Command,
+    /// Appended by a new leader as the first entry of its term.
+    LeaderChangeMessage,
+    /// Encodes the complete new voter set after a membership change.
+    VotersRecord,
+}
+
+/// A single entry in the replicated log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogEntry {
+    /// Position in the log (0-indexed).
+    pub offset: u64,
+    /// Term when the entry was created.
+    pub term: Term,
+    /// Whether this is an application command or a control record.
+    pub entry_type: EntryType,
+    /// Serialised command or control record payload.
+    pub payload: Vec<u8>,
+}
