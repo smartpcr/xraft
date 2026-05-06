@@ -1,0 +1,9 @@
+[workspace]
+members = ["xraft-core", "xraft-test"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+
+[workspace.lints.clippy]
+all = "deny"
