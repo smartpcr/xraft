@@ -6,7 +6,7 @@ use crate::types::{ClusterId, NodeId, Term};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcEnvelope {
     pub cluster_id: ClusterId,
-    pub leader_epoch: Term,
+    pub leader_epoch: u64,
     pub source: NodeId,
     pub payload: RpcPayload,
 }
