@@ -1,12 +1,11 @@
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Opaque application command payload. xraft never interprets the contents.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppRecord {
-    pub data: Bytes,
+    pub data: bytes::Bytes,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Opaque application snapshot payload. xraft never interprets the contents.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppSnapshot {
     pub data: Vec<u8>,
 }
