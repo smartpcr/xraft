@@ -1,0 +1,16 @@
+[package]
+name = "xraft-test"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+xraft-core = { path = "../xraft-core" }
+tokio = { version = "1", features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
+async-trait = "0.1"
+bincode = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true
