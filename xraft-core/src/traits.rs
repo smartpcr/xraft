@@ -73,23 +73,34 @@ pub trait TransportSender: Send + Sync + 'static {
 /// reads from the network.
 #[async_trait]
 pub trait QuorumStateStore: Send + Sync + 'static {
-    async fn load(&self) -> Result<Option<QuorumState>>;
-    async fn save(&self, state: &QuorumState) -> Result<()>;
+    async fn load(&self) -> Result<Option<QuorumState>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn save(&self, state: &QuorumState) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
-/// Abstraction over time for the event loop.
-///
-/// Production: wraps `tokio::time`.
-/// Test: `SimulatedClock` with manual tick (in `xraft-test`).
-///
-/// Used directly by the EventLoop for timer management (election timeouts,
-/// check-quorum deadlines). Not mediated by `IoAction`.
-pub trait Clock: Send + 'static {
-    /// Current instant.
-    fn now(&self) -> Instant;
+/// Trait for sending RPCs to other nodes.
+#[async_trait]
+pub trait TransportSender: Send + Sync + 'static {
+    async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
 
-    /// Generate a random election timeout in [min, max].
-    fn random_election_timeout(&self) -> Duration;
+/// Trait for receiving RPCs from other nodes.
+#[async_trait]
+pub trait TransportReceiver: Send + 'static {
+    async fn recv(&mut self) -> Result<RpcEnvelope, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Deterministic clock for the event loop.
+#[async_trait]
+pub trait Clock: Send + 'static {
+    fn now_ms(&self) -> u64;
+    fn random_election_timeout_ms(&self) -> u64;
+}
+
+/// Application state machine.
+pub trait StateMachine: Send + 'static {
+    fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    fn snapshot(&self) -> Result<AppSnapshot, Box<dyn std::error::Error + Send + Sync>>;
+    fn restore(&mut self, snapshot: AppSnapshot) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ---------------------------------------------------------------------------

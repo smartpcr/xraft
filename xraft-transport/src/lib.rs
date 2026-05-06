@@ -1,4 +1,8 @@
-//! xraft-transport: Network transport for xraft.
+//! xraft-transport: Async RPC transport layer.
+//!
+//! Provides an in-process channel-based transport for testing and a module
+//! structure for future TCP-based production transport.
 
-mod channel;
-pub use channel::{ChannelTransport, RaftMessage};
+pub mod channel;
+
+pub use channel::{ChannelTransportSender, ChannelTransportReceiver, create_channel_network};
