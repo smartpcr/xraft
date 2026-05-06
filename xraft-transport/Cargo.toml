@@ -1,0 +1,13 @@
+[package]
+name = "xraft-transport"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+xraft-core = { path = "../xraft-core" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
