@@ -1,4 +1,4 @@
-use std::fmt;
+use thiserror::Error;
 
 /// Error types for the xraft system.
 #[derive(Debug)]

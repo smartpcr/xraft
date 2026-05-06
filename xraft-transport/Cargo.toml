@@ -11,3 +11,5 @@ workspace = true
 
 [dependencies]
 xraft-core = { path = "../xraft-core" }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
