@@ -1,0 +1,12 @@
+use serde::{Deserialize, Serialize};
+
+use crate::types::{NodeId, Term};
+
+/// Persisted quorum state (voted-for + term), fsync'd before responding to RPCs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuorumState {
+    pub current_term: Term,
+    pub voted_for: Option<NodeId>,
+    pub leader_id: Option<NodeId>,
+    pub leader_epoch: Term,
+}
