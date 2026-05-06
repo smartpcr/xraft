@@ -6,7 +6,7 @@
     "contentHash": "ca02a67d471a8c1825df416ee1044cebd5440a1ade39698c9fd00a908a26e6e0",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-cargo-workspace-and-root-configuration",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-cargo-workspace-and-root-configuration",
-    "status": "review"
+    "status": "complete"
   },
   {
     "title": "Core Domain Types in \u0060xraft-core\u0060",
@@ -141,7 +141,7 @@
     "contentHash": "b3906f0d3ecca4570022be298d5a9e3d80b8039be521ea4a2fde3d3561621094",
     "workstreamId": "ws-raft-raft-protocol-phase-transport-layer-xraft-transport-stage-tcp-transport-production",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-transport-layer-xraft-transport-stage-tcp-transport-production",
-    "status": "active"
+    "status": "complete"
   },
   {
     "title": "Event Loop Skeleton and Timer Infrastructure",
@@ -285,7 +285,7 @@
     "contentHash": "5fec0d59ed02ce12b054db0d98d2529264f155e8cfe08ac33592018e29968f10",
     "workstreamId": "ws-raft-raft-protocol-phase-test-harness-xraft-test-stage-invariant-checker",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-test-harness-xraft-test-stage-invariant-checker",
-    "status": "active"
+    "status": "complete"
   },
   {
     "title": "Election Scenario Tests",
