@@ -1,12 +1,28 @@
+use crate::log_entry::LogEntry;
+use crate::types::{ClusterId, NodeId, Term};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{NodeId, Offset, Term};
+/// Envelope wrapping every RPC with identity and fencing fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RpcEnvelope {
+    pub cluster_id: ClusterId,
+    pub leader_epoch: Term,
+    pub source: NodeId,
+    pub payload: RpcPayload,
+}
 
-/// Request sent by a candidate to request a vote (or pre-vote) from a peer.
-///
-/// When `is_pre_vote` is `true`, the `term` field carries the *prospective*
-/// next term (`current_term + 1`). The candidate has NOT yet incremented its
-/// own term or persisted any state — this is a speculative viability check.
+/// All RPC message types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RpcPayload {
+    VoteRequest(VoteRequest),
+    VoteResponse(VoteResponse),
+    FetchRequest(FetchRequest),
+    FetchResponse(FetchResponse),
+    FetchSnapshotRequest(FetchSnapshotRequest),
+    FetchSnapshotResponse(FetchSnapshotResponse),
+}
+
+/// Election request (also used for Pre-Vote).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoteRequest {
     pub term: Term,
@@ -16,10 +32,7 @@ pub struct VoteRequest {
     pub is_pre_vote: bool,
 }
 
-/// Response to a `VoteRequest`.
-///
-/// For pre-vote responses, the voter does NOT update its own term or
-/// `voted_for` — no durable state is mutated.
+/// Election response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoteResponse {
     pub term: Term,
@@ -27,15 +40,68 @@ pub struct VoteResponse {
     pub is_pre_vote: bool,
 }
 
-/// Response from a leader to a follower's Fetch RPC.
-///
-/// Followers use the `leader_id` and `term` fields to track the last
-/// valid leader contact, which gates pre-vote rejection (the leader
-/// lease check). This is the primary mechanism through which followers
-/// learn that a leader is alive.
+/// Pull-based log replication request from follower to leader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchRequest {
+    /// Follower/observer sending the request.
+    pub replica_id: NodeId,
+    /// Next offset the follower wants to read (= follower's log_end_offset).
+    pub fetch_offset: u64,
+    /// Epoch of the follower's last log entry.
+    pub last_fetched_epoch: Term,
+    /// Maximum response payload size.
+    pub max_bytes: u32,
+}
+
+/// Leader's response to a Fetch request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchResponse {
     pub term: Term,
     pub leader_id: NodeId,
-    pub high_watermark: Offset,
+    pub leader_epoch: Term,
+    /// Exclusive upper bound: entries with offset < HW are committed.
+    pub high_watermark: u64,
+    /// Leader's log start (after compaction).
+    pub log_start_offset: u64,
+    /// Log entries starting at the requested fetch_offset.
+    pub entries: Vec<LogEntry>,
+    /// Set when log divergence is detected.
+    pub diverging_epoch: Option<DivergingEpoch>,
+    /// Set when fetch_offset < log_start_offset (need snapshot).
+    pub snapshot_id: Option<SnapshotId>,
+}
+
+/// Instructs follower to truncate to resolve divergence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DivergingEpoch {
+    /// The epoch where divergence was found.
+    pub epoch: Term,
+    /// The offset to truncate to.
+    pub end_offset: u64,
+}
+
+/// Identifies a snapshot for transfer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotId {
+    /// Last offset included in snapshot.
+    pub end_offset: u64,
+    /// Term of last entry in snapshot.
+    pub epoch: Term,
+}
+
+/// Snapshot transfer request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchSnapshotRequest {
+    pub snapshot_id: SnapshotId,
+    pub position: u64,
+    pub max_bytes: u32,
+}
+
+/// Snapshot transfer response chunk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchSnapshotResponse {
+    pub snapshot_id: SnapshotId,
+    pub position: u64,
+    pub data: bytes::Bytes,
+    pub is_last_chunk: bool,
 }

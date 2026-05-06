@@ -28,6 +28,16 @@ impl fmt::Display for Term {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 pub struct Offset(pub u64);
 
-/// Unique cluster identifier.
+/// Cluster identity for RPC fencing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClusterId(pub uuid::Uuid);
+
+impl Default for ClusterId {
+    fn default() -> Self {
+        ClusterId(uuid::Uuid::new_v4())
+    }
+}
+
+/// Log position (0-indexed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+pub struct Offset(pub u64);
