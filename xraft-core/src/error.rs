@@ -10,7 +10,9 @@ pub enum XraftError {
     TransportError(io::Error),
     NotLeader { leader_id: Option<NodeId> },
     ProposalQueueFull,
+    /// RPC cluster_id mismatch.
     InvalidClusterId,
+    /// Node is shutting down; no new operations accepted.
     Shutdown,
 }
 

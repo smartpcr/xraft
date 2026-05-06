@@ -8,3 +8,15 @@ workspace = true
 
 [dependencies]
 xraft-core = { path = "../xraft-core" }
+bincode = "1"
+crc32c = "0.6"
+tokio = { version = "1", features = ["sync"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true
