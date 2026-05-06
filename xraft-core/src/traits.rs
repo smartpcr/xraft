@@ -1,3 +1,4 @@
+use crate::quorum_state::QuorumState;
 use async_trait::async_trait;
 use std::io;
 
