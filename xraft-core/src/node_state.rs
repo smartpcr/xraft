@@ -1,636 +1,528 @@
 use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use crate::types::{NodeId, Term, Role, VoterInfo, AppRecord};
+use crate::log_entry::{LogEntry, EntryType};
+use crate::rpc::*;
+use crate::consensus_state::ConsensusState;
 
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-
-use crate::log_entry::{EntryType, LogEntry};
-use crate::types::{NodeId, Term};
-use crate::voter::{Endpoint, VoterInfo, VotersRecord};
-
-/// The four node roles in xraft (architecture §2.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Role {
-    /// Initial state before bootstrap/recovery; terminal state for removed voters.
-    Unattached,
-    /// Follower replicating from the leader.
-    Follower,
-    /// Candidate running an election.
-    Candidate,
-    /// Leader serving client requests and replicating to followers.
-    Leader,
-}
-
-/// Tracks a VotersRecord that has been appended but not yet committed.
-///
-/// While pending, HW advancement for entries at or after `offset` uses
-/// `voters` instead of the committed voter set.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingMembershipChange {
-    /// Log offset of the uncommitted VotersRecord.
-    pub offset: u64,
-    /// The proposed new voter set.
-    pub voters: Vec<VoterInfo>,
-    /// The node that was promoted from observer to pending voter.
-    /// Used to restore observer state if the VotersRecord is truncated.
-    pub promoted_node_id: NodeId,
-    /// Endpoint of the promoted node (for restoration on truncation).
-    pub promoted_endpoint: Endpoint,
-}
-
-/// Per-follower/observer replication progress tracked by the leader
-/// (architecture §3.2 `FollowerProgress`).
+/// Per-follower replication progress tracked by the leader.
 #[derive(Debug, Clone)]
 pub struct FollowerProgress {
     pub node_id: NodeId,
-    /// Next offset the follower wants to read (= follower's log_end_offset).
-    /// The follower has replicated entries `[0, fetch_offset)`.
     pub fetch_offset: u64,
-    /// Whether this node counts toward quorum (voter vs observer).
-    /// Observers replicate via Fetch but their fetch_offset is excluded
-    /// from HW calculation (architecture §5.4).
-    pub is_voter: bool,
+    pub last_fetch_time_ms: u64,
 }
 
-/// Error type for LogStore operations.
+/// Leader epoch checkpoint entry — maps an epoch (term) to the log offset
+/// where that epoch begins.
 #[derive(Debug, Clone)]
-pub struct LogStoreError {
-    pub message: String,
+pub struct EpochEntry {
+    pub epoch: u64,
+    pub start_offset: u64,
 }
 
-impl fmt::Display for LogStoreError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LogStoreError: {}", self.message)
-    }
-}
-
-impl std::error::Error for LogStoreError {}
-
-impl LogStoreError {
-    pub fn new(msg: impl Into<String>) -> Self {
-        Self {
-            message: msg.into(),
-        }
-    }
-}
-
-/// Trait abstracting the replicated log store (architecture §4.1).
-///
-/// All mutating methods take `&self` — implementations use interior
-/// mutability (e.g. `tokio::sync::Mutex`) consistent with `Send + Sync`.
-/// The `IoStage` holds an owned `Box<dyn LogStore>` and invokes it via
-/// `&self` concurrently with other I/O traits via `tokio::join!`.
-#[async_trait]
-pub trait LogStore: Send + Sync + 'static {
-    /// Append entries. Must fsync before returning Ok.
-    async fn append(&self, entries: &[LogEntry]) -> Result<(), LogStoreError>;
-
-    /// Read entries in [start_offset, end_offset).
-    async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>, LogStoreError>;
-
-    /// Truncate the log suffix starting at the given offset (for divergence).
-    async fn truncate_suffix(&self, from_offset: u64) -> Result<(), LogStoreError>;
-
-    /// Truncate the log prefix up to the given offset (after snapshot).
-    async fn truncate_prefix(&self, up_to_offset: u64) -> Result<(), LogStoreError>;
-
-    /// The first offset still in the log.
-    fn log_start_offset(&self) -> u64;
-
-    /// The next offset to be written.
-    fn log_end_offset(&self) -> u64;
-
-    /// Read the entry at the given offset.
-    async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>, LogStoreError>;
-
-    /// Scan uncommitted entries (from `high_watermark` to end) for a VotersRecord.
-    async fn has_uncommitted_voters_record(&self, high_watermark: u64) -> Result<bool, LogStoreError>;
-}
-
-/// In-memory log store implementing the async `LogStore` trait.
-///
-/// Uses `tokio::sync::Mutex` for interior mutability and atomics for
-/// offset tracking, consistent with the `Send + Sync + 'static` bound.
-pub struct InMemoryLog {
-    entries: Mutex<Vec<LogEntry>>,
-    start_offset: AtomicU64,
-    end_offset: AtomicU64,
-}
-
-impl fmt::Debug for InMemoryLog {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InMemoryLog")
-            .field("start_offset", &self.start_offset.load(Ordering::SeqCst))
-            .field("end_offset", &self.end_offset.load(Ordering::SeqCst))
-            .finish()
-    }
-}
-
-impl Default for InMemoryLog {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl InMemoryLog {
-    pub fn new() -> Self {
-        Self {
-            entries: Mutex::new(Vec::new()),
-            start_offset: AtomicU64::new(0),
-            end_offset: AtomicU64::new(0),
-        }
-    }
-
-    /// Set the start offset for testing purposes (simulating log compaction).
-    #[cfg(test)]
-    pub fn set_start_offset_for_test(&self, offset: u64) {
-        self.start_offset.store(offset, Ordering::SeqCst);
-    }
-}
-
-#[async_trait]
-impl LogStore for InMemoryLog {
-    async fn append(&self, entries: &[LogEntry]) -> Result<(), LogStoreError> {
-        let mut log = self.entries.lock().unwrap();
-        for entry in entries {
-            log.push(entry.clone());
-        }
-        if let Some(last) = entries.last() {
-            self.end_offset.store(last.offset + 1, Ordering::SeqCst);
-        }
-        Ok(())
-    }
-
-    async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>, LogStoreError> {
-        let log = self.entries.lock().unwrap();
-        let result = log
-            .iter()
-            .filter(|e| e.offset >= start_offset && e.offset < end_offset)
-            .cloned()
-            .collect();
-        Ok(result)
-    }
-
-    async fn truncate_suffix(&self, from_offset: u64) -> Result<(), LogStoreError> {
-        let mut log = self.entries.lock().unwrap();
-        log.retain(|e| e.offset < from_offset);
-        let new_end = log.last().map(|e| e.offset + 1).unwrap_or(0);
-        self.end_offset.store(new_end, Ordering::SeqCst);
-        Ok(())
-    }
-
-    async fn truncate_prefix(&self, up_to_offset: u64) -> Result<(), LogStoreError> {
-        let mut log = self.entries.lock().unwrap();
-        log.retain(|e| e.offset >= up_to_offset);
-        self.start_offset.store(up_to_offset, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn log_start_offset(&self) -> u64 {
-        self.start_offset.load(Ordering::SeqCst)
-    }
-
-    fn log_end_offset(&self) -> u64 {
-        self.end_offset.load(Ordering::SeqCst)
-    }
-
-    async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>, LogStoreError> {
-        let log = self.entries.lock().unwrap();
-        Ok(log.iter().find(|e| e.offset == offset).cloned())
-    }
-
-    async fn has_uncommitted_voters_record(&self, high_watermark: u64) -> Result<bool, LogStoreError> {
-        let log = self.entries.lock().unwrap();
-        Ok(log
-            .iter()
-            .filter(|e| e.offset >= high_watermark)
-            .any(|e| e.entry_type == EntryType::VotersRecord))
-    }
-}
-
-/// Synchronous log operations used by the `MembershipManager`.
-///
-/// The async `LogStore` trait is designed for the I/O stage where fsync
-/// and network I/O are involved. The `MembershipManager` operates on
-/// in-memory state within the event loop and needs synchronous access.
-/// Append is fallible so that storage errors can be surfaced to the
-/// caller (e.g. `handle_add_voter`) without panicking.
-pub trait SyncLogOps: Send + Sync {
-    /// Append a single entry to the log. Returns an error if the
-    /// underlying storage cannot persist the entry.
-    fn append_entry(&self, entry: LogEntry) -> Result<(), LogStoreError>;
-
-    /// Check for uncommitted VotersRecord entries at or past `high_watermark`.
-    fn has_uncommitted_voters_record_sync(&self, high_watermark: u64) -> bool;
-
-    /// Read up to `max_entries` starting at `from_offset`.
-    fn read_entries(&self, from_offset: u64, max_entries: usize) -> Vec<LogEntry>;
-
-    /// Read entries starting at `from_offset`, respecting both `max_entries`
-    /// and `max_bytes` limits. Entries are included until either limit is
-    /// reached. If `max_bytes` is 0, only `max_entries` is enforced.
-    fn read_entries_bounded(
-        &self,
-        from_offset: u64,
-        max_entries: usize,
-        max_bytes: u32,
-    ) -> Vec<LogEntry>;
-
-    /// The next offset to be written.
-    fn end_offset(&self) -> u64;
-
-    /// The first offset still in the log (after compaction/snapshot).
-    fn start_offset(&self) -> u64;
-
-    /// Return the term of the entry at the given offset, or None if absent.
-    fn entry_term_at(&self, offset: u64) -> Option<Term>;
-
-    /// Find the end offset of a given epoch (term) in the log.
-    /// Returns the offset of the first entry with a term > `epoch`,
-    /// i.e., the exclusive upper bound of entries with that epoch.
-    fn epoch_end_offset(&self, epoch: Term) -> u64;
-
-    /// Truncate the log suffix starting at the given offset.
-    fn truncate_suffix_sync(&self, from_offset: u64);
-}
-
-impl SyncLogOps for InMemoryLog {
-    fn append_entry(&self, entry: LogEntry) -> Result<(), LogStoreError> {
-        let mut log = self.entries.lock().unwrap();
-        let next_offset = entry.offset + 1;
-        log.push(entry);
-        self.end_offset.store(next_offset, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn has_uncommitted_voters_record_sync(&self, high_watermark: u64) -> bool {
-        let log = self.entries.lock().unwrap();
-        log.iter()
-            .filter(|e| e.offset >= high_watermark)
-            .any(|e| e.entry_type == EntryType::VotersRecord)
-    }
-
-    fn read_entries(&self, from_offset: u64, max_entries: usize) -> Vec<LogEntry> {
-        let log = self.entries.lock().unwrap();
-        log.iter()
-            .filter(|e| e.offset >= from_offset)
-            .take(max_entries)
-            .cloned()
-            .collect()
-    }
-
-    fn read_entries_bounded(
-        &self,
-        from_offset: u64,
-        max_entries: usize,
-        max_bytes: u32,
-    ) -> Vec<LogEntry> {
-        let log = self.entries.lock().unwrap();
-        let mut result = Vec::new();
-        let mut total_bytes: u64 = 0;
-        for entry in log.iter().filter(|e| e.offset >= from_offset) {
-            if result.len() >= max_entries {
-                break;
-            }
-            // Approximate entry size: payload + fixed overhead for offset/term/type
-            let entry_size = entry.payload.len() as u64 + 24;
-            if max_bytes > 0 && total_bytes + entry_size > max_bytes as u64 && !result.is_empty() {
-                break;
-            }
-            total_bytes += entry_size;
-            result.push(entry.clone());
-        }
-        result
-    }
-
-    fn end_offset(&self) -> u64 {
-        self.end_offset.load(Ordering::SeqCst)
-    }
-
-    fn start_offset(&self) -> u64 {
-        self.start_offset.load(Ordering::SeqCst)
-    }
-
-    fn entry_term_at(&self, offset: u64) -> Option<Term> {
-        let log = self.entries.lock().unwrap();
-        log.iter().find(|e| e.offset == offset).map(|e| e.term)
-    }
-
-    fn epoch_end_offset(&self, epoch: Term) -> u64 {
-        let log = self.entries.lock().unwrap();
-        // Find the first entry with term > epoch, return its offset.
-        // If no such entry exists, return end_offset.
-        for entry in log.iter() {
-            if entry.term > epoch && entry.offset > 0 {
-                return entry.offset;
-            }
-        }
-        self.end_offset.load(Ordering::SeqCst)
-    }
-
-    fn truncate_suffix_sync(&self, from_offset: u64) {
-        let mut log = self.entries.lock().unwrap();
-        log.retain(|e| e.offset < from_offset);
-        let new_end = log.last().map(|e| e.offset + 1).unwrap_or(0);
-        self.end_offset.store(new_end, Ordering::SeqCst);
-    }
-}
-
-/// Public read projection of consensus state (architecture §5.11).
-///
-/// Returned by `RaftNode::read()` via a `tokio::sync::watch` channel.
-/// Contains only the committed voter set — pending membership changes
-/// are not visible until committed.
-#[derive(Debug, Clone)]
-pub struct ConsensusState {
-    pub node_id: NodeId,
-    pub current_term: Term,
-    pub role: Role,
-    pub leader_id: Option<NodeId>,
-    pub log_end_offset: u64,
-    pub high_watermark: u64,
-    /// The committed voter set — updated only when a VotersRecord commits.
-    /// Elections, Check Quorum, and external queries all use this set.
-    pub voter_set: Vec<VoterInfo>,
-}
-
-/// Full internal protocol state (pub(crate) in production, pub here for testing).
-///
-/// The public `ConsensusState` returned by `read()` is a separate, smaller
-/// projection — see architecture §3.2.
+/// Full internal protocol state of a Raft node.
 #[derive(Debug)]
 pub struct NodeState {
     pub node_id: NodeId,
     pub current_term: Term,
+    pub voted_for: Option<NodeId>,
     pub role: Role,
     pub leader_id: Option<NodeId>,
 
-    // Log boundaries
-    pub log_end_offset: u64,
-    /// Exclusive upper bound of committed offsets: entries with offset < HW
-    /// are committed.
+    // Log — in-memory for deterministic testing; production uses LogStore trait
+    pub log: Vec<LogEntry>,
+    pub log_start_offset: u64,
     pub high_watermark: u64,
 
-    // Voter set (from latest COMMITTED VotersRecord)
+    // Voter set
     pub voter_set: Vec<VoterInfo>,
 
-    // Observers (non-voting, replicating via Fetch)
-    pub observers: HashSet<NodeId>,
-    /// Network endpoints for registered observers. Preserved so that a
-    /// truncated VotersRecord can restore the promoted node's endpoint.
-    pub observer_endpoints: HashMap<NodeId, Endpoint>,
+    // Leader-only state
+    pub follower_progress: HashMap<NodeId, FollowerProgress>,
 
-    // Pending membership change (at most one)
-    pub pending_membership_change: Option<PendingMembershipChange>,
+    // Election state
+    pub votes_received: HashSet<NodeId>,
+    pub pre_votes_received: HashSet<NodeId>,
+    pub election_deadline_ms: u64,
+    pub check_quorum_deadline_ms: u64,
+    pub last_heard_from_leader_ms: u64,
 
-    // Leader-only: per-follower replication progress
-    pub follower_state: HashMap<NodeId, FollowerProgress>,
+    // Leader epoch checkpoint: ordered list of (epoch, start_offset).
+    // Maintained by ALL nodes — followers record epoch transitions when
+    // receiving entries from a new leader term; leaders record when
+    // they append their LeaderChangeMessage.
+    pub leader_epoch_checkpoint: Vec<EpochEntry>,
+
+    // State machine applied offset
+    pub last_applied: u64,
 }
 
 impl NodeState {
-    /// Create a new NodeState for a leader with the given voter set.
-    pub fn new_leader(node_id: NodeId, term: Term, voter_set: Vec<VoterInfo>) -> Self {
-        let mut follower_state = HashMap::new();
-        for voter in &voter_set {
-            if voter.node_id != node_id {
-                follower_state.insert(
-                    voter.node_id,
-                    FollowerProgress {
-                        node_id: voter.node_id,
-                        fetch_offset: 0,
-                        is_voter: true,
-                    },
-                );
-            }
-        }
-
-        NodeState {
+    pub fn new(node_id: NodeId, voter_set: Vec<VoterInfo>) -> Self {
+        Self {
             node_id,
-            current_term: term,
-            role: Role::Leader,
-            leader_id: Some(node_id),
-            log_end_offset: 0,
+            current_term: Term(0),
+            voted_for: None,
+            role: Role::Unattached,
+            leader_id: None,
+            log: Vec::new(),
+            log_start_offset: 0,
             high_watermark: 0,
             voter_set,
-            observers: HashSet::new(),
-            observer_endpoints: HashMap::new(),
-            pending_membership_change: None,
-            follower_state,
+            follower_progress: HashMap::new(),
+            votes_received: HashSet::new(),
+            pre_votes_received: HashSet::new(),
+            election_deadline_ms: 0,
+            check_quorum_deadline_ms: 0,
+            last_heard_from_leader_ms: 0,
+            leader_epoch_checkpoint: Vec::new(),
+            last_applied: 0,
         }
     }
 
-    /// Project the internal state into a `ConsensusState` for external
-    /// consumption. The event loop calls this after every state mutation
-    /// and publishes the result via a `tokio::sync::watch` channel.
+    /// Get current log_end_offset (next offset to be appended).
+    pub fn log_end_offset(&self) -> u64 {
+        if self.log.is_empty() {
+            self.log_start_offset
+        } else {
+            self.log.last().unwrap().offset + 1
+        }
+    }
+
+    /// Get the term of the last log entry (or Term(0) if empty).
+    pub fn last_log_term(&self) -> Term {
+        self.log.last().map(|e| e.term).unwrap_or(Term(0))
+    }
+
+    /// Get the offset of the last log entry (or 0 if empty).
+    pub fn last_log_offset(&self) -> u64 {
+        if self.log.is_empty() {
+            0
+        } else {
+            self.log.last().unwrap().offset
+        }
+    }
+
+    /// Append entries to the log, tracking epoch transitions.
+    pub fn append_entries(&mut self, entries: Vec<LogEntry>) {
+        for entry in entries {
+            self.maybe_record_epoch(&entry);
+            self.log.push(entry);
+        }
+    }
+
+    /// Append a single entry and return its offset.
+    pub fn append_entry(&mut self, mut entry: LogEntry) -> u64 {
+        let offset = self.log_end_offset();
+        entry.offset = offset;
+        self.maybe_record_epoch(&entry);
+        self.log.push(entry);
+        offset
+    }
+
+    /// Record an epoch boundary if this entry starts a new epoch.
+    fn maybe_record_epoch(&mut self, entry: &LogEntry) {
+        let prev_term = self.log.last().map(|e| e.term.0).unwrap_or(0);
+        if entry.term.0 != prev_term || self.leader_epoch_checkpoint.is_empty() {
+            // Avoid duplicate epoch entries for the same epoch
+            if self.leader_epoch_checkpoint.last().map(|e| e.epoch) != Some(entry.term.0) {
+                self.leader_epoch_checkpoint.push(EpochEntry {
+                    epoch: entry.term.0,
+                    start_offset: entry.offset,
+                });
+            }
+        }
+    }
+
+    /// Read entries from [start, end) exclusive.
+    pub fn read_entries(&self, start: u64, end: u64) -> Vec<LogEntry> {
+        self.log.iter()
+            .filter(|e| e.offset >= start && e.offset < end)
+            .cloned()
+            .collect()
+    }
+
+    /// Truncate log from the given offset onward (for divergence resolution).
+    /// Clamps the truncation point to max(from_offset, high_watermark) to
+    /// prevent truncating committed entries. If from_offset < high_watermark,
+    /// the truncation is safely clamped rather than panicking.
+    pub fn truncate_suffix(&mut self, from_offset: u64) {
+        // Clamp to protect committed and applied entries
+        let safe_offset = from_offset
+            .max(self.high_watermark)
+            .max(self.last_applied);
+
+        self.log.retain(|e| e.offset < safe_offset);
+        // Remove epoch checkpoint entries at or beyond the truncation point
+        self.leader_epoch_checkpoint
+            .retain(|e| e.start_offset < safe_offset);
+    }
+
+    /// Get entry at a specific offset.
+    pub fn entry_at(&self, offset: u64) -> Option<&LogEntry> {
+        self.log.iter().find(|e| e.offset == offset)
+    }
+
+    /// Become a candidate and start election.
+    pub fn start_election(&mut self, now_ms: u64, election_timeout_ms: u64) {
+        self.current_term = self.current_term.next();
+        self.role = Role::Candidate;
+        self.voted_for = Some(self.node_id);
+        self.leader_id = None;
+        self.votes_received.clear();
+        self.votes_received.insert(self.node_id);
+        self.election_deadline_ms = now_ms + election_timeout_ms;
+    }
+
+    /// Become leader.
+    pub fn become_leader(&mut self, now_ms: u64, check_quorum_interval_ms: u64) {
+        self.role = Role::Leader;
+        self.leader_id = Some(self.node_id);
+        self.follower_progress.clear();
+        self.check_quorum_deadline_ms = now_ms + check_quorum_interval_ms;
+
+        // Initialize follower progress for all voters except self
+        for voter in &self.voter_set {
+            if voter.node_id != self.node_id {
+                self.follower_progress.insert(voter.node_id, FollowerProgress {
+                    node_id: voter.node_id,
+                    fetch_offset: 0,
+                    last_fetch_time_ms: now_ms,
+                });
+            }
+        }
+
+        // Append LeaderChangeMessage (no-op) as first entry of new term.
+        // The epoch checkpoint is recorded via maybe_record_epoch.
+        let offset = self.log_end_offset();
+        let entry = LogEntry::leader_change(offset, self.current_term);
+        self.maybe_record_epoch(&entry);
+        self.log.push(entry);
+    }
+
+    /// Become follower for the given term.
+    pub fn become_follower(&mut self, term: Term, leader_id: Option<NodeId>, now_ms: u64, election_timeout_ms: u64) {
+        self.current_term = term;
+        self.role = Role::Follower;
+        self.leader_id = leader_id;
+        self.voted_for = None;
+        self.votes_received.clear();
+        self.follower_progress.clear();
+        self.election_deadline_ms = now_ms + election_timeout_ms;
+        self.last_heard_from_leader_ms = now_ms;
+    }
+
+    /// Step down to Unattached (used when leader fails quorum check).
+    pub fn step_down(&mut self) {
+        self.role = Role::Unattached;
+        self.leader_id = None;
+        self.follower_progress.clear();
+    }
+
+    /// Propose a command — leader only.
+    pub fn propose(&mut self, record: &AppRecord) -> Option<u64> {
+        if self.role != Role::Leader {
+            return None;
+        }
+        let offset = self.log_end_offset();
+        let entry = LogEntry::command(offset, self.current_term, record);
+        self.log.push(entry);
+        Some(offset)
+    }
+
+    /// Handle a Vote request and return the response.
+    pub fn handle_vote_request(&mut self, req: &VoteRequest, now_ms: u64, election_timeout_ms: u64) -> VoteResponse {
+        // Step down if request has higher term
+        if req.term > self.current_term {
+            self.become_follower(req.term, None, now_ms, election_timeout_ms);
+        }
+
+        let mut vote_granted = false;
+
+        if req.term >= self.current_term {
+            let can_vote = self.voted_for.is_none() || self.voted_for == Some(req.candidate_id);
+            let log_ok = req.last_log_term > self.last_log_term()
+                || (req.last_log_term == self.last_log_term() && req.last_log_offset >= self.last_log_offset());
+
+            if can_vote && log_ok {
+                self.voted_for = Some(req.candidate_id);
+                self.current_term = req.term;
+                vote_granted = true;
+                self.election_deadline_ms = now_ms + election_timeout_ms;
+            }
+        }
+
+        VoteResponse {
+            term: self.current_term,
+            vote_granted,
+            is_pre_vote: req.is_pre_vote,
+        }
+    }
+
+    /// Handle a Vote response. Returns true if we won the election.
+    pub fn handle_vote_response(&mut self, resp: &VoteResponse, from: NodeId, now_ms: u64, election_timeout_ms: u64, check_quorum_ms: u64) -> bool {
+        if resp.term > self.current_term {
+            self.become_follower(resp.term, None, now_ms, election_timeout_ms);
+            return false;
+        }
+
+        if self.role != Role::Candidate {
+            return false;
+        }
+
+        if resp.vote_granted {
+            self.votes_received.insert(from);
+        }
+
+        let majority = self.voter_set.len() / 2 + 1;
+        if self.votes_received.len() >= majority {
+            self.become_leader(now_ms, check_quorum_ms);
+            return true;
+        }
+        false
+    }
+
+    /// Handle a Fetch request from a follower — leader side.
+    /// Returns a FetchResponse.
+    ///
+    /// Processing order per architecture §4.1:
+    /// 1. Validate divergence BEFORE recording follower progress
+    /// 2. Update follower progress only after divergence validation passes
+    /// 3. Advance high watermark
+    /// 4. Return entries + HW
+    pub fn handle_fetch_request(&mut self, req: &FetchRequest, now_ms: u64) -> FetchResponse {
+        // Check for log divergence FIRST — do not let a divergent follower's
+        // advertised fetch_offset influence HW calculation.
+        if let Some(diverging) = self.check_divergence(req.last_fetched_epoch, req.fetch_offset) {
+            return FetchResponse {
+                leader_id: self.node_id,
+                leader_epoch: self.current_term.0,
+                high_watermark: self.high_watermark,
+                log_start_offset: self.log_start_offset,
+                entries: vec![],
+                diverging_epoch: Some(diverging),
+                snapshot_id: None,
+            };
+        }
+
+        // Only update follower progress AFTER divergence validation passes
+        if let Some(progress) = self.follower_progress.get_mut(&req.replica_id) {
+            progress.fetch_offset = req.fetch_offset;
+            progress.last_fetch_time_ms = now_ms;
+        }
+
+        // Advance high watermark before responding
+        self.advance_high_watermark();
+
+        // Read entries starting from fetch_offset
+        let entries = self.read_entries(req.fetch_offset, self.log_end_offset());
+
+        FetchResponse {
+            leader_id: self.node_id,
+            leader_epoch: self.current_term.0,
+            high_watermark: self.high_watermark,
+            log_start_offset: self.log_start_offset,
+            entries,
+            diverging_epoch: None,
+            snapshot_id: None,
+        }
+    }
+
+    /// Check for log divergence against leader-epoch checkpoint.
+    /// Returns a `DivergingEpoch` if the follower's last fetched epoch
+    /// does not match the leader's epoch history at that offset range.
+    ///
+    /// Handles the same-epoch extra-tail case: if the follower claims an
+    /// epoch that IS the leader's latest epoch but fetch_offset exceeds the
+    /// leader's LEO, the follower has entries from a stale leader in the
+    /// same term — truncate to the leader's LEO.
+    fn check_divergence(&self, last_fetched_epoch: u64, fetch_offset: u64) -> Option<DivergingEpoch> {
+        if last_fetched_epoch == 0 || self.leader_epoch_checkpoint.is_empty() {
+            return None;
+        }
+
+        // Find the epoch boundary for last_fetched_epoch
+        let mut epoch_end = None;
+        let mut found = false;
+        for i in 0..self.leader_epoch_checkpoint.len() {
+            if self.leader_epoch_checkpoint[i].epoch == last_fetched_epoch {
+                found = true;
+                // The epoch ends where the next epoch starts
+                if i + 1 < self.leader_epoch_checkpoint.len() {
+                    epoch_end = Some(self.leader_epoch_checkpoint[i + 1].start_offset);
+                } else {
+                    // This IS the latest epoch on the leader.
+                    // The epoch extends to the leader's LEO.
+                    epoch_end = Some(self.log_end_offset());
+                }
+                break;
+            } else if self.leader_epoch_checkpoint[i].epoch > last_fetched_epoch {
+                // This epoch never existed on the leader — the follower has entries
+                // from a term the leader doesn't know about. Truncate to this
+                // epoch's start offset.
+                epoch_end = Some(self.leader_epoch_checkpoint[i].start_offset);
+                break;
+            }
+        }
+
+        // If the epoch wasn't found and no higher epoch exists, the follower
+        // is at an epoch beyond the leader's knowledge — divergence at LEO
+        if !found && epoch_end.is_none() {
+            return Some(DivergingEpoch {
+                epoch: last_fetched_epoch,
+                end_offset: self.log_end_offset(),
+            });
+        }
+
+        if let Some(end) = epoch_end {
+            if fetch_offset > end {
+                return Some(DivergingEpoch {
+                    epoch: last_fetched_epoch,
+                    end_offset: end,
+                });
+            }
+        }
+
+        None
+    }
+
+    /// Handle a Fetch response on the follower side.
+    /// Returns the number of new entries actually appended.
+    pub fn handle_fetch_response(&mut self, resp: &FetchResponse, now_ms: u64, election_timeout_ms: u64) -> usize {
+        // Reject stale responses from old terms
+        if resp.leader_epoch < self.current_term.0 {
+            return 0;
+        }
+
+        // Step up to leader's term if higher
+        if resp.leader_epoch > self.current_term.0 {
+            self.become_follower(
+                Term(resp.leader_epoch),
+                Some(resp.leader_id),
+                now_ms,
+                election_timeout_ms,
+            );
+        } else {
+            // Same term — validate leader identity
+            if self.leader_id.is_some() && self.leader_id != Some(resp.leader_id) {
+                return 0; // conflicting leader in same term
+            }
+            self.leader_id = Some(resp.leader_id);
+            self.last_heard_from_leader_ms = now_ms;
+            self.election_deadline_ms = now_ms + election_timeout_ms;
+            // Ensure we're a follower (not candidate/unattached) when receiving
+            // a valid response at our term
+            if self.role != Role::Follower {
+                self.role = Role::Follower;
+            }
+        }
+
+        // Handle divergence — truncate our log
+        if let Some(ref div) = resp.diverging_epoch {
+            self.truncate_suffix(div.end_offset);
+            return 0;
+        }
+
+        // Check for conflicting entries in the overlap range and truncate
+        // at the first conflict. This is a safety net even if epoch-based
+        // divergence detection misses an edge case.
+        for entry in &resp.entries {
+            if let Some(local) = self.log.iter().find(|e| e.offset == entry.offset) {
+                if local.term != entry.term || local.data != entry.data {
+                    // Conflict detected — truncate from this offset
+                    self.truncate_suffix(entry.offset);
+                    break;
+                }
+            }
+        }
+
+        // Append new entries, tracking epoch transitions
+        let mut appended = 0usize;
+        for entry in &resp.entries {
+            if entry.offset >= self.log_end_offset() {
+                self.maybe_record_epoch(entry);
+                self.log.push(entry.clone());
+                appended += 1;
+            }
+        }
+
+        // Update high watermark from leader's HW, constrained to our log end
+        // (follower should not claim HW beyond entries it actually has)
+        let effective_hw = std::cmp::min(resp.high_watermark, self.log_end_offset());
+        if effective_hw > self.high_watermark {
+            self.high_watermark = effective_hw;
+        }
+
+        appended
+    }
+
+    /// Advance HW based on majority replication — leader only.
+    /// Uses the canonical algorithm: sort all voters' fetch_offsets descending,
+    /// pick index ⌊V/2⌋.
+    pub fn advance_high_watermark(&mut self) {
+        if self.role != Role::Leader {
+            return;
+        }
+
+        let mut offsets: Vec<u64> = Vec::new();
+
+        // Leader's own log_end_offset
+        offsets.push(self.log_end_offset());
+
+        // Each follower's fetch_offset
+        for progress in self.follower_progress.values() {
+            offsets.push(progress.fetch_offset);
+        }
+
+        // Sort descending
+        offsets.sort_unstable_by(|a, b| b.cmp(a));
+
+        let voter_count = offsets.len();
+        if voter_count == 0 {
+            return;
+        }
+
+        // Majority index: ⌊V/2⌋ (0-indexed)
+        let majority_index = voter_count / 2;
+        let candidate = offsets[majority_index];
+
+        // HW never decreases
+        if candidate > self.high_watermark {
+            self.high_watermark = candidate;
+        }
+    }
+
+    /// Apply committed entries to the state machine.
+    /// Returns the AppRecords that were applied.
+    pub fn get_committable_entries(&self) -> Vec<(u64, AppRecord)> {
+        let mut results = Vec::new();
+        for entry in &self.log {
+            if entry.offset >= self.last_applied && entry.offset < self.high_watermark {
+                if entry.entry_type == EntryType::Command {
+                    results.push((entry.offset, AppRecord { data: entry.data.clone() }));
+                }
+            }
+        }
+        results
+    }
+
+    /// Mark entries as applied up to the given offset.
+    pub fn mark_applied(&mut self, up_to: u64) {
+        if up_to > self.last_applied {
+            self.last_applied = up_to;
+        }
+    }
+
+    /// Create a public ConsensusState projection.
     pub fn to_consensus_state(&self) -> ConsensusState {
         ConsensusState {
             node_id: self.node_id,
             current_term: self.current_term,
             role: self.role,
             leader_id: self.leader_id,
-            log_end_offset: self.log_end_offset,
+            log_end_offset: self.log_end_offset(),
             high_watermark: self.high_watermark,
             voter_set: self.voter_set.clone(),
         }
-    }
-
-    /// Check if a node is in the committed voter set.
-    pub fn is_voter(&self, node_id: NodeId) -> bool {
-        self.voter_set.iter().any(|v| v.node_id == node_id)
-    }
-
-    /// Check if a node is a registered observer.
-    pub fn is_observer(&self, node_id: NodeId) -> bool {
-        self.observers.contains(&node_id)
-    }
-
-    /// Get the voter set that should be used for HW advancement at the
-    /// given offset. If a pending membership change exists and the offset
-    /// is at or after the VotersRecord's offset, use the pending voter set.
-    pub fn effective_voter_set_for_hw(&self, offset: u64) -> &[VoterInfo] {
-        if let Some(ref pending) = self.pending_membership_change {
-            if offset >= pending.offset {
-                return &pending.voters;
-            }
-        }
-        &self.voter_set
-    }
-
-    /// Compute the majority offset for a given voter set.
-    ///
-    /// HW = sorted descending fetch_offsets of voters, pick index ⌊V/2⌋.
-    /// Only voters contribute. The leader's own offset counts.
-    fn compute_hw_with_voters(&self, voters: &[VoterInfo], log_end_offset: u64) -> u64 {
-        let mut offsets: Vec<u64> = voters
-            .iter()
-            .map(|v| {
-                if v.node_id == self.node_id {
-                    log_end_offset
-                } else {
-                    self.follower_state
-                        .get(&v.node_id)
-                        .map(|fp| fp.fetch_offset)
-                        .unwrap_or(0)
-                }
-            })
-            .collect();
-
-        offsets.sort_unstable();
-        offsets.reverse();
-
-        let majority_idx = offsets.len() / 2; // ⌊V/2⌋ (0-indexed)
-        offsets.get(majority_idx).copied().unwrap_or(0)
-    }
-
-    /// Compute the high watermark using dual-quorum semantics (§5.5).
-    ///
-    /// When a pending VotersRecord exists at offset P:
-    /// - Entries before P require a majority of the **committed** voter set.
-    /// - Entries at or after P require a majority of the **new** voter set.
-    pub fn compute_high_watermark(&self, log_end_offset: u64) -> u64 {
-        match &self.pending_membership_change {
-            None => self.compute_hw_with_voters(&self.voter_set, log_end_offset),
-            Some(pending) => {
-                // Phase 1: entries before VotersRecord use committed voter set
-                let hw_committed =
-                    self.compute_hw_with_voters(&self.voter_set, log_end_offset);
-
-                if hw_committed < pending.offset {
-                    // Committed voters haven't reached VotersRecord yet.
-                    return hw_committed;
-                }
-
-                // Phase 2: entries at/after VotersRecord use the new voter set
-                let hw_new =
-                    self.compute_hw_with_voters(&pending.voters, log_end_offset);
-
-                // New quorum determines advancement at/past VotersRecord offset.
-                hw_new.max(pending.offset)
-            }
-        }
-    }
-
-    /// Finalize a pending membership change (called when the VotersRecord
-    /// is committed). Atomically replaces the committed voter set and
-    /// clears the pending change.
-    ///
-    /// After this call:
-    /// - `voter_set` contains the new voter set
-    /// - The promoted node participates in elections and Check Quorum
-    /// - `to_consensus_state()` returns the updated voter set
-    /// - `election_voter_set()` includes the new voter
-    /// - `check_quorum_voter_set()` includes the new voter
-    pub fn commit_membership_change(&mut self) {
-        if let Some(pending) = self.pending_membership_change.take() {
-            self.voter_set = pending.voters;
-            // Mark the promoted node as a voter in follower tracking
-            if let Some(fp) = self.follower_state.get_mut(&pending.promoted_node_id) {
-                fp.is_voter = true;
-            }
-            // Clean up observer endpoint entry (node is now a full voter)
-            self.observer_endpoints.remove(&pending.promoted_node_id);
-        }
-    }
-
-    /// Returns the voter set used for elections (Vote/PreVote RPCs).
-    ///
-    /// Always returns the **committed** voter set — pending membership
-    /// changes do NOT affect election quorum until committed (§5.5).
-    pub fn election_voter_set(&self) -> &[VoterInfo] {
-        &self.voter_set
-    }
-
-    /// Returns the voter set used for Check Quorum validation.
-    ///
-    /// Always the **committed** voter set — the leader must receive
-    /// Fetch requests from a majority of committed voters within the
-    /// election timeout to maintain leadership (architecture §5.8).
-    pub fn check_quorum_voter_set(&self) -> &[VoterInfo] {
-        &self.voter_set
-    }
-
-    /// Validate Check Quorum: returns true if the leader has received
-    /// recent Fetch requests from a majority of the committed voter set.
-    ///
-    /// `recent_fetchers` is the set of node IDs that have sent a Fetch
-    /// request within the election timeout window.
-    pub fn check_quorum_met(&self, recent_fetchers: &HashSet<NodeId>) -> bool {
-        let voters = self.check_quorum_voter_set();
-        let mut count = 0usize;
-        for v in voters {
-            if v.node_id == self.node_id || recent_fetchers.contains(&v.node_id) {
-                count += 1;
-            }
-        }
-        count > voters.len() / 2
-    }
-
-    /// Determine if a VoteRequest should be granted based on the
-    /// committed voter set. Only nodes in the committed voter set
-    /// can vote or stand for election.
-    pub fn can_vote_for(&self, candidate_id: NodeId) -> bool {
-        self.voter_set.iter().any(|v| v.node_id == candidate_id)
-    }
-
-    /// Apply a committed VotersRecord control entry from the replicated log.
-    ///
-    /// Called by the event loop on ALL nodes (leader, follower, observer) when
-    /// HW advances past a VotersRecord entry. The `record` parameter is
-    /// deserialized from the committed log entry's payload.
-    ///
-    /// On the **leader**, a `pending_membership_change` already exists and is
-    /// committed (voter set replaced, pending cleared, promoted node marked).
-    ///
-    /// On **followers/observers**, no local `pending_membership_change` exists.
-    /// The voter set is replaced directly from the deserialized `VotersRecord`,
-    /// and `FollowerProgress` entries are updated to reflect the new voter
-    /// membership.
-    pub fn apply_voters_record_from_log(&mut self, record: &VotersRecord) {
-        if let Some(pending) = self.pending_membership_change.take() {
-            // Leader path: commit the pending change (which matches the record)
-            self.voter_set = pending.voters;
-            if let Some(fp) = self.follower_state.get_mut(&pending.promoted_node_id) {
-                fp.is_voter = true;
-            }
-            self.observer_endpoints.remove(&pending.promoted_node_id);
-        } else {
-            // Follower/observer path: apply the VotersRecord from the log directly.
-            // Determine which nodes are new voters vs removed voters.
-            let old_voter_ids: std::collections::HashSet<NodeId> =
-                self.voter_set.iter().map(|v| v.node_id).collect();
-            let new_voter_ids: std::collections::HashSet<NodeId> =
-                record.voters.iter().map(|v| v.node_id).collect();
-
-            // Mark newly added voters in follower_state
-            for vid in new_voter_ids.difference(&old_voter_ids) {
-                // Remove from observers if present (promoted)
-                self.observers.remove(vid);
-                self.observer_endpoints.remove(vid);
-
-                if let Some(fp) = self.follower_state.get_mut(vid) {
-                    fp.is_voter = true;
-                }
-            }
-
-            // Mark removed voters in follower_state
-            for vid in old_voter_ids.difference(&new_voter_ids) {
-                if let Some(fp) = self.follower_state.get_mut(vid) {
-                    fp.is_voter = false;
-                }
-            }
-
-            // Atomically replace the voter set
-            self.voter_set = record.voters.clone();
-        }
-    }
-
-    /// Apply a committed VotersRecord using the local pending state (leader only).
-    ///
-    /// Delegates to `commit_membership_change`. For the general path that
-    /// works on all nodes, use `apply_voters_record_from_log`.
-    pub fn apply_voters_record(&mut self) {
-        self.commit_membership_change();
     }
 }

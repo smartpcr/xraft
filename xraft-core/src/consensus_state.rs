@@ -1,16 +1,7 @@
-use crate::types::{NodeId, Term};
-use crate::voter::VoterInfo;
-use serde::{Deserialize, Serialize};
+use crate::types::{NodeId, Term, Role, VoterInfo};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Role {
-    Unattached,
-    Follower,
-    Candidate,
-    Leader,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Public consensus state returned by `RaftNode::read()`.
+#[derive(Debug, Clone)]
 pub struct ConsensusState {
     pub node_id: NodeId,
     pub current_term: Term,

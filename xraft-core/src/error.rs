@@ -1,4 +1,4 @@
-use thiserror::Error;
+use std::fmt;
 
 /// Top-level error type for xraft.
 #[derive(Error, Debug)]
@@ -11,14 +11,8 @@ pub enum XraftError {
 
     #[error("not leader")]
     NotLeader,
-
-    #[error("proposal queue full")]
-    ProposalQueueFull,
-
-    #[error("invalid cluster id")]
-    InvalidClusterId,
-
-    #[error("shutdown")]
+    StorageError(String),
+    TransportError(String),
     Shutdown,
 
     #[error("serialization error: {0}")]
