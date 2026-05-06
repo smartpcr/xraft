@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 use crate::log_entry::LogEntry;
 use crate::types::{ClusterId, NodeId, Term};
@@ -9,7 +8,7 @@ use crate::types::{ClusterId, NodeId, Term};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcEnvelope {
     pub cluster_id: ClusterId,
-    pub leader_epoch: Term,
+    pub leader_epoch: u64,
     pub source: NodeId,
     pub payload: RpcPayload,
 }
@@ -19,14 +18,6 @@ pub struct RpcEnvelope {
 pub enum RpcPayload {
     VoteRequest(VoteRequest),
     VoteResponse(VoteResponse),
-    FetchRequest(FetchRequest),
-    FetchResponse(FetchResponse),
-    FetchSnapshotRequest(FetchSnapshotRequest),
-    FetchSnapshotResponse(FetchSnapshotResponse),
-    AddVoterRequest(AddVoterRequest),
-    RemoveVoterRequest(RemoveVoterRequest),
-    UpdateVoterRequest(UpdateVoterRequest),
-    MembershipChangeResponse(MembershipChangeResponse),
 }
 
 // --- Vote (Election) ---

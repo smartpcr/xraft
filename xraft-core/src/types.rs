@@ -1,11 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Unique numeric identifier for a node within the cluster.
-///
-/// Newtype wrapper around `u64`, consistent with Stage 1.2 of the
-/// implementation plan. Additional core types (`Term`, `ClusterId`,
-/// `Offset`) will be added here in Stage 1.2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
 
 /// Monotonically increasing logical clock (epoch).
@@ -26,6 +22,18 @@ pub struct ClusterId(pub u64);
 
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "N{}", self.0)
+    }
+}
+
+impl fmt::Display for Term {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "T{}", self.0)
+    }
+}
+
+impl fmt::Display for Offset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "O{}", self.0)
     }
 }

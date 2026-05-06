@@ -1,4 +1,4 @@
-use std::fmt;
+use thiserror::Error;
 
 use crate::types::NodeId;
 
@@ -13,9 +13,11 @@ pub enum XraftError {
     NotLeader { leader_id: Option<NodeId> },
     /// BatchAccumulator back-pressure limit reached.
     ProposalQueueFull,
-    /// RPC `cluster_id` mismatch.
+
+    #[error("invalid cluster id")]
     InvalidClusterId,
-    /// Node is shutting down; no new operations accepted.
+
+    #[error("shutdown")]
     Shutdown,
 }
 
