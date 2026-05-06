@@ -1,23 +1,26 @@
+use crate::quorum_state::QuorumState;
 use async_trait::async_trait;
+use std::time::{Duration, Instant};
 
-use crate::error::Result;
-use crate::log_entry::LogEntry;
+pub type Result<T> = std::result::Result<T, crate::error::XraftError>;
 
-/// Trait for persistent log storage.
 #[async_trait]
-pub trait LogStore: Send + Sync + 'static {
-    async fn append(&self, entries: &[LogEntry]) -> Result<()>;
-    async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>>;
-    async fn truncate_suffix(&self, from_offset: u64) -> Result<()>;
-    async fn truncate_prefix(&self, up_to_offset: u64) -> Result<()>;
-    fn log_start_offset(&self) -> u64;
-    fn log_end_offset(&self) -> u64;
-    async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>>;
+pub trait QuorumStateStore: Send + Sync + 'static {
+    async fn load(&self) -> Result<Option<QuorumState>>;
+    async fn save(&self, state: &QuorumState) -> Result<()>;
 }
 
-/// Trait for application state machine.
-pub trait StateMachine: Send + 'static {
-    fn apply(&mut self, offset: u64, data: &[u8]) -> Result<()>;
-    fn snapshot(&self) -> Result<Vec<u8>>;
-    fn restore(&mut self, snapshot: Vec<u8>) -> Result<()>;
+/// Abstraction over time for the event loop.
+///
+/// Production: wraps `tokio::time`.
+/// Test: `SimulatedClock` with manual tick (in `xraft-test`).
+///
+/// Used directly by the EventLoop for timer management (election timeouts,
+/// check-quorum deadlines). Not mediated by `IoAction`.
+pub trait Clock: Send + 'static {
+    /// Current instant.
+    fn now(&self) -> Instant;
+
+    /// Generate a random election timeout in [min, max].
+    fn random_election_timeout(&self) -> Duration;
 }
