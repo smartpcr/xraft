@@ -6,9 +6,8 @@ version.workspace = true
 [lints]
 workspace = true
 
-[dependencies]
-xraft-core = { path = "../xraft-core" }
-async-trait = "0.1"
-
 [lints]
 workspace = true
+
+[dependencies]
+xraft-core = { path = "../xraft-core" }
