@@ -1,4 +1,6 @@
+use crate::types::NodeId;
 use std::fmt;
+use std::io;
 
 /// Top-level error type for xraft.
 #[derive(Error, Debug)]

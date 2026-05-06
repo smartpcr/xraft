@@ -1,8 +1,9 @@
 pub mod app_record;
 pub mod config;
-pub mod consensus_state;
-pub mod election;
+pub mod deferred_completion;
 pub mod error;
+pub mod follower_progress;
+pub mod io_action;
 pub mod log_entry;
 pub mod quorum_state;
 pub mod snapshot;

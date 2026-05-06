@@ -1,3 +1,7 @@
+use crate::app_record::AppRecord;
+use crate::types::Term;
+use crate::voter::VotersRecord;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// The type of a log entry.
