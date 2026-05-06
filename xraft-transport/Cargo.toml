@@ -1,7 +1,10 @@
 [package]
 name = "xraft-transport"
+version = "0.1.0"
 edition.workspace = true
-version.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 xraft-core = { path = "../xraft-core" }

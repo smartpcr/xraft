@@ -1,15 +1,14 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use crate::types::{Term, AppRecord};
 
 use crate::types::{Offset, Term};
 
 /// The type of a log entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryType {
-    /// Application command (wraps an AppRecord).
+    /// Application command (forwarded to StateMachine).
     Command,
-    /// No-op entry appended by new leader at start of term.
+    /// Control record appended on leader election.
     LeaderChangeMessage,
     /// Membership change control record.
     VotersRecord,
@@ -20,7 +19,6 @@ pub enum EntryType {
 pub struct LogEntry {
     pub offset: u64,
     pub term: Term,
-    /// Entry type discriminator.
     pub entry_type: EntryType,
     pub payload: Bytes,
 }

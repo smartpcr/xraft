@@ -1,18 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
 /// Unique numeric identifier for a node within a cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
 
-impl fmt::Display for NodeId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "N{}", self.0)
-    }
-}
-
-/// Monotonically increasing logical clock identifying an election cycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+/// Monotonically increasing term number used for leader elections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Term(pub u64);
 
 impl fmt::Display for Term {

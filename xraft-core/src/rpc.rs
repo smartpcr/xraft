@@ -24,47 +24,33 @@ pub enum RpcPayload {
 pub struct VoteRequest {
     pub term: Term,
     pub candidate_id: NodeId,
-    pub last_log_offset: u64,
+    pub last_log_offset: Offset,
     pub last_log_term: Term,
     pub is_pre_vote: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Response to a `VoteRequest`.
+///
+/// For pre-vote responses, the voter does NOT update its own term or
+/// `voted_for` — no durable state is mutated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoteResponse {
     pub term: Term,
     pub vote_granted: bool,
     pub is_pre_vote: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FetchRequest {
-    pub replica_id: NodeId,
-    pub fetch_offset: u64,
-    pub last_fetched_epoch: u64,
-    pub max_bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Response from a leader to a follower's Fetch RPC.
+///
+/// Followers use the `leader_id` and `term` fields to track the last
+/// valid leader contact, which gates pre-vote rejection (the leader
+/// lease check). This is the primary mechanism through which followers
+/// learn that a leader is alive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchResponse {
+    pub term: Term,
     pub leader_id: NodeId,
-    pub leader_epoch: u64,
-    pub high_watermark: u64,
-    pub log_start_offset: u64,
-    pub entries: Vec<LogEntry>,
-    pub diverging_epoch: Option<DivergingEpoch>,
-    pub snapshot_id: Option<SnapshotId>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DivergingEpoch {
-    pub epoch: u64,
-    pub end_offset: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotId {
-    pub end_offset: u64,
-    pub epoch: u64,
+    pub high_watermark: Offset,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
