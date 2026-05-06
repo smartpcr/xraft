@@ -1,15 +1,29 @@
+pub mod app_record;
+pub mod config;
+pub mod consensus_state;
+pub mod election;
 pub mod error;
+pub mod io_action;
+pub mod io_stage;
+pub mod log_entry;
+pub mod node_state;
+pub mod quorum_state;
 pub mod rpc;
 pub mod traits;
 pub mod types;
+pub mod voter;
 
+pub use app_record::{AppRecord, AppSnapshot};
+pub use config::RaftConfig;
+pub use consensus_state::{ConsensusState, Role};
+pub use election::{ElectionAction, ElectionEvent, ElectionManager, ElectionOutput};
 pub use error::XraftError;
-pub use rpc::{
-    AddVoterRequest, DivergingEpoch, FetchRequest, FetchResponse, FetchSnapshotRequest,
-    FetchSnapshotResponse, MembershipChangeResponse, MembershipError, RemoveVoterRequest,
-    RpcEnvelope, RpcPayload, SnapshotId, UpdateVoterRequest, VoteRequest, VoteResponse,
-};
-pub use traits::{TransportReceiver, TransportSender};
-pub use types::{ClusterId, NodeId, Term};
-
-pub type Result<T> = std::result::Result<T, XraftError>;
+pub use io_action::{IoAction, IoActionBatch};
+pub use io_stage::{IoStage, TransportSender};
+pub use log_entry::{EntryType, LogEntry};
+pub use node_state::{NodeEvent, NodeState};
+pub use quorum_state::QuorumState;
+pub use rpc::{RpcEnvelope, RpcPayload, VoteRequest, VoteResponse};
+pub use traits::{Clock, QuorumStateStore};
+pub use types::{ClusterId, NodeId, Offset, Term};
+pub use voter::{VoterInfo, VotersRecord};

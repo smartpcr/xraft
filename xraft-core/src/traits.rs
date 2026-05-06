@@ -1,20 +1,26 @@
-use crate::rpc::RpcEnvelope;
-use crate::types::NodeId;
-use crate::Result;
+use crate::quorum_state::QuorumState;
 use async_trait::async_trait;
+use std::time::{Duration, Instant};
 
-/// Outbound RPC transport. Called by IoStage via SendRpc action.
-/// Takes `&self` (shared reference) because the IoStage may send to
-/// multiple peers concurrently. Requires `Send + Sync + 'static`.
+pub type Result<T> = std::result::Result<T, crate::error::XraftError>;
+
 #[async_trait]
-pub trait TransportSender: Send + Sync + 'static {
-    async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<()>;
+pub trait QuorumStateStore: Send + Sync + 'static {
+    async fn load(&self) -> Result<Option<QuorumState>>;
+    async fn save(&self, state: &QuorumState) -> Result<()>;
 }
 
-/// Inbound RPC transport. Called exclusively by ReceiverTask (§4.4).
-/// Takes `&mut self` (exclusive access) because only the ReceiverTask
-/// reads from the network. Requires `Send + 'static`.
-#[async_trait]
-pub trait TransportReceiver: Send + 'static {
-    async fn recv(&mut self) -> Result<RpcEnvelope>;
+/// Abstraction over time for the event loop.
+///
+/// Production: wraps `tokio::time`.
+/// Test: `SimulatedClock` with manual tick (in `xraft-test`).
+///
+/// Used directly by the EventLoop for timer management (election timeouts,
+/// check-quorum deadlines). Not mediated by `IoAction`.
+pub trait Clock: Send + 'static {
+    /// Current instant.
+    fn now(&self) -> Instant;
+
+    /// Generate a random election timeout in [min, max].
+    fn random_election_timeout(&self) -> Duration;
 }
