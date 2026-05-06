@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use crate::types::{Term, AppRecord};
 
 /// Type of log entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

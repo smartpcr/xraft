@@ -6,12 +6,12 @@ use crate::types::NodeId;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoterInfo {
     pub node_id: NodeId,
-    pub endpoint: Endpoint,
+    pub endpoint: String,
 }
 
 /// A voters record describing the current voter set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VotersRecord {
-    pub version: u32,
+    pub version: u64,
     pub voters: Vec<VoterInfo>,
 }
