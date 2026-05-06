@@ -8,7 +8,7 @@ use crate::types::{Offset, Term};
 pub enum EntryType {
     /// Application-level state machine command (wraps an `AppRecord`).
     Command,
-    /// Control record appended on leader election.
+    /// No-op appended by new leader to establish commit state.
     LeaderChangeMessage,
     /// Encodes the complete new voter set for membership changes.
     VotersRecord,
