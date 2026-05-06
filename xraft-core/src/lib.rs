@@ -1,15 +1,26 @@
 pub mod app_record;
 pub mod config;
-pub mod deferred_completion;
 pub mod error;
-pub mod follower_progress;
+pub mod event_loop;
 pub mod io_action;
+pub mod io_stage;
 pub mod log_entry;
-pub mod node_state;
-pub mod quorum_state;
-pub mod replication;
-pub mod rpc;
 pub mod snapshot;
+pub mod snapshot_coordinator;
 pub mod traits;
 pub mod types;
 pub mod voter;
+
+// Public re-exports for the crate's primary API surface.
+pub use app_record::{AppRecord, AppSnapshot};
+pub use config::RaftConfig;
+pub use error::XraftError;
+pub use event_loop::EventLoop;
+pub use io_action::{IoAction, IoActionBatch};
+pub use io_stage::{IoResult, IoStage};
+pub use log_entry::{EntryType, LogEntry};
+pub use snapshot::{Snapshot, SnapshotId, SnapshotMetadata, SnapshotReader, SnapshotWriter};
+pub use snapshot_coordinator::{SnapshotAction, SnapshotCoordinator};
+pub use traits::{LogStore, NetworkSender, SnapshotIO, StateMachine};
+pub use types::{ClusterId, NodeId, Offset, Term};
+pub use voter::{VoterInfo, VotersRecord};

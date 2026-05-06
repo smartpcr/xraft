@@ -1,67 +1,46 @@
 use crate::app_record::AppRecord;
 use crate::types::Term;
 use crate::voter::VotersRecord;
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 
-/// Discriminator for log entry types.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Entry type discriminator.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum EntryType {
-    /// Application-level command wrapping an AppRecord.
     Command,
-    /// No-op appended by new leader to establish commit state.
     LeaderChangeMessage,
-    /// Membership change record encoding complete new voter set.
     VotersRecord,
 }
 
-/// A single entry in the replicated log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A single log entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
-    pub offset: Offset,
+    pub offset: u64,
     pub term: Term,
-    /// Type discriminator.
     pub entry_type: EntryType,
-    /// Serialised payload.
-    pub payload: Bytes,
+    pub payload: Option<AppRecord>,
 }
 
 impl LogEntry {
-    /// Create a Command entry wrapping an AppRecord.
-    pub fn command(offset: u64, term: Term, record: &AppRecord) -> Self {
-        LogEntry {
-            offset,
-            term,
-            entry_type: EntryType::Command,
-            payload: record.data.clone(),
+    /// Decode a `VotersRecord` from a `VotersRecord`-typed entry's payload.
+    ///
+    /// Returns `None` if the entry is not a `VotersRecord` type or if the
+    /// payload is missing/malformed.
+    pub fn decode_voters_record(&self) -> Option<VotersRecord> {
+        match self.entry_type {
+            EntryType::VotersRecord => {
+                let payload = self.payload.as_ref()?;
+                serde_json::from_slice(&payload.data).ok()
+            }
+            _ => None,
         }
     }
 
-    /// Create a LeaderChangeMessage (no-op) entry.
-    pub fn leader_change(offset: u64, term: Term) -> Self {
-        LogEntry {
-            offset,
-            term,
-            entry_type: EntryType::LeaderChangeMessage,
-            payload: Bytes::new(),
-        }
-    }
-
-    /// Create a VotersRecord entry.
-    pub fn voters_record(offset: u64, term: Term, record: &VotersRecord) -> Self {
-        let data = bincode::serialize(record).expect("VotersRecord serialisation");
-        LogEntry {
-            offset,
-            term,
-            entry_type: EntryType::VotersRecord,
-            payload: Bytes::from(data),
-        }
-    }
-
-    /// Extract AppRecord from a Command entry. Panics if not Command type.
-    pub fn as_app_record(&self) -> AppRecord {
-        AppRecord {
-            data: self.payload.clone(),
+    /// For a `LeaderChangeMessage` entry, the entry's term **is** the
+    /// leader epoch (architecture §5.4 — a leader-change record is
+    /// committed at the start of a new leader's term).
+    pub fn leader_epoch(&self) -> Option<Term> {
+        match self.entry_type {
+            EntryType::LeaderChangeMessage => Some(self.term),
+            _ => None,
         }
     }
 }
