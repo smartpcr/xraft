@@ -1,5 +1,4 @@
 use crate::types::{NodeId, Term};
-use serde::{Deserialize, Serialize};
 
 /// Persisted voting state, stored separately from the log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

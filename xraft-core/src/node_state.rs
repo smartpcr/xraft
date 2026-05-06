@@ -33,6 +33,7 @@ pub struct NodeState {
     pub cluster_id: ClusterId,
     pub current_term: Term,
     pub voted_for: Option<NodeId>,
+
     pub role: Role,
     pub leader_id: Option<NodeId>,
 
@@ -165,5 +166,84 @@ impl From<&NodeState> for ConsensusState {
             high_watermark: state.high_watermark,
             voter_set: state.voter_set.clone(),
         }
+    }
+
+    /// Returns the `NodeId`s of all voters except this node.
+    pub fn other_voters(&self) -> Vec<NodeId> {
+        self.voter_set
+            .iter()
+            .map(|v| v.node_id)
+            .filter(|id| *id != self.node_id)
+            .collect()
+    }
+
+    /// Returns true if the given node is in the current voter set.
+    pub fn is_voter(&self, node_id: NodeId) -> bool {
+        self.voter_set.iter().any(|v| v.node_id == node_id)
+    }
+
+    /// Total number of voters in the cluster (including self).
+    pub fn voter_count(&self) -> usize {
+        self.voter_set.len()
+    }
+
+    /// Majority quorum size: `⌊n/2⌋ + 1`.
+    pub fn majority(&self) -> usize {
+        self.voter_count() / 2 + 1
+    }
+
+    /// Records contact from a valid leader at the given timestamp.
+    pub fn record_leader_contact(&mut self, now_ms: u64, leader_id: NodeId, term: Term) {
+        self.last_leader_contact_ms = Some(now_ms);
+        self.leader_id = Some(leader_id);
+        self.last_leader_term = Some(term);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cluster_id() -> ClusterId {
+        ClusterId(uuid::Uuid::nil())
+    }
+
+    fn three_node_voter_set() -> Vec<VoterInfo> {
+        vec![
+            VoterInfo { node_id: NodeId(1), endpoint: "n1".into() },
+            VoterInfo { node_id: NodeId(2), endpoint: "n2".into() },
+            VoterInfo { node_id: NodeId(3), endpoint: "n3".into() },
+        ]
+    }
+
+    #[test]
+    fn majority_of_three_is_two() {
+        let state = NodeState::new(NodeId(1), test_cluster_id(), three_node_voter_set());
+        assert_eq!(state.majority(), 2);
+    }
+
+    #[test]
+    fn other_voters_excludes_self() {
+        let state = NodeState::new(NodeId(1), test_cluster_id(), three_node_voter_set());
+        let others = state.other_voters();
+        assert_eq!(others.len(), 2);
+        assert!(!others.contains(&NodeId(1)));
+        assert!(others.contains(&NodeId(2)));
+        assert!(others.contains(&NodeId(3)));
+    }
+
+    #[test]
+    fn project_matches_internal_state() {
+        let mut state = NodeState::new(NodeId(1), test_cluster_id(), three_node_voter_set());
+        state.current_term = Term(5);
+        state.role = Role::Leader;
+        state.leader_id = Some(NodeId(1));
+        state.high_watermark = Offset(42);
+
+        let projected = state.project();
+        assert_eq!(projected.current_term, Term(5));
+        assert_eq!(projected.role, Role::Leader);
+        assert_eq!(projected.leader_id, Some(NodeId(1)));
+        assert_eq!(projected.high_watermark, Offset(42));
     }
 }

@@ -18,9 +18,7 @@ pub enum EntryType {
 /// A single entry in the replicated log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
-    /// Position in the log (0-indexed).
-    pub offset: u64,
-    /// Term when the entry was created.
+    pub offset: Offset,
     pub term: Term,
     /// Type discriminator.
     pub entry_type: EntryType,

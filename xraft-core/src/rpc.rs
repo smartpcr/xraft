@@ -27,7 +27,7 @@ pub enum RpcPayload {
 pub struct VoteRequest {
     pub term: Term,
     pub candidate_id: NodeId,
-    pub last_log_offset: u64,
+    pub last_log_offset: Offset,
     pub last_log_term: Term,
     pub is_pre_vote: bool,
 }
@@ -56,6 +56,7 @@ pub struct FetchRequest {
 /// Leader's response to a Fetch request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchResponse {
+    pub term: Term,
     pub leader_id: NodeId,
     pub leader_epoch: Term,
     /// Exclusive upper bound: entries with offset < HW are committed.
