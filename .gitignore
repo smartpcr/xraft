@@ -2,3 +2,8 @@
 **/*.rs.bk
 *.pdb
 Cargo.lock
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
