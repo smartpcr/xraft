@@ -8,6 +8,7 @@ use crate::types::{Offset, Term};
 pub struct LogEntry {
     pub offset: u64,
     pub term: Term,
+    /// Type discriminator.
     pub entry_type: EntryType,
     pub payload: Bytes,
 }
