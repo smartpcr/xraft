@@ -30,7 +30,14 @@ impl fmt::Display for XraftError {
     }
 }
 
-impl std::error::Error for XraftError {}
+impl std::error::Error for XraftError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            XraftError::StorageError(e) | XraftError::TransportError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 /// Alias for results using XraftError.
 pub type Result<T> = std::result::Result<T, XraftError>;
