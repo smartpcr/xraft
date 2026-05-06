@@ -1,20 +1,9 @@
 [workspace]
-members = [
-    "xraft-core",
-    "xraft-storage",
-    "xraft-transport",
-    "xraft-test",
-]
+members = ["xraft-core"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
 
-[workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-bytes = "1"
-tracing = "0.1"
-async-trait = "0.1"
-rand = "0.8"
+[workspace.lints.clippy]
+all = "deny"
