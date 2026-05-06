@@ -1,6 +1,4 @@
-use crate::types::NodeId;
 use std::fmt;
-use std::io;
 
 use crate::types::NodeId;
 
@@ -68,5 +66,8 @@ impl std::error::Error for XraftError {
     }
 }
 
-/// Convenience Result alias.
-pub type Result<T> = std::result::Result<T, XraftError>;
+impl From<std::io::Error> for XraftError {
+    fn from(e: std::io::Error) -> Self {
+        Self::StorageError(e)
+    }
+}

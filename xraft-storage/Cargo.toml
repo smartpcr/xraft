@@ -17,3 +17,6 @@ xraft-core = { path = "../xraft-core" }
 
 [lints]
 workspace = true
+
+[dependencies]
+xraft-core = { path = "../xraft-core" }

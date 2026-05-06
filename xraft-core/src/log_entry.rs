@@ -6,20 +6,17 @@ use crate::types::{Offset, Term};
 /// The type of a log entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryType {
-    /// Application-level command wrapping an AppRecord.
     Command,
-    /// No-op appended by new leader to establish commit state.
     LeaderChangeMessage,
     /// Membership change control record.
     VotersRecord,
 }
 
-/// A single entry in the replicated log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A single log entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
     pub offset: u64,
     pub term: Term,
-    /// Type discriminator.
     pub entry_type: EntryType,
     pub payload: Bytes,
 }

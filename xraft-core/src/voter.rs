@@ -2,14 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 use crate::types::NodeId;
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 /// Information about a voter node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoterInfo {
     pub node_id: NodeId,
-    pub endpoint: SocketAddr,
+    pub endpoint: String,
 }
 
 /// Membership change control record.
