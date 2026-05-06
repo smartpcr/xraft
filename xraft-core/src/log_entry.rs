@@ -1,16 +1,14 @@
 use serde::{Deserialize, Serialize};
+use crate::types::{Term, AppRecord};
 
-use crate::types::Term;
-use crate::voter::VotersRecord;
-
-/// Discriminator for log entry types.
+/// Types of log entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryType {
-    /// Application-level state machine command.
+    /// Application command (wraps an AppRecord).
     Command,
-    /// Leader no-op appended at the start of a new term.
+    /// No-op entry appended by new leader at start of term.
     LeaderChangeMessage,
-    /// Membership change — contains a complete `VotersRecord`.
+    /// Membership change record.
     VotersRecord,
 }
 
@@ -21,31 +19,30 @@ pub struct LogEntry {
     pub offset: u64,
     /// Term when the entry was created.
     pub term: Term,
-    /// Type discriminator.
+    /// Entry type discriminator.
     pub entry_type: EntryType,
-    /// Serialised payload (command bytes or control record).
-    pub payload: Vec<u8>,
+    /// Entry payload — for Command entries this is a serialized AppRecord.
+    pub data: Vec<u8>,
 }
 
 impl LogEntry {
-    /// Create a VotersRecord log entry at the given offset and term.
-    pub fn voters_record(offset: u64, term: Term, record: &VotersRecord) -> Self {
-        let payload = bincode::serialize(record).expect("VotersRecord serialisation");
-        LogEntry {
-            offset,
-            term,
-            entry_type: EntryType::VotersRecord,
-            payload,
-        }
-    }
-
-    /// Create a Command log entry.
-    pub fn command(offset: u64, term: Term, data: Vec<u8>) -> Self {
-        LogEntry {
+    /// Create a command log entry.
+    pub fn command(offset: u64, term: Term, record: &AppRecord) -> Self {
+        Self {
             offset,
             term,
             entry_type: EntryType::Command,
-            payload: data,
+            data: record.data.clone(),
+        }
+    }
+
+    /// Create a leader change message (no-op) log entry.
+    pub fn leader_change(offset: u64, term: Term) -> Self {
+        Self {
+            offset,
+            term,
+            entry_type: EntryType::LeaderChangeMessage,
+            data: Vec::new(),
         }
     }
 }
