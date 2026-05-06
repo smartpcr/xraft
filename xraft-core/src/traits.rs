@@ -1,7 +1,8 @@
+use crate::quorum_state::QuorumState;
 use async_trait::async_trait;
+use std::time::{Duration, Instant};
 
-use crate::error::Result;
-use crate::log_entry::LogEntry;
+pub type Result<T> = std::result::Result<T, crate::error::XraftError>;
 
 /// Durable, append-only log store.
 ///

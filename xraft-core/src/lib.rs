@@ -1,6 +1,17 @@
+pub mod app_record;
 pub mod config;
+pub mod consensus_state;
+pub mod election;
 pub mod error;
+pub mod io_action;
+pub mod io_stage;
+pub mod log_entry;
+pub mod node_state;
+pub mod quorum_state;
+pub mod rpc;
+pub mod traits;
 pub mod types;
+pub mod voter;
 
 pub use config::RaftConfig;
 pub use error::{Result, XraftError};

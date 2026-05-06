@@ -1,4 +1,4 @@
-use std::fmt;
+use thiserror::Error;
 
 /// Public error type for xraft operations.
 #[derive(Debug)]
@@ -13,7 +13,8 @@ pub enum XraftError {
     },
     /// BatchAccumulator back-pressure limit reached.
     ProposalQueueFull,
-    /// RPC `cluster_id` mismatch.
+
+    #[error("invalid cluster id")]
     InvalidClusterId,
     /// Node is shutting down.
     Shutdown,

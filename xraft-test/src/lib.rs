@@ -1,4 +1,2 @@
-//! xraft-test: Deterministic testing harness for xraft.
-
-pub mod invariant_checker;
-pub mod simulated_cluster;
+pub mod memory_quorum_state;
+pub mod simulated_clock;
