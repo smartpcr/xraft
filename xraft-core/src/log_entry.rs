@@ -6,27 +6,43 @@ use crate::types::{Offset, Term};
 /// The type of a log entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryType {
+    /// Application-level state machine command.
     Command,
+    /// Leader no-op appended at the start of a new term.
     LeaderChangeMessage,
     /// Membership change control record.
     VotersRecord,
 }
 
+/// A single entry in the replicated log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
     pub offset: u64,
     pub term: Term,
+    /// Type discriminator.
     pub entry_type: EntryType,
     pub payload: Bytes,
 }
 
 impl LogEntry {
-    pub fn command(offset: Offset, term: Term, record: &AppRecord) -> Self {
-        Self {
+    /// Create a VotersRecord log entry at the given offset and term.
+    pub fn voters_record(offset: u64, term: Term, record: &VotersRecord) -> Self {
+        let payload = bincode::serialize(record).expect("VotersRecord serialisation");
+        LogEntry {
+            offset,
+            term,
+            entry_type: EntryType::VotersRecord,
+            payload,
+        }
+    }
+
+    /// Create a Command log entry.
+    pub fn command(offset: u64, term: Term, data: Vec<u8>) -> Self {
+        LogEntry {
             offset,
             term,
             entry_type: EntryType::Command,
-            payload: record.data.to_vec(),
+            payload: data,
         }
     }
 }
