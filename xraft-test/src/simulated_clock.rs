@@ -1,51 +1,60 @@
+//! Deterministic clock for simulation testing.
+//!
+//! Implements the `Clock` trait to provide explicit time control in tests.
+//! The clock is advanced by the test harness, ensuring reproducible behavior.
+
+use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use xraft_core::traits::Clock;
 
-/// Deterministic simulated clock for testing.
-/// Time only advances via explicit `advance()` calls.
+/// Deterministic simulated clock implementing the `Clock` trait.
+///
+/// Time advances only when explicitly told to via `advance()` or `set()`.
+/// Election timeout is deterministic but configurable per-instance to
+/// support node-specific timeout staggering.
 pub struct SimulatedClock {
-    inner: Arc<Mutex<SimulatedClockInner>>,
+    inner: Arc<Mutex<ClockInner>>,
 }
 
-struct SimulatedClockInner {
-    now: Instant,
-    election_timeout: Duration,
+struct ClockInner {
+    now_ms: u64,
+    election_timeout_ms: u64,
 }
 
 impl SimulatedClock {
-    pub fn new() -> Self {
+    /// Create a new clock starting at time 0 with the given election timeout.
+    pub fn new(election_timeout_ms: u64) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(SimulatedClockInner {
-                now: Instant::now(),
-                election_timeout: Duration::from_millis(200),
+            inner: Arc::new(Mutex::new(ClockInner {
+                now_ms: 0,
+                election_timeout_ms,
             })),
         }
     }
 
-    pub fn advance(&self, duration: Duration) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.now += duration;
+    /// Advance the clock by `ms` milliseconds.
+    pub fn advance(&self, ms: u64) {
+        self.inner.lock().unwrap().now_ms += ms;
     }
 
-    pub fn set_election_timeout(&self, timeout: Duration) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.election_timeout = timeout;
+    /// Set the clock to an absolute value.
+    pub fn set(&self, ms: u64) {
+        self.inner.lock().unwrap().now_ms = ms;
+    }
+
+    /// Read the current time without advancing.
+    pub fn now(&self) -> u64 {
+        self.inner.lock().unwrap().now_ms
     }
 }
 
+#[async_trait]
 impl Clock for SimulatedClock {
-    fn now(&self) -> Instant {
-        self.inner.lock().unwrap().now
+    fn now_ms(&self) -> u64 {
+        self.inner.lock().unwrap().now_ms
     }
 
-    fn random_election_timeout(&self) -> Duration {
-        self.inner.lock().unwrap().election_timeout
-    }
-}
-
-impl Default for SimulatedClock {
-    fn default() -> Self {
-        Self::new()
+    fn random_election_timeout_ms(&self) -> u64 {
+        self.inner.lock().unwrap().election_timeout_ms
     }
 }
