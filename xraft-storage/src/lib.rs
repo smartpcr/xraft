@@ -1,5 +1,3 @@
-pub mod segment;
-pub mod segment_index;
-pub mod segment_log;
+//! xraft-storage: Durable storage backends for xraft.
 
 pub use segment_log::SegmentLog;

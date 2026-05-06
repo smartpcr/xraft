@@ -1,5 +1,4 @@
 use std::fmt;
-use std::io;
 
 /// Public error type for xraft operations.
 #[derive(Debug)]
@@ -14,7 +13,6 @@ pub enum XraftError {
     },
     /// BatchAccumulator back-pressure limit reached.
     ProposalQueueFull,
-    /// RPC cluster_id mismatch.
     InvalidClusterId,
     /// Node is shutting down.
     Shutdown,
@@ -35,14 +33,7 @@ impl fmt::Display for XraftError {
     }
 }
 
-impl std::error::Error for XraftError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::StorageError(e) | Self::TransportError(e) => Some(e),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for XraftError {}
 
 impl From<io::Error> for XraftError {
     fn from(e: io::Error) -> Self {
