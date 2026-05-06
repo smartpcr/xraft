@@ -38,6 +38,7 @@ impl ChannelTransport {
             receivers,
         }
     }
+}
 
     /// Split the transport into per-node sender/receiver pairs.
     ///

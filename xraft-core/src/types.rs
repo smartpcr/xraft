@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Unique numeric identifier for a node within a cluster.
@@ -10,8 +11,8 @@ impl fmt::Display for NodeId {
     }
 }
 
-/// Monotonically increasing logical clock (epoch).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Monotonically increasing logical clock identifying an election cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 pub struct Term(pub u64);
 
 impl fmt::Display for Term {
