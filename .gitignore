@@ -2,3 +2,5 @@
 **/*.rs.bk
 *.pdb
 Cargo.lock
+**/*.rs.bk
+*.pdb

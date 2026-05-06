@@ -3,10 +3,12 @@ name = "xraft-core"
 edition.workspace = true
 version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
-tokio = { workspace = true }
-serde = { workspace = true }
-bytes = { workspace = true }
-tracing = { workspace = true }
-async-trait = { workspace = true }
-rand = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+xraft-test = { path = "../xraft-test" }

@@ -3,9 +3,9 @@ use std::path::PathBuf;
 /// Construction-time configuration for a Raft node.
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
-    pub election_timeout_min_ms: u64,
-    pub election_timeout_max_ms: u64,
-    pub fetch_interval_ms: u64,
+    pub election_timeout_min: Duration,
+    pub election_timeout_max: Duration,
+    pub fetch_interval: Duration,
     pub max_batch_size: usize,
     pub max_fetch_bytes: u32,
     pub snapshot_interval: u64,
@@ -29,5 +29,22 @@ impl Default for RaftConfig {
             segment_max_bytes: 64 * 1024 * 1024, // 64 MiB
             index_interval: 256,
         }
+    }
+}
+
+impl RaftConfig {
+    /// Validates that timing constraints are consistent.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.election_timeout_min >= self.election_timeout_max {
+            return Err(
+                "election_timeout_min must be less than election_timeout_max".into(),
+            );
+        }
+        if self.fetch_interval >= self.election_timeout_min {
+            return Err(
+                "fetch_interval must be less than election_timeout_min".into(),
+            );
+        }
+        Ok(())
     }
 }
