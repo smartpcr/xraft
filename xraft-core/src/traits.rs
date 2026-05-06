@@ -24,8 +24,6 @@ pub trait LogStore: Send + Sync + 'static {
 
     /// The first offset still in the log.
     fn log_start_offset(&self) -> u64;
-
-    /// The next offset to be written.
     fn log_end_offset(&self) -> u64;
 
     /// Read the entry at the given offset. Returns None if out of bounds.

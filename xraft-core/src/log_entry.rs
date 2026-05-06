@@ -23,3 +23,25 @@ pub struct LogEntry {
     /// Serialized payload (bincode-encoded AppRecord, VotersRecord, etc.).
     pub payload: Vec<u8>,
 }
+
+impl LogEntry {
+    /// Create a command log entry.
+    pub fn command(offset: Offset, term: Term, payload: Vec<u8>) -> Self {
+        Self {
+            offset,
+            term,
+            entry_type: EntryType::Command,
+            payload,
+        }
+    }
+
+    /// Create a leader change message entry.
+    pub fn leader_change(offset: Offset, term: Term) -> Self {
+        Self {
+            offset,
+            term,
+            entry_type: EntryType::LeaderChangeMessage,
+            payload: Vec::new(),
+        }
+    }
+}
