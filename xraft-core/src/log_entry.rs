@@ -1,27 +1,49 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::Term;
+use crate::types::{Offset, Term};
 
-/// Discriminates application records from consensus control records.
+/// Type of log entry — distinguishes application commands from control records.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryType {
-    /// Application-level state machine command (wraps an AppRecord).
+    /// Application command payload.
     Command,
-    /// Appended by a new leader as the first entry of its term.
+    /// Leader change marker record.
     LeaderChangeMessage,
-    /// Encodes the complete new voter set after a membership change.
+    /// Voters configuration change record.
     VotersRecord,
 }
 
 /// A single entry in the replicated log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
-    /// Position in the log (0-indexed).
-    pub offset: u64,
-    /// Term when the entry was created.
+    /// Position in the log (0-based).
+    pub offset: Offset,
+    /// Term in which the entry was created.
     pub term: Term,
-    /// Whether this is an application command or a control record.
+    /// Type of this entry.
     pub entry_type: EntryType,
-    /// Serialised command or control record payload.
+    /// Opaque payload bytes.
     pub payload: Vec<u8>,
+}
+
+impl LogEntry {
+    /// Create a command log entry.
+    pub fn command(offset: Offset, term: Term, payload: Vec<u8>) -> Self {
+        Self {
+            offset,
+            term,
+            entry_type: EntryType::Command,
+            payload,
+        }
+    }
+
+    /// Create a leader change message entry.
+    pub fn leader_change(offset: Offset, term: Term) -> Self {
+        Self {
+            offset,
+            term,
+            entry_type: EntryType::LeaderChangeMessage,
+            payload: Vec::new(),
+        }
+    }
 }
