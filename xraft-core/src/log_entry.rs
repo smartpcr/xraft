@@ -12,8 +12,8 @@ pub enum EntryType {
     VotersRecord,
 }
 
-/// A single entry in the replicated log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A single log entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
     pub offset: u64,
     pub term: u64,
