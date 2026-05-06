@@ -3,9 +3,9 @@ use std::path::PathBuf;
 /// Configuration for the Raft node.
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
-    pub election_timeout_min_ms: u64,
-    pub election_timeout_max_ms: u64,
-    pub fetch_interval_ms: u64,
+    pub election_timeout_min: Duration,
+    pub election_timeout_max: Duration,
+    pub fetch_interval: Duration,
     pub max_batch_size: usize,
     pub max_fetch_bytes: u32,
     pub snapshot_interval: u64,
