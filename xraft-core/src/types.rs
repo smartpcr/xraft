@@ -38,7 +38,3 @@ impl Default for ClusterId {
         ClusterId(uuid::Uuid::new_v4())
     }
 }
-
-/// Log position (0-indexed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
-pub struct Offset(pub u64);
