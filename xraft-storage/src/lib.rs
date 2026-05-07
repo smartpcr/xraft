@@ -4,4 +4,10 @@
 //! traits for testing, and a module structure for future durable
 //! (segment-log based) storage.
 
-pub use segment_log::SegmentLog;
+mod memory_log;
+mod memory_log_store;
+mod segment;
+mod segment_index;
+mod segment_log;
+
+pub use segment_log::{SegmentLog, SegmentLogConfig};
