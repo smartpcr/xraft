@@ -1,0 +1,15 @@
+[package]
+name = "xraft-core"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+bincode = "1"
