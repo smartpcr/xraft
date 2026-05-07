@@ -1,5 +1,4 @@
-use std::fmt;
-use std::io;
+use thiserror::Error;
 
 /// Public error type for xraft operations.
 #[derive(Debug)]
@@ -19,6 +18,12 @@ pub enum XraftError {
     InvalidClusterId,
     /// Node is shutting down.
     Shutdown,
+
+    #[error("serialization error: {0}")]
+    SerializationError(String),
+
+    #[error("{0}")]
+    Other(String),
 }
 
 impl fmt::Display for XraftError {

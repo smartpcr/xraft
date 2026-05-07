@@ -2,5 +2,9 @@
 **/*.rs.bk
 *.pdb
 Cargo.lock
-**/*.rs.bk
-*.pdb
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.orig

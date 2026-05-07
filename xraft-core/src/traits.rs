@@ -2,25 +2,30 @@ use std::io;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use tokio::time::Instant;
 
+use crate::error::Result;
 use crate::log_entry::LogEntry;
+use crate::snapshot::{Snapshot, SnapshotId};
 use crate::quorum_state::QuorumState;
-use crate::rpc::{RpcEnvelope, SnapshotId};
-use crate::snapshot::{Snapshot, SnapshotWriter};
-use crate::types::NodeId;
+use crate::app_record::{AppRecord, AppSnapshot};
 
-/// Durable log storage trait.
+/// Durable log storage.
 #[async_trait]
 pub trait LogStore: Send + Sync + 'static {
-    async fn append(&self, entries: &[LogEntry]) -> Result<(), io::Error>;
-    async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>, io::Error>;
-    async fn truncate_suffix(&self, from_offset: u64) -> Result<(), io::Error>;
-    async fn truncate_prefix(&self, up_to_offset: u64) -> Result<(), io::Error>;
+    /// Append entries to the log.
+    async fn append(&self, entries: &[LogEntry]) -> Result<()>;
+    /// Read entries in range [start_offset, end_offset).
+    async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>>;
+    /// Remove all entries at and after the given offset.
+    async fn truncate_suffix(&self, from_offset: u64) -> Result<()>;
+    /// Delete entries before the given offset.
+    async fn truncate_prefix(&self, up_to_offset: u64) -> Result<()>;
+    /// First offset still in the log (after compaction).
     fn log_start_offset(&self) -> u64;
+    /// Next offset to be appended.
     fn log_end_offset(&self) -> u64;
-    async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>, io::Error>;
+    /// Read a single entry at the given offset.
+    async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>>;
 }
 
 /// Durable, append-only log store.
