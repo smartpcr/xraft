@@ -1,5 +1,9 @@
+use std::io;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio::time::Instant;
 
 use crate::error::Result;
 use crate::rpc::RpcEnvelope;
@@ -27,44 +31,40 @@ pub trait QuorumStateStore: Send + Sync + 'static {
 /// Snapshot I/O operations.
 #[async_trait]
 pub trait SnapshotIO: Send + Sync + 'static {
-    /// Write a complete snapshot atomically. Must fsync before returning Ok.
-    async fn save(&self, snapshot: &Snapshot) -> std::io::Result<()>;
-
-    /// Load the latest snapshot, if any.
-    async fn load_latest(&self) -> std::io::Result<Option<Snapshot>>;
-
-    /// Read a chunk of a snapshot at the given byte position.
+    async fn save(&self, snapshot: &Snapshot) -> Result<(), io::Error>;
+    async fn load_latest(&self) -> Result<Option<Snapshot>, io::Error>;
     async fn read_chunk(
         &self,
         id: &SnapshotId,
         position: u64,
         max_bytes: u32,
-    ) -> std::io::Result<(Bytes, bool)>;
-
-    /// Begin writing a snapshot received from a leader, chunk by chunk.
-    async fn begin_receive(&self, id: &SnapshotId) -> std::io::Result<SnapshotWriter>;
+    ) -> Result<(Bytes, bool), io::Error>;
+    async fn begin_receive(&self, id: &SnapshotId) -> Result<SnapshotWriter, io::Error>;
 }
 
-/// Network transport for sending RPCs to peer nodes.
-///
-/// Injected into `IoStage` so that `SendRpc` actions execute through a real
-/// (or test-mock) transport rather than a hardcoded placeholder.
+/// Outbound RPC transport (shared reference for concurrent sends).
 #[async_trait]
-pub trait NetworkSender: Send + Sync + 'static {
-    /// Send an RPC payload to the given peer. The payload is an opaque byte
-    /// buffer; higher-level RPC envelope framing is defined in a later stage.
-    async fn send(&self, target: crate::types::NodeId, data: Vec<u8>) -> std::io::Result<()>;
+pub trait TransportSender: Send + Sync + 'static {
+    async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<(), io::Error>;
 }
 
-/// Application state machine. Synchronous trait (not async) per architecture
-/// §4.1 — callbacks are invoked by the EventLoop, not the IoStage.
+/// Inbound RPC transport (exclusive access for sequential reads).
+#[async_trait]
+pub trait TransportReceiver: Send + 'static {
+    async fn recv(&mut self) -> Result<RpcEnvelope, io::Error>;
+}
+
+/// Runtime clock trait for timer management in the EventLoop.
+#[async_trait]
+pub trait Clock: Send + 'static {
+    fn now(&self) -> Instant;
+    async fn sleep_until(&self, deadline: Instant);
+    fn random_election_timeout(&self) -> Duration;
+}
+
+/// Application state machine — synchronous callbacks invoked by the EventLoop.
 pub trait StateMachine: Send + 'static {
-    /// Apply a committed command entry to the state machine.
-    fn apply(&mut self, offset: u64, record: &AppRecord) -> std::io::Result<()>;
-
-    /// Take a point-in-time snapshot of the current state machine state.
-    fn snapshot(&self) -> std::io::Result<AppSnapshot>;
-
-    /// Restore the state machine from a snapshot.
-    fn restore(&mut self, snapshot: AppSnapshot) -> std::io::Result<()>;
+    fn apply(&mut self, offset: u64, record: &crate::app_record::AppRecord) -> Result<(), io::Error>;
+    fn snapshot(&self) -> Result<crate::app_record::AppSnapshot, io::Error>;
+    fn restore(&mut self, snapshot: crate::app_record::AppSnapshot) -> Result<(), io::Error>;
 }

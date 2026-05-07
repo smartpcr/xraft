@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 /// Opaque application command payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRecord {
-    pub data: bytes::Bytes,
+    pub data: Bytes,
 }
 
 /// Opaque application snapshot payload.
