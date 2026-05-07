@@ -34,7 +34,7 @@ impl Term {
 
 impl fmt::Display for Term {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Term({})", self.0)
+        write!(f, "T{}", self.0)
     }
 }
 

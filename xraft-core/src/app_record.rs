@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// `StateMachine`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRecord {
-    pub data: bytes::Bytes,
+    pub data: Bytes,
 }
 
 /// Opaque application snapshot payload. Produced by `StateMachine::snapshot()`

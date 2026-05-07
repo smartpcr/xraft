@@ -16,6 +16,6 @@ pub struct VoterInfo {
 /// The `voters` field encodes the **complete** new voter set (not a delta).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VotersRecord {
-    pub version: u64,
+    pub version: u32,
     pub voters: Vec<VoterInfo>,
 }

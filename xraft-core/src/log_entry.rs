@@ -17,13 +17,16 @@ use crate::types::{Offset, Term};
 /// the application's `StateMachine`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EntryType {
+    /// Application-level state machine command (wraps an AppRecord).
     Command,
+    /// Appended by a new leader as the first entry of its term.
     LeaderChangeMessage,
+    /// Appended when processing AddVoter/RemoveVoter/UpdateVoter.
     VotersRecord,
 }
 
-/// A single log entry.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// A single entry in the replicated log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub offset: u64,
     pub term: Term,

@@ -6,7 +6,6 @@ use crate::voter::VoterInfo;
 /// The role a node occupies in the Raft protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Role {
-    /// Initial state before bootstrap or recovery completes.
     Unattached,
     Follower,
     Candidate,
