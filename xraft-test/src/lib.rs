@@ -1,5 +1,7 @@
-pub mod simulated_clock;
-pub mod test_harness;
+pub mod memory_log;
+pub mod memory_snapshot;
+pub mod memory_state_machine;
 
-#[cfg(test)]
-mod check_quorum_tests;
+pub use memory_log::MemoryLogStore;
+pub use memory_snapshot::MemorySnapshotStore;
+pub use memory_state_machine::MemoryStateMachine;

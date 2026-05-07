@@ -1,19 +1,22 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::{NodeId, Term};
-use crate::voter::VoterInfo;
+use crate::types::{NodeId, Term, VoterInfo};
 
-/// Node role in the Raft protocol.
+/// Role of a node in the consensus protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     Unattached,
+    /// Following a known leader.
     Follower,
+    /// Running an election.
     Candidate,
+    /// Serving as cluster leader.
     Leader,
 }
 
-/// Public projection of the consensus state, returned by `RaftNode::read()`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Public projection of NodeState, returned by `RaftNode::read()`.
+/// Contains only the fields safe to expose externally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsensusState {
     pub node_id: NodeId,
     pub current_term: Term,
