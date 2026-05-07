@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
 
 /// Configuration for the Raft node.
 #[derive(Debug, Clone)]
@@ -8,8 +8,9 @@ pub struct RaftConfig {
     pub fetch_interval_ms: u64,
     pub max_batch_size: usize,
     pub max_fetch_bytes: u32,
+    /// Number of committed entries between snapshots.
     pub snapshot_interval: u64,
-    pub data_dir: PathBuf,
+    pub data_dir: String,
 }
 
 impl Default for RaftConfig {
@@ -18,10 +19,10 @@ impl Default for RaftConfig {
             election_timeout_min_ms: 150,
             election_timeout_max_ms: 300,
             fetch_interval_ms: 50,
-            max_batch_size: 256,
-            max_fetch_bytes: 1024 * 1024,
-            snapshot_interval: 10_000,
-            data_dir: PathBuf::from("data"),
+            max_batch_size: 100,
+            max_fetch_bytes: 1_048_576,
+            snapshot_interval: 1000,
+            data_dir: "data".to_string(),
         }
     }
 }

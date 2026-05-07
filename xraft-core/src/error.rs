@@ -1,5 +1,4 @@
-use std::fmt;
-use std::io;
+use thiserror::Error;
 
 /// Top-level error type for xraft.
 #[derive(Error, Debug)]

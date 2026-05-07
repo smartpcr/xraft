@@ -1,4 +1,5 @@
 use std::fmt;
+use std::net::SocketAddr;
 
 /// Unique identifier for a node in the Raft cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -22,12 +23,14 @@ impl fmt::Display for NodeId {
     }
 }
 
-/// Monotonically increasing logical clock (epoch).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+/// Monotonically increasing logical clock / leader epoch.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub struct Term(pub u64);
 
 impl Term {
-    pub fn next(self) -> Term {
+    pub fn next(self) -> Self {
         Term(self.0 + 1)
     }
 }
