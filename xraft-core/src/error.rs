@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io;
 
 /// Errors produced by xraft operations.
 #[derive(Debug)]

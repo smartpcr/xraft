@@ -1,5 +1,9 @@
+use std::io;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio::time::Instant;
 
 use crate::error::Result;
 use crate::log_entry::LogEntry;
@@ -12,8 +16,6 @@ pub trait LogStore: Send + Sync + 'static {
     async fn truncate_suffix(&self, from_offset: u64) -> Result<()>;
     async fn truncate_prefix(&self, up_to_offset: u64) -> Result<()>;
     fn log_start_offset(&self) -> u64;
-
-    /// The next offset to be written (one past the last entry).
     fn log_end_offset(&self) -> u64;
     async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>>;
 }

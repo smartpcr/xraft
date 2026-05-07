@@ -1,13 +1,11 @@
+use serde::{Deserialize, Serialize};
+
 use crate::app_record::AppSnapshot;
 use crate::types::Term;
 use crate::voter::VoterInfo;
 
-/// Unique identifier for a snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct SnapshotId(pub String);
-
-/// Consensus metadata included in every snapshot.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Consensus metadata included in a snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
     pub last_included_offset: u64,
     pub last_included_term: Term,
@@ -15,20 +13,19 @@ pub struct SnapshotMetadata {
     pub leader_epoch: Term,
 }
 
-/// A complete snapshot: consensus metadata + application state.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Composite snapshot: consensus metadata + application payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub metadata: SnapshotMetadata,
     pub app_snapshot: AppSnapshot,
 }
 
-/// Writer for receiving snapshot chunks from a leader.
-pub struct SnapshotWriter {
-    pub id: SnapshotId,
+/// Wraps a snapshot chunk stream for follower restore.
+pub struct SnapshotReader {
+    pub data: Vec<u8>,
 }
 
-/// Reader for serving snapshot chunks to a follower
-/// (used by `Listener::handle_load_snapshot` and `FetchSnapshot` RPC).
-pub struct SnapshotReader {
-    pub id: SnapshotId,
+/// Wraps a chunked write session for receiving snapshots from leader.
+pub struct SnapshotWriter {
+    pub data: Vec<u8>,
 }
