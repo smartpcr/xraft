@@ -177,7 +177,7 @@
     "contentHash": "e127b4c94a90d1cf6ed162d1012e1d62ad5515fa730fbcd495ebb50711cdf0a5",
     "workstreamId": "ws-raft-raft-protocol-phase-election-and-leader-lifecycle-xraft-core-stage-check-quorum-and-leader-step-down",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-election-and-leader-lifecycle-xraft-core-stage-check-quorum-and-leader-step-down",
-    "status": "review"
+    "status": "complete"
   },
   {
     "title": "Fetch RPC \u2014 Follower Side",
@@ -267,7 +267,7 @@
     "contentHash": "d5b5a940f364b0bbd1f320edc85f77109024f7e9b89158b134dc20dda3e58e1e",
     "workstreamId": "ws-raft-raft-protocol-phase-dynamic-quorum-membership-changes-stage-update-voter-and-votersrecord-snapshot-integration",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-dynamic-quorum-membership-changes-stage-update-voter-and-votersrecord-snapshot-integration",
-    "status": "review"
+    "status": "complete"
   },
   {
     "title": "Simulated Cluster",
