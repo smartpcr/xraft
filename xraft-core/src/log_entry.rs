@@ -1,6 +1,5 @@
-use crate::app_record::AppRecord;
-use crate::types::Term;
-use crate::voter::VotersRecord;
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 /// The type of a log entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,8 +12,8 @@ pub enum EntryType {
     VotersRecord,
 }
 
-/// A single log entry.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// A single entry in the replicated log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     /// The offset of this entry in the log.
     pub offset: u64,

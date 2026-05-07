@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use crate::app_record::AppSnapshot;
 use crate::voter::VoterInfo;
 use bytes::Bytes;

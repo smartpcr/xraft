@@ -19,7 +19,7 @@ impl Default for RaftConfig {
             election_timeout_max_ms: 300,
             fetch_interval_ms: 50,
             max_batch_size: 256,
-            max_fetch_bytes: 1024 * 1024, // 1 MiB
+            max_fetch_bytes: 1024 * 1024,
             snapshot_interval: 10_000,
             data_dir: PathBuf::from("data"),
         }
@@ -38,5 +38,13 @@ impl RaftConfig {
             return Err("fetch_interval_ms must be < election_timeout_min_ms".to_string());
         }
         Ok(())
+    }
+
+    pub fn election_timeout_min(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.election_timeout_min_ms)
+    }
+
+    pub fn election_timeout_max(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.election_timeout_max_ms)
     }
 }

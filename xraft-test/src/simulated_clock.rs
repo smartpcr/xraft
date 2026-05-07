@@ -1,60 +1,63 @@
-//! Deterministic clock for simulation testing.
-//!
-//! Implements the `Clock` trait to provide explicit time control in tests.
-//! The clock is advanced by the test harness, ensuring reproducible behavior.
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use std::sync::{Arc, Mutex};
+use tokio::time::Instant;
+
 use xraft_core::traits::Clock;
 
-/// Deterministic simulated clock implementing the `Clock` trait.
-///
-/// Time advances only when explicitly told to via `advance()` or `set()`.
-/// Election timeout is deterministic but configurable per-instance to
-/// support node-specific timeout staggering.
+/// Deterministic clock for testing. Time only advances when
+/// `advance()` is called. `sleep_until` returns immediately when
+/// the internal instant is >= the requested deadline, otherwise
+/// it yields once and returns (tests must advance time externally).
+#[derive(Clone)]
 pub struct SimulatedClock {
-    inner: Arc<Mutex<ClockInner>>,
+    inner: Arc<Mutex<SimulatedClockInner>>,
 }
 
-struct ClockInner {
-    now_ms: u64,
-    election_timeout_ms: u64,
+struct SimulatedClockInner {
+    now: Instant,
+    election_timeout: Duration,
 }
 
 impl SimulatedClock {
-    /// Create a new clock starting at time 0 with the given election timeout.
-    pub fn new(election_timeout_ms: u64) -> Self {
+    pub fn new(election_timeout: Duration) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ClockInner {
-                now_ms: 0,
-                election_timeout_ms,
+            inner: Arc::new(Mutex::new(SimulatedClockInner {
+                now: Instant::now(),
+                election_timeout,
             })),
         }
     }
 
-    /// Advance the clock by `ms` milliseconds.
-    pub fn advance(&self, ms: u64) {
-        self.inner.lock().unwrap().now_ms += ms;
+    /// Advance clock by the given duration.
+    pub fn advance(&self, d: Duration) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.now += d;
     }
 
-    /// Set the clock to an absolute value.
-    pub fn set(&self, ms: u64) {
-        self.inner.lock().unwrap().now_ms = ms;
-    }
-
-    /// Read the current time without advancing.
-    pub fn now(&self) -> u64 {
-        self.inner.lock().unwrap().now_ms
+    /// Get current simulated instant.
+    pub fn current(&self) -> Instant {
+        self.inner.lock().unwrap().now
     }
 }
 
 #[async_trait]
 impl Clock for SimulatedClock {
-    fn now_ms(&self) -> u64 {
-        self.inner.lock().unwrap().now_ms
+    fn now(&self) -> Instant {
+        self.inner.lock().unwrap().now
     }
 
-    fn random_election_timeout_ms(&self) -> u64 {
-        self.inner.lock().unwrap().election_timeout_ms
+    async fn sleep_until(&self, deadline: Instant) {
+        // In tests we don't actually sleep — we just yield once.
+        // The caller is expected to advance() the clock past the deadline.
+        if self.now() < deadline {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn random_election_timeout(&self) -> Duration {
+        // Deterministic in tests.
+        self.inner.lock().unwrap().election_timeout
     }
 }
