@@ -1,4 +1,5 @@
 pub mod types;
+pub mod voter;
 
 pub use config::RaftConfig;
 pub use error::{Result, XraftError};

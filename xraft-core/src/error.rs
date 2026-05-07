@@ -1,4 +1,6 @@
-use thiserror::Error;
+use crate::types::NodeId;
+use std::fmt;
+use std::io;
 
 /// Public error type for xraft operations.
 #[derive(Debug)]
@@ -13,17 +15,14 @@ pub enum XraftError {
     },
     /// BatchAccumulator back-pressure limit reached.
     ProposalQueueFull,
-
-    #[error("invalid cluster id")]
+    /// RPC cluster_id mismatch.
     InvalidClusterId,
     /// Node is shutting down.
     Shutdown,
-
-    #[error("serialization error: {0}")]
-    SerializationError(String),
-
-    #[error("{0}")]
-    Other(String),
+    /// Bootstrap precondition not met (log not empty, quorum-state exists, or snapshot exists).
+    BootstrapPreconditionFailed(String),
+    /// Invalid configuration parameters.
+    InvalidConfig(String),
 }
 
 impl fmt::Display for XraftError {

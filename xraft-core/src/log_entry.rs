@@ -10,7 +10,7 @@ pub struct AppRecord {
 }
 
 /// A single entry in the replicated log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     /// Position in the log (0-indexed).
     pub offset: u64,
