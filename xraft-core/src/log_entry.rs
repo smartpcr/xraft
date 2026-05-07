@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Offset, Term};
@@ -39,7 +40,7 @@ impl LogEntry {
             offset,
             term,
             entry_type: EntryType::Command,
-            data: record.data.clone(),
+            payload: record.data.clone(),
         }
     }
 
@@ -49,7 +50,7 @@ impl LogEntry {
             offset,
             term,
             entry_type: EntryType::LeaderChangeMessage,
-            data: Vec::new(),
+            payload: Bytes::new(),
         }
     }
 }
