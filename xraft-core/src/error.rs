@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io;
 
 use crate::types::NodeId;
 
@@ -38,7 +39,7 @@ impl fmt::Display for XraftError {
 impl std::error::Error for XraftError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::StorageError(e) | Self::TransportError(e) => Some(e),
+            XraftError::StorageError(e) | XraftError::TransportError(e) => Some(e),
             _ => None,
         }
     }
