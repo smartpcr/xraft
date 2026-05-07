@@ -10,14 +10,3 @@ pub struct QuorumState {
     pub leader_id: Option<NodeId>,
     pub leader_epoch: Term,
 }
-
-impl Default for QuorumState {
-    fn default() -> Self {
-        Self {
-            current_term: Term(0),
-            voted_for: None,
-            leader_id: None,
-            leader_epoch: Term(0),
-        }
-    }
-}

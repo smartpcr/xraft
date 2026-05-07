@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use tokio::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::log_entry::LogEntry;
@@ -24,27 +26,20 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 /// dispatched concurrently from `IoStage`.
 #[async_trait]
 pub trait LogStore: Send + Sync + 'static {
-    /// Append entries to the log.
-    async fn append(&self, entries: &[LogEntry]) -> Result<()>;
-    /// Read entries in range [start_offset, end_offset).
-    async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>>;
-    /// Remove all entries at and after the given offset.
-    async fn truncate_suffix(&self, from_offset: u64) -> Result<()>;
-    /// Delete entries before the given offset.
-    async fn truncate_prefix(&self, up_to_offset: u64) -> Result<()>;
-    /// First offset still in the log (after compaction).
+    async fn append(&self, entries: &[LogEntry]) -> XraftResult<()>;
+    async fn read(&self, start_offset: u64, end_offset: u64) -> XraftResult<Vec<LogEntry>>;
+    async fn truncate_suffix(&self, from_offset: u64) -> XraftResult<()>;
+    async fn truncate_prefix(&self, up_to_offset: u64) -> XraftResult<()>;
     fn log_start_offset(&self) -> u64;
-    /// Next offset to be appended.
     fn log_end_offset(&self) -> u64;
-    /// Read a single entry at the given offset.
-    async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>>;
+    async fn entry_at(&self, offset: u64) -> XraftResult<Option<LogEntry>>;
 }
 
 /// Persisted quorum state (current term + voted-for).
 #[async_trait]
 pub trait QuorumStateStore: Send + Sync + 'static {
-    async fn load(&self) -> Result<Option<QuorumState>>;
-    async fn save(&self, state: &QuorumState) -> Result<()>;
+    async fn load(&self) -> XraftResult<Option<QuorumState>>;
+    async fn save(&self, state: &QuorumState) -> XraftResult<()>;
 }
 
 /// Snapshot persistence: save, load, and streaming chunk I/O.
@@ -87,21 +82,42 @@ pub trait QuorumStateStore: Send + Sync + 'static {
 /// Snapshot I/O operations.
 #[async_trait]
 pub trait SnapshotIO: Send + Sync + 'static {
-    async fn save(&self, snapshot: &Snapshot) -> Result<()>;
-    async fn load_latest(&self) -> Result<Option<Snapshot>>;
+    async fn save(&self, snapshot: &Snapshot) -> XraftResult<()>;
+    async fn load_latest(&self) -> XraftResult<Option<Snapshot>>;
     async fn read_chunk(
         &self,
         id: &SnapshotId,
         position: u64,
         max_bytes: u32,
-    ) -> Result<(Vec<u8>, bool)>;
+    ) -> XraftResult<(Bytes, bool)>;
+    async fn begin_receive(&self, id: &SnapshotId) -> XraftResult<SnapshotWriter>;
 }
 
-/// Application state machine.
+/// Outbound RPC sender. Takes `&self` for concurrent sends.
+#[async_trait]
+pub trait TransportSender: Send + Sync + 'static {
+    async fn send(&self, target: NodeId, message: RpcEnvelope) -> XraftResult<()>;
+}
+
+/// Inbound RPC receiver. Takes `&mut self` — exclusive access by ReceiverTask.
+#[async_trait]
+pub trait TransportReceiver: Send + 'static {
+    async fn recv(&mut self) -> XraftResult<RpcEnvelope>;
+}
+
+/// Deterministic time source. Used by EventLoop for timer management.
+#[async_trait]
+pub trait Clock: Send + 'static {
+    fn now(&self) -> Instant;
+    async fn sleep_until(&self, deadline: Instant);
+    fn random_election_timeout(&self) -> Duration;
+}
+
+/// Application state machine. Synchronous — invoked by EventLoop.
 pub trait StateMachine: Send + 'static {
-    fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>;
-    fn snapshot(&self) -> Result<AppSnapshot>;
-    fn restore(&mut self, snapshot: AppSnapshot) -> Result<()>;
+    fn apply(&mut self, offset: u64, record: &AppRecord) -> XraftResult<()>;
+    fn snapshot(&self) -> XraftResult<AppSnapshot>;
+    fn restore(&mut self, snapshot: AppSnapshot) -> XraftResult<()>;
 }
 
 // ---------------------------------------------------------------------------
