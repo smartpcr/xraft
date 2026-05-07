@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::membership::NodeId;
+
 /// Top-level error type for xraft operations.
 #[derive(Debug, Error)]
 pub enum XraftError {
@@ -9,8 +11,8 @@ pub enum XraftError {
     #[error("transport error: {0}")]
     TransportError(String),
 
-    #[error("not leader")]
-    NotLeader,
+    #[error("not leader (leader_id: {leader_id:?})")]
+    NotLeader { leader_id: Option<NodeId> },
 
     #[error("proposal queue full")]
     ProposalQueueFull,
