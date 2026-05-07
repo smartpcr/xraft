@@ -2,18 +2,16 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::app_record::AppSnapshot;
-use crate::types::{Term, VoterInfo};
+use crate::types::Term;
+use crate::voter::VoterInfo;
 
 /// Consensus metadata stored alongside a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
-    /// Last log entry offset included in this snapshot.
     pub last_included_offset: u64,
-    /// Term of the last included entry.
     pub last_included_term: Term,
     /// Voter set at snapshot time.
     pub voters: Vec<VoterInfo>,
-    /// Leader epoch at snapshot time.
     pub leader_epoch: Term,
 }
 
