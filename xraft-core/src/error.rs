@@ -1,5 +1,4 @@
-use std::fmt;
-use std::io;
+use thiserror::Error;
 
 /// Errors produced by xraft operations.
 #[derive(Debug)]
@@ -8,7 +7,11 @@ pub enum XraftError {
     TransportError(String),
     NotLeader,
     ProposalQueueFull,
+
+    #[error("invalid cluster id")]
     InvalidClusterId,
+
+    #[error("shutdown")]
     Shutdown,
 
 impl fmt::Display for XraftError {

@@ -1,4 +1,8 @@
-/target/
+target/
 Cargo.lock
-**/*.rs.bk
-*.pdb
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.orig

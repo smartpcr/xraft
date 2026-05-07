@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Offset, Term};
@@ -15,7 +14,7 @@ pub enum EntryType {
 }
 
 /// A single entry in the replicated log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
     /// Position in the log (0-based).
     pub offset: Offset,
