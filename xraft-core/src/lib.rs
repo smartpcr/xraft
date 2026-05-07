@@ -11,34 +11,32 @@ pub mod traits;
 pub mod error;
 pub mod config;
 pub mod consensus_state;
-pub mod election;
 pub mod error;
-pub mod event_loop;
 pub mod follower_progress;
-pub mod io_action;
-pub mod listener;
-pub mod listener_event;
 pub mod log_entry;
+pub mod membership;
 pub mod node_state;
-pub use node_state::NodeState;
 pub mod quorum_state;
 pub mod rpc;
 pub mod snapshot;
 pub mod traits;
 pub mod types;
-pub mod voter;
 
+// Re-exports for convenience
 pub use app_record::{AppRecord, AppSnapshot};
 pub use config::RaftConfig;
 pub use consensus_state::{ConsensusState, Role};
-pub use error::XraftError;
-pub use event_loop::{EventLoop, EventLoopMessage};
-pub use io_action::{IoAction, IoActionBatch, IoStage};
-pub use listener::Listener;
-pub use listener_event::ListenerEvent;
+pub use error::{Result, XraftError};
+pub use follower_progress::FollowerProgress;
 pub use log_entry::{EntryType, LogEntry};
+pub use membership::MembershipManager;
+pub use node_state::{NodeState, PendingMembershipChange};
 pub use quorum_state::QuorumState;
-pub use snapshot::{Snapshot, SnapshotMetadata};
-pub use traits::{Clock, LogStore, QuorumStateStore, SnapshotIO, StateMachine, TransportReceiver, TransportSender};
-pub use types::{ClusterId, NodeId, Offset, Term};
-pub use voter::{VoterInfo, VotersRecord};
+pub use rpc::{
+    AddVoterRequest, MembershipChangeResponse, MembershipError, RemoveVoterRequest,
+    UpdateVoterRequest,
+};
+pub use snapshot::{Snapshot, SnapshotId, SnapshotMetadata};
+pub use snapshot_coordinator::SnapshotCoordinator;
+pub use traits::{LogStore, QuorumStateStore, SnapshotIO, StateMachine};
+pub use types::{ClusterId, NodeId, Offset, Term, VoterInfo, VotersRecord};

@@ -1,13 +1,12 @@
-use tokio::time::Instant;
+use serde::{Deserialize, Serialize};
 
 use crate::types::NodeId;
 
-/// Leader-side per-follower replication progress tracking.
-#[derive(Debug, Clone)]
+/// Per-follower replication progress tracked by the leader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FollowerProgress {
     pub node_id: NodeId,
     pub fetch_offset: u64,
-    /// `None` means no Fetch has ever been received from this follower.
-    pub last_fetch_timestamp: Option<Instant>,
+    /// Whether this follower counts for quorum.
     pub is_voter: bool,
 }
