@@ -1,14 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::{NodeId, Term};
-use crate::voter::VoterInfo;
+use crate::types::{NodeId, Term, VoterInfo};
 
 /// The role a node occupies in the Raft protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Role {
     Unattached,
+    /// Following a known leader.
     Follower,
+    /// Running an election.
     Candidate,
+    /// Serving as cluster leader.
     Leader,
 }
 

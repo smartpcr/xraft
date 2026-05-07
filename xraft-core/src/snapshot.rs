@@ -2,8 +2,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::app_record::AppSnapshot;
-use crate::types::Term;
-use crate::voter::VoterInfo;
+use crate::types::{Term, VoterInfo};
 
 /// Consensus metadata stored alongside a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,4 +1,4 @@
-use tokio::time::Instant;
+use serde::{Deserialize, Serialize};
 
 use crate::types::NodeId;
 

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::net::SocketAddr;
 
 /// Unique numeric identifier for a node within a cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -27,7 +28,7 @@ impl fmt::Display for NodeId {
 pub struct Term(pub u64);
 
 impl Term {
-    pub fn next(self) -> Term {
+    pub fn next(self) -> Self {
         Term(self.0 + 1)
     }
 }
