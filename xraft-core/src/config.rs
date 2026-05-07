@@ -41,4 +41,12 @@ impl RaftConfig {
         }
         Ok(())
     }
+
+    pub fn election_timeout_min(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.election_timeout_min_ms)
+    }
+
+    pub fn election_timeout_max(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.election_timeout_max_ms)
+    }
 }

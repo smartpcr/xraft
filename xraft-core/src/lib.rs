@@ -9,7 +9,6 @@ pub mod node_state;
 pub mod quorum_state;
 pub mod rpc;
 pub mod snapshot;
-pub mod snapshot_coordinator;
 pub mod traits;
 pub mod types;
 

@@ -87,3 +87,11 @@ impl VotersRecord {
         self.voters.iter().find(|v| v.node_id == node_id)
     }
 }
+
+/// Cluster identity for fencing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ClusterId(pub uuid::Uuid);
+
+/// Log offset (position in the log, 0-indexed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Offset(pub u64);

@@ -5,7 +5,6 @@ use crate::types::{NodeId, Term, VoterInfo};
 /// Role of a node in the consensus protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
-    /// Initial state before bootstrap or recovery completes.
     Unattached,
     /// Following a known leader.
     Follower,
