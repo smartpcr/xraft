@@ -1,5 +1,8 @@
 pub mod leader_epoch_checkpoint;
+pub mod memory_log;
+pub mod memory_log_store;
+pub mod memory_quorum_state;
 pub mod quorum_state_file;
-
-pub use leader_epoch_checkpoint::LeaderEpochCheckpoint;
-pub use quorum_state_file::QuorumStateFile;
+pub mod segment;
+pub mod segment_index;
+pub mod segment_log;
