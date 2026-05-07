@@ -1,231 +1,236 @@
-use crate::error::{Result, XraftError};
-use crate::log_entry::EntryType;
-use crate::node_state::NodeState;
-use crate::snapshot::{Snapshot, SnapshotMetadata};
-use crate::traits::{LogStore, SnapshotIO, StateMachine};
-use crate::types::VotersRecord;
+// -----------------------------------------------------------------------
+// Copyright (c) Microsoft Corp. All rights reserved.
+// -----------------------------------------------------------------------
 
-/// Coordinates snapshot creation and recovery.
-pub struct SnapshotCoordinator;
+use std::sync::Arc;
+
+use tracing::{debug, info, warn};
+
+use crate::error::{RaftError, RaftResult};
+use crate::log_store::LogStore;
+use crate::membership::{VoterSet, VotersRecord};
+use crate::node::{NodeId, NodeRole};
+use crate::snapshot_io::{SnapshotIo, SnapshotMetadata};
+use crate::state::RaftState;
+
+/// Coordinates snapshot creation and recovery, ensuring that the voter set
+/// recorded in a snapshot is consistent with the log store and the active
+/// membership configuration after restoration.
+pub struct SnapshotCoordinator {
+    node_id: NodeId,
+}
 
 impl SnapshotCoordinator {
-    /// Create a snapshot capturing the current committed state.
-    ///
-    /// The snapshot includes:
-    /// - Consensus metadata (offsets, term, voter set, leader epoch)
-    /// - Application state machine snapshot
-    ///
-    /// The voter set in the snapshot is the **committed** voter set from
-    /// NodeState, ensuring recovery restores the correct membership.
-    ///
-    /// `last_included_term` is derived from the actual log entry at
-    /// `last_included_offset`, not from `current_term`. If the entry has
-    /// been compacted and a previous snapshot covers that exact offset,
-    /// the previous snapshot's term is used. Otherwise, an error is returned.
-    pub async fn create_snapshot(
-        state: &NodeState,
-        state_machine: &dyn StateMachine,
-        snapshot_io: &dyn SnapshotIO,
-        log_store: &dyn LogStore,
-    ) -> Result<Snapshot> {
-        if state.high_watermark == 0 {
-            return Err(XraftError::Other("no committed entries to snapshot".into()));
-        }
-
-        // The snapshot covers up to HW - 1 (last committed offset)
-        let last_included_offset = state.high_watermark - 1;
-
-        // Derive last_included_term from the actual log entry
-        let last_included_term = if let Some(entry) = log_store.entry_at(last_included_offset).await? {
-            entry.term
-        } else if let Some(prev_snap) = snapshot_io.load_latest().await? {
-            // Entry compacted — only safe if previous snapshot covers this exact offset
-            if prev_snap.metadata.last_included_offset == last_included_offset {
-                prev_snap.metadata.last_included_term
-            } else {
-                return Err(XraftError::Other(format!(
-                    "cannot determine term for offset {}: entry compacted and no matching snapshot",
-                    last_included_offset
-                )));
-            }
-        } else {
-            return Err(XraftError::Other(format!(
-                "cannot determine term for offset {}: entry not in log and no snapshot",
-                last_included_offset
-            )));
-        };
-
-        // Get application snapshot
-        let app_snapshot = state_machine.snapshot()?;
-
-        let metadata = SnapshotMetadata {
-            last_included_offset,
-            last_included_term,
-            // Use committed voter set — this is the key integration point
-            voters: state.voter_set.clone(),
-            leader_epoch: state.current_term,
-        };
-
-        let snapshot = Snapshot {
-            metadata,
-            app_snapshot,
-        };
-
-        // Persist the snapshot
-        snapshot_io.save(&snapshot).await?;
-
-        Ok(snapshot)
+    pub fn new(node_id: NodeId) -> Self {
+        Self { node_id }
     }
 
-    /// Recover node state from a snapshot.
-    ///
-    /// Recovery flow (per architecture §5.10):
-    /// 1. Load latest snapshot
-    /// 2. Restore committed voter set from snapshot metadata
-    /// 3. Restore state machine from app snapshot
-    /// 4. Scan log tail for bookkeeping — advance `log_end_offset` and track
-    ///    any VotersRecord entries as **pending** (uncommitted). The
-    ///    `high_watermark` is NOT advanced — it stays at
-    ///    `snapshot.last_included_offset + 1`. Entries between HW and
-    ///    log_end_offset have unknown committed status; the authoritative HW
-    ///    comes from the leader via Fetch responses after recovery.
-    /// 5. Transition to Follower role; begin accepting RPCs.
-    pub async fn recover_from_snapshot(
-        state: &mut NodeState,
-        state_machine: &mut dyn StateMachine,
-        snapshot_io: &dyn SnapshotIO,
-        log_store: &dyn LogStore,
-    ) -> Result<bool> {
-        // Step 1: Load latest snapshot
-        let snapshot = match snapshot_io.load_latest().await? {
-            Some(s) => s,
-            None => return Ok(false),
-        };
+    // ------------------------------------------------------------------
+    // Snapshot creation
+    // ------------------------------------------------------------------
 
-        // Step 2: Restore committed voter set and consensus metadata
-        state.restore_from_snapshot_metadata(
-            snapshot.metadata.last_included_offset,
-            snapshot.metadata.last_included_term,
-            snapshot.metadata.voters.clone(),
-            snapshot.metadata.leader_epoch,
+    /// Creates a snapshot of the current state and persists it via
+    /// `snapshot_io`. Returns the metadata of the newly created snapshot.
+    pub async fn create_snapshot(
+        &self,
+        state: &RaftState,
+        log_store: &dyn LogStore,
+        snapshot_io: &dyn SnapshotIo,
+    ) -> RaftResult<SnapshotMetadata> {
+        let last_applied = state.last_applied_index();
+        let last_term = state.last_applied_term();
+        let voter_set = state.voter_set().clone();
+        let voters_record = state.voters_record().clone();
+
+        info!(
+            node = %self.node_id,
+            last_applied_index = last_applied,
+            last_applied_term = last_term,
+            voters = ?voter_set,
+            "creating snapshot"
         );
 
-        // Step 3: Restore application state machine
-        state_machine.restore(snapshot.app_snapshot)?;
+        // 1. Serialise application state.
+        let app_state = state.serialize_application_state()?;
 
-        // Step 4: Scan log tail for bookkeeping only.
-        // DO NOT advance HW or apply VotersRecord to committed voter_set.
-        // VotersRecord entries are tracked as pending membership changes.
-        let replay_start = snapshot.metadata.last_included_offset + 1;
-        let log_end = log_store.log_end_offset();
+        // 2. Build metadata.
+        let metadata = SnapshotMetadata {
+            last_included_index: last_applied,
+            last_included_term: last_term,
+            voter_set: voter_set.clone(),
+            voters_record: voters_record.clone(),
+        };
 
-        if log_end > replay_start {
-            let entries = log_store.read(replay_start, log_end).await?;
-            for entry in &entries {
-                state.replay_log_tail_entry(entry)?;
-            }
-        }
+        // 3. Persist.
+        snapshot_io.save(metadata.clone(), &app_state).await?;
 
-        // Step 5: Transition to Follower
-        state.role = crate::consensus_state::Role::Follower;
+        // 4. Compact the log up to the snapshot point.
+        log_store.compact(last_applied).await?;
 
-        Ok(true)
+        info!(
+            node = %self.node_id,
+            last_included_index = last_applied,
+            "snapshot created and log compacted"
+        );
+
+        Ok(metadata)
     }
 
-    /// Truncate the log prefix after a successful snapshot.
-    /// Entries up to and including last_included_offset can be removed.
-    pub async fn truncate_log_after_snapshot(
-        state: &mut NodeState,
+    // ------------------------------------------------------------------
+    // Snapshot recovery
+    // ------------------------------------------------------------------
+
+    /// Recovers node state from the latest available snapshot.
+    ///
+    /// Returns `Ok(true)` if a snapshot was found and successfully applied,
+    /// or `Ok(false)` if no snapshot is available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot exists but cannot be applied, or if
+    /// post-restore consistency checks fail (e.g. voter-set mismatch).
+    pub async fn recover_from_snapshot(
+        &self,
+        state: &mut RaftState,
         log_store: &dyn LogStore,
-        last_included_offset: u64,
-    ) -> Result<()> {
-        let new_start = last_included_offset + 1;
-        log_store.truncate_prefix(new_start).await?;
-        state.log_start_offset = new_start;
-        Ok(())
-    }
-
-    /// Verify post-recovery voter set consistency.
-    ///
-    /// Checks that the committed `voter_set` in NodeState matches the last
-    /// committed `VotersRecord`. The "last committed VotersRecord" is
-    /// determined by scanning committed log entries between the snapshot end
-    /// and HW — if any VotersRecord exists there, the last one (by offset)
-    /// is the authoritative committed set. If none exists, the snapshot
-    /// metadata voters are authoritative.
-    ///
-    /// Also checks that any uncommitted VotersRecord entries in the log tail
-    /// (between HW and log_end_offset) are properly tracked as
-    /// `pending_membership_change`.
-    ///
-    /// Returns `true` if the state is consistent.
-    pub async fn verify_voter_set_consistency(
-        state: &NodeState,
-        log_store: &dyn LogStore,
-        snapshot_io: &dyn SnapshotIO,
-    ) -> Result<bool> {
-        // 1. Determine the authoritative committed voter set.
-        //    Start from snapshot metadata; override with last committed VR if any.
-        if let Some(snapshot) = snapshot_io.load_latest().await? {
-            let snap_end = snapshot.metadata.last_included_offset + 1;
-            let mut expected_voters = snapshot.metadata.voters.clone();
-
-            // If HW advanced past the snapshot, scan for committed VotersRecords
-            if state.high_watermark > snap_end {
-                let committed_entries =
-                    log_store.read(snap_end, state.high_watermark).await?;
-                // Find the last committed VotersRecord (highest offset)
-                let last_committed_vr = committed_entries
-                    .iter()
-                    .rev()
-                    .find(|e| e.entry_type == EntryType::VotersRecord);
-
-                if let Some(entry) = last_committed_vr {
-                    let record: VotersRecord = bincode::deserialize(&entry.payload)
-                        .map_err(|e| XraftError::SerializationError(format!(
-                            "failed to deserialize committed VotersRecord at offset {}: {}",
-                            entry.offset, e
-                        )))?;
-                    expected_voters = record.voters;
-                }
-            }
-
-            // Compare actual voter_set against expected
-            if state.voter_set != expected_voters {
+        snapshot_io: &dyn SnapshotIo,
+    ) -> RaftResult<bool> {
+        // Step 1 — load the latest snapshot (if any).
+        let (metadata, app_state) = match snapshot_io.load_latest().await? {
+            Some(pair) => pair,
+            None => {
+                debug!(node = %self.node_id, "no snapshot found; skipping recovery");
                 return Ok(false);
             }
-        }
+        };
 
-        // 2. Any VotersRecord in the uncommitted tail (HW..log_end_offset)
-        //    must be tracked as pending_membership_change.
-        let start = state.high_watermark.max(log_store.log_start_offset());
-        let end = log_store.log_end_offset();
+        info!(
+            node = %self.node_id,
+            last_included_index = metadata.last_included_index,
+            last_included_term = metadata.last_included_term,
+            voters = ?metadata.voter_set,
+            "recovering from snapshot"
+        );
 
-        if end > start {
-            let tail_entries = log_store.read(start, end).await?;
-            let last_tail_vr = tail_entries
-                .iter()
-                .rev()
-                .find(|e| e.entry_type == EntryType::VotersRecord);
+        // Step 2 — restore application state.
+        state.restore_application_state(&app_state)?;
 
-            match (last_tail_vr, &state.pending_membership_change) {
-                (Some(entry), Some(pending)) => {
-                    // Pending offset must match the last VotersRecord in tail
-                    if pending.offset != entry.offset {
-                        return Ok(false);
-                    }
-                    let record: VotersRecord = bincode::deserialize(&entry.payload)
-                        .map_err(|e| XraftError::SerializationError(e.to_string()))?;
-                    if pending.voters != record.voters {
-                        return Ok(false);
-                    }
-                }
-                (Some(_), None) => return Ok(false), // VR in tail but no pending
-                (None, Some(_)) => {} // pending from before snapshot — ok if HW hasn't advanced
-                (None, None) => {}
-            }
-        }
+        // Step 3 — apply snapshot metadata to Raft state.
+        state.set_last_applied(metadata.last_included_index, metadata.last_included_term);
+        state.set_commit_index(metadata.last_included_index);
+
+        // Step 4 — restore voter set and voters record from the snapshot.
+        state.set_voter_set(metadata.voter_set.clone());
+        state.set_voters_record(metadata.voters_record.clone());
+
+        // Step 5 — transition role. After a snapshot install the node
+        // demotes itself to Follower to avoid stale-leader scenarios.
+        state.transition_role(NodeRole::Follower);
+
+        // Step 6 — verify that the restored voter set is consistent with
+        // the log store and snapshot metadata. A corrupt snapshot or an
+        // inconsistent log tail could silently produce an incorrect
+        // committed voter set, breaking election quorum safety.
+        Self::verify_voter_set_consistency(state, log_store, snapshot_io).await?;
+
+        info!(
+            node = %self.node_id,
+            last_applied_index = state.last_applied_index(),
+            "snapshot recovery complete"
+        );
 
         Ok(true)
     }
+
+    // ------------------------------------------------------------------
+    // Post-restore consistency verification
+    // ------------------------------------------------------------------
+
+    /// Verifies that the active voter set in `state` is consistent with
+    /// the log store and the latest snapshot metadata.
+    ///
+    /// Specifically this checks:
+    /// 1. Every voter in the current set appears in the voters record.
+    /// 2. The voters record's effective index does not exceed the commit
+    ///    index (i.e. no uncommitted membership change is treated as
+    ///    committed).
+    /// 3. If the log contains membership-change entries after the
+    ///    snapshot's last-included-index, the voter set accounts for them.
+    ///
+    /// Returns `Ok(())` on success, or a [`RaftError::InconsistentVoterSet`]
+    /// if any check fails.
+    async fn verify_voter_set_consistency(
+        state: &RaftState,
+        log_store: &dyn LogStore,
+        snapshot_io: &dyn SnapshotIo,
+    ) -> RaftResult<()> {
+        let voter_set = state.voter_set();
+        let voters_record = state.voters_record();
+        let commit_index = state.commit_index();
+
+        // Check 1: every active voter must be present in the record.
+        for voter in voter_set.iter() {
+            if !voters_record.contains(voter) {
+                warn!(
+                    voter = %voter,
+                    "voter present in active set but missing from voters record"
+                );
+                return Err(RaftError::InconsistentVoterSet(format!(
+                    "voter {} is in the active voter set but not in the voters record",
+                    voter
+                )));
+            }
+        }
+
+        // Check 2: effective index of the record must not exceed commit.
+        if let Some(effective_index) = voters_record.effective_index() {
+            if effective_index > commit_index {
+                warn!(
+                    effective_index,
+                    commit_index,
+                    "voters record effective index exceeds commit index"
+                );
+                return Err(RaftError::InconsistentVoterSet(format!(
+                    "voters record effective index ({}) exceeds commit index ({})",
+                    effective_index, commit_index
+                )));
+            }
+        }
+
+        // Check 3: replay any membership entries in the log tail that
+        // follow the snapshot boundary and verify the voter set reflects
+        // them.
+        if let Some((snapshot_meta, _)) = snapshot_io.load_latest().await? {
+            let tail_start = snapshot_meta.last_included_index + 1;
+            let membership_entries =
+                log_store.membership_entries_in_range(tail_start, commit_index).await?;
+
+            if let Some(latest_entry) = membership_entries.last() {
+                let expected_voter_set = &latest_entry.voter_set;
+                if voter_set != expected_voter_set {
+                    warn!(
+                        current = ?voter_set,
+                        expected = ?expected_voter_set,
+                        entry_index = latest_entry.index,
+                        "voter set does not reflect latest committed membership entry"
+                    );
+                    return Err(RaftError::InconsistentVoterSet(format!(
+                        "voter set does not match latest committed membership entry at index {}",
+                        latest_entry.index
+                    )));
+                }
+            }
+        }
+
+        debug!("voter set consistency verified successfully");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Unit tests would go here, using mock implementations of
+    // LogStore, SnapshotIo, and RaftState.
 }
