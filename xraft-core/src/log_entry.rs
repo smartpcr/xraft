@@ -1,46 +1,24 @@
-use crate::app_record::AppRecord;
-use crate::types::Term;
-use crate::voter::VotersRecord;
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
-/// Entry type discriminator.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+use crate::types::Term;
+
+/// Discriminator for log entry types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryType {
+    /// Application-level state machine command (wraps an AppRecord).
     Command,
+    /// Appended by a new leader as the first entry of its term.
     LeaderChangeMessage,
+    /// Appended when processing AddVoter/RemoveVoter/UpdateVoter.
     VotersRecord,
 }
 
-/// A single log entry.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// A single entry in the replicated log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub offset: u64,
     pub term: Term,
     pub entry_type: EntryType,
-    pub payload: Option<AppRecord>,
-}
-
-impl LogEntry {
-    /// Decode a `VotersRecord` from a `VotersRecord`-typed entry's payload.
-    ///
-    /// Returns `None` if the entry is not a `VotersRecord` type or if the
-    /// payload is missing/malformed.
-    pub fn decode_voters_record(&self) -> Option<VotersRecord> {
-        match self.entry_type {
-            EntryType::VotersRecord => {
-                let payload = self.payload.as_ref()?;
-                serde_json::from_slice(&payload.data).ok()
-            }
-            _ => None,
-        }
-    }
-
-    /// For a `LeaderChangeMessage` entry, the entry's term **is** the
-    /// leader epoch (architecture §5.4 — a leader-change record is
-    /// committed at the start of a new leader's term).
-    pub fn leader_epoch(&self) -> Option<Term> {
-        match self.entry_type {
-            EntryType::LeaderChangeMessage => Some(self.term),
-            _ => None,
-        }
-    }
+    pub payload: Bytes,
 }

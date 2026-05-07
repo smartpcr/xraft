@@ -1,31 +1,12 @@
-//! Listener trait for application-level commit and leader-change notification.
-//!
-//! Per architecture §4.1, the EventLoop invokes Listener callbacks synchronously
-//! during message processing — after StateMachine::apply and before
-//! DeferredCompletionQueue::complete. The Listener receives committed AppRecord
-//! values (control records are filtered) and leadership changes.
+use crate::app_record::AppRecord;
+use crate::snapshot::SnapshotReader;
+use crate::types::{NodeId, Term};
 
-use crate::types::{AppRecord, NodeId, Term};
-
-/// Application callback for commit and leader-change events.
-///
-/// Invoked by the EventLoop in the three-phase commit notification sequence:
-/// 1. `StateMachine::apply` — per committed command entry
-/// 2. `Listener::handle_commit` — batch of committed AppRecords
-/// 3. `DeferredCompletionQueue::complete` — resolves client futures
+/// Application callback interface invoked synchronously by the EventLoop.
+/// Modelled on KRaft's `RaftClient.Listener`.
 pub trait Listener: Send + 'static {
-    /// Called once with the full batch of newly committed application records.
-    /// Control records (LeaderChangeMessage, VotersRecord) are filtered.
-    fn handle_commit(&mut self, committed: &[AppRecord]);
-
-    /// Called when the leadership changes (new leader elected or stepped down).
-    fn handle_leader_change(&mut self, new_leader: Option<NodeId>, term: Term);
-}
-
-/// No-op listener for tests that don't need commit notification.
-pub struct NoOpListener;
-
-impl Listener for NoOpListener {
-    fn handle_commit(&mut self, _committed: &[AppRecord]) {}
-    fn handle_leader_change(&mut self, _new_leader: Option<NodeId>, _term: Term) {}
+    fn handle_commit(&mut self, batch: &[(u64, AppRecord)]);
+    fn handle_load_snapshot(&mut self, reader: SnapshotReader);
+    fn handle_leader_change(&mut self, leader_id: NodeId, term: Term);
+    fn begin_shutdown(&mut self);
 }

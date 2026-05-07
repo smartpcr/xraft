@@ -1,5 +1,4 @@
-use crate::log_entry::LogEntry;
-use crate::types::{ClusterId, NodeId, Term};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::types::Term;

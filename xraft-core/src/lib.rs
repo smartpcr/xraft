@@ -1,7 +1,6 @@
 pub mod app_record;
 pub mod rpc;
 pub mod snapshot;
-pub mod snapshot_coordinator;
 pub mod traits;
 pub mod types;
 pub mod voter;
