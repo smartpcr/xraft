@@ -1,8 +1,8 @@
-use std::net::SocketAddr;
-
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::types::NodeId;
+use crate::types::{ClusterId, NodeId, Term};
+use crate::voter::VoterInfo;
 
 /// Wire envelope carrying identity, fencing, and payload fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,41 +31,17 @@ pub struct VoteRequest {
     pub is_pre_vote: bool,
 }
 
-/// Response to a membership change request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipChangeResponse {
-    pub success: bool,
-    pub error: Option<MembershipError>,
+    pub result: Result<(), MembershipError>,
 }
 
-impl MembershipChangeResponse {
-    pub fn ok() -> Self {
-        Self {
-            success: true,
-            error: None,
-        }
-    }
-
-    pub fn err(error: MembershipError) -> Self {
-        Self {
-            success: false,
-            error: Some(error),
-        }
-    }
-}
-
-/// Errors that can occur during membership changes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MembershipError {
-    /// This node is not the leader; includes leader_id for redirection.
-    NotLeader { leader_id: Option<NodeId> },
-    /// Another membership change is already in progress.
+    NotLeader,
     ChangeInProgress,
-    /// The node is already a voter.
     NodeAlreadyVoter,
-    /// The node was not found in the voter set.
     NodeNotFound,
-    /// The observer has not caught up to the leader's log.
     NodeNotCaughtUp,
 }
 

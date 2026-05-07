@@ -1,7 +1,6 @@
-use std::io;
-use std::time::Duration;
-
 use async_trait::async_trait;
+use bytes::Bytes;
+use tokio::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::rpc::RpcEnvelope;
@@ -26,22 +25,43 @@ pub trait QuorumStateStore: Send + Sync + 'static {
     async fn save(&self, state: &crate::quorum_state::QuorumState) -> Result<()>;
 }
 
-/// Snapshot I/O operations.
+/// Snapshot storage.
 #[async_trait]
 pub trait SnapshotIO: Send + Sync + 'static {
-    async fn save(&self, snapshot: &Snapshot) -> Result<()>;
-    async fn load_latest(&self) -> Result<Option<Snapshot>>;
+    async fn save(&self, snapshot: &Snapshot) -> XraftResult<()>;
+    async fn load_latest(&self) -> XraftResult<Option<Snapshot>>;
     async fn read_chunk(
         &self,
         id: &SnapshotId,
         position: u64,
         max_bytes: u32,
-    ) -> Result<(Vec<u8>, bool)>;
+    ) -> XraftResult<(Bytes, bool)>;
+    async fn begin_receive(&self, id: &SnapshotId) -> XraftResult<SnapshotWriter>;
 }
 
-/// Application state machine.
+/// Outbound RPC sender. Takes `&self` for concurrent sends.
+#[async_trait]
+pub trait TransportSender: Send + Sync + 'static {
+    async fn send(&self, target: NodeId, message: RpcEnvelope) -> XraftResult<()>;
+}
+
+/// Inbound RPC receiver. Takes `&mut self` — exclusive access by ReceiverTask.
+#[async_trait]
+pub trait TransportReceiver: Send + 'static {
+    async fn recv(&mut self) -> XraftResult<RpcEnvelope>;
+}
+
+/// Deterministic time source. Used by EventLoop for timer management.
+#[async_trait]
+pub trait Clock: Send + 'static {
+    fn now(&self) -> Instant;
+    async fn sleep_until(&self, deadline: Instant);
+    fn random_election_timeout(&self) -> Duration;
+}
+
+/// Application state machine. Synchronous — invoked by EventLoop.
 pub trait StateMachine: Send + 'static {
-    fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>;
-    fn snapshot(&self) -> Result<AppSnapshot>;
-    fn restore(&mut self, snapshot: AppSnapshot) -> Result<()>;
+    fn apply(&mut self, offset: u64, record: &AppRecord) -> XraftResult<()>;
+    fn snapshot(&self) -> XraftResult<AppSnapshot>;
+    fn restore(&mut self, snapshot: AppSnapshot) -> XraftResult<()>;
 }

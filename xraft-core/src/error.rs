@@ -1,4 +1,6 @@
-use thiserror::Error;
+use crate::types::NodeId;
+use std::fmt;
+use std::io;
 
 use crate::membership::NodeId;
 
@@ -13,18 +15,14 @@ pub enum XraftError {
     NotLeader { leader_id: Option<NodeId> },
     /// BatchAccumulator back-pressure limit reached.
     ProposalQueueFull,
-
-    #[error("invalid cluster id")]
+    /// RPC cluster_id mismatch.
     InvalidClusterId,
-
-    #[error("shutdown")]
+    /// Node is shutting down; no new operations accepted.
     Shutdown,
-
-    #[error("serialization error: {0}")]
-    SerializationError(String),
-
-    #[error("{0}")]
-    Other(String),
+    /// Bootstrap precondition not met (log not empty, quorum-state exists, or snapshot exists).
+    BootstrapPreconditionFailed(String),
+    /// Invalid configuration parameters.
+    InvalidConfig(String),
 }
 
 impl fmt::Display for XraftError {
