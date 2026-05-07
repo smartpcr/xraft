@@ -9,8 +9,8 @@ pub struct AppRecord {
     pub data: Bytes,
 }
 
-/// A single log entry.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// A single entry in the replicated log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub offset: u64,
     pub term: Term,
