@@ -434,6 +434,11 @@ impl NodeState {
             high_watermark: self.high_watermark,
             voter_set: self.voter_set.clone(),
         }
+        self.pending_membership_change = Some(PendingMembershipChange {
+            offset,
+            proposed_voter_set,
+        });
+        Ok(())
     }
 
     /// Check if a node is in the committed voter set.
@@ -632,5 +637,127 @@ impl NodeState {
     /// works on all nodes, use `apply_voters_record_from_log`.
     pub fn apply_voters_record(&mut self) {
         self.commit_membership_change();
+    }
+
+    #[test]
+    fn advance_hw_rejects_non_contiguous_entries() {
+        let mut state = default_state();
+
+        // Provide entries at offsets 0 and 2, skipping 1.
+        let entries = vec![
+            make_data_entry(0, 1),
+            make_data_entry(2, 1),
+        ];
+
+        let result = state.advance_high_watermark(3, &entries);
+        assert!(result.is_err());
+        assert!(
+            matches!(&result, Err(RaftError::NonContiguousCommit(_))),
+            "expected NonContiguousCommit, got {:?}",
+            result
+        );
+        // HW must not have advanced.
+        assert_eq!(state.high_watermark(), 0);
+    }
+
+    #[test]
+    fn advance_hw_rejects_insufficient_entry_count() {
+        let mut state = default_state();
+
+        // Only provide 2 entries for a range of 3.
+        let entries = vec![
+            make_data_entry(0, 1),
+            make_data_entry(1, 1),
+        ];
+
+        let result = state.advance_high_watermark(3, &entries);
+        assert!(result.is_err());
+        assert_eq!(state.high_watermark(), 0);
+    }
+
+    #[test]
+    fn advance_hw_applies_voters_record() {
+        let mut state = default_state();
+
+        let new_voter_set = VoterSet::from_iter(vec![
+            make_node_id(1),
+            make_node_id(2),
+            make_node_id(4),
+        ]);
+
+        // Propose the membership change first.
+        state
+            .propose_membership_change(1, new_voter_set.clone())
+            .unwrap();
+        assert!(state.pending_membership_change().is_some());
+
+        let entries = vec![
+            make_data_entry(0, 1),
+            make_voters_record_entry(1, 1, new_voter_set.clone()),
+            make_data_entry(2, 1),
+        ];
+
+        state.advance_high_watermark(3, &entries).unwrap();
+        assert_eq!(state.high_watermark(), 3);
+        assert_eq!(state.voter_set(), &new_voter_set);
+        // Pending membership change should be cleared.
+        assert!(state.pending_membership_change().is_none());
+    }
+
+    #[test]
+    fn advance_hw_rejects_backward_movement() {
+        let mut state = default_state();
+
+        let entries = vec![make_data_entry(0, 1)];
+        state.advance_high_watermark(1, &entries).unwrap();
+
+        let result = state.advance_high_watermark(1, &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn advance_hw_rejects_duplicate_offsets() {
+        let mut state = default_state();
+
+        let entries = vec![
+            make_data_entry(0, 1),
+            make_data_entry(0, 1), // duplicate
+        ];
+
+        let result = state.advance_high_watermark(2, &entries);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn clear_pending_if_truncated_clears_when_at_boundary() {
+        let mut state = default_state();
+        let new_vs = VoterSet::from_iter(vec![make_node_id(1), make_node_id(2)]);
+        state.propose_membership_change(5, new_vs).unwrap();
+        assert!(state.pending_membership_change().is_some());
+
+        state.clear_pending_if_truncated(5);
+        assert!(state.pending_membership_change().is_none());
+    }
+
+    #[test]
+    fn clear_pending_if_truncated_preserves_when_below_boundary() {
+        let mut state = default_state();
+        let new_vs = VoterSet::from_iter(vec![make_node_id(1), make_node_id(2)]);
+        state.propose_membership_change(3, new_vs).unwrap();
+
+        state.clear_pending_if_truncated(5);
+        assert!(state.pending_membership_change().is_some());
+    }
+
+    #[test]
+    fn restore_from_snapshot_stores_last_included_term() {
+        let mut state = default_state();
+        let vs = VoterSet::from_iter(vec![make_node_id(1), make_node_id(2)]);
+        let vr = VotersRecord::new(vs.clone(), 10);
+
+        state.restore_from_snapshot_metadata(10, 3, 5, vs, vr);
+        assert_eq!(state.snapshot_last_term(), 3);
+        assert_eq!(state.high_watermark(), 10);
+        assert_eq!(state.leader_epoch(), 5);
     }
 }
