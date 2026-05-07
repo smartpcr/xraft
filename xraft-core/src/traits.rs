@@ -1,6 +1,8 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use tokio::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::log_entry::LogEntry;
@@ -27,7 +29,6 @@ pub trait LogStore: Send + Sync + 'static {
 
     /// The first offset still in the log.
     fn log_start_offset(&self) -> u64;
-    /// Next offset to be appended.
     fn log_end_offset(&self) -> u64;
 
     /// Read the entry at the given offset.

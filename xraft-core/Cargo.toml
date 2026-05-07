@@ -1,5 +1,6 @@
 [package]
 name = "xraft-core"
+version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
@@ -19,5 +20,5 @@ async-trait = "0.1"
 thiserror = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
-[lints]
-workspace = true
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

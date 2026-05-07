@@ -1,4 +1,6 @@
-use thiserror::Error;
+use crate::types::NodeId;
+use std::fmt;
+use std::io;
 
 /// Error types for the xraft system.
 #[derive(Debug)]
@@ -15,12 +17,10 @@ pub enum XraftError {
     InvalidClusterId,
     /// Node is shutting down.
     Shutdown,
-
-    #[error("serialization error: {0}")]
-    SerializationError(String),
-
-    #[error("{0}")]
-    Other(String),
+    /// Bootstrap precondition not met (log not empty, quorum-state exists, or snapshot exists).
+    BootstrapPreconditionFailed(String),
+    /// Invalid configuration parameters.
+    InvalidConfig(String),
 }
 
 impl fmt::Display for XraftError {
