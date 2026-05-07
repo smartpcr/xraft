@@ -3,7 +3,6 @@ pub mod listener;
 pub mod listener_event;
 pub mod snapshot;
 pub mod types;
-pub mod voter;
 
 // Re-export core domain types for convenience.
 pub use app_record::{AppRecord, AppSnapshot};
