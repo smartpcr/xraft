@@ -1,630 +1,344 @@
-use tracing::{info, warn};
+use crate::error::XraftError;
+use tokio::sync::{mpsc, watch};
 
-use crate::app_record::AppRecord;
 use crate::config::RaftConfig;
-use crate::io_action::{IoAction, IoActionBatch};
-use crate::io_stage::{IoResult, IoStage};
-use crate::snapshot_coordinator::{SnapshotAction, SnapshotCoordinator};
-use crate::traits::{LogStore, NetworkSender, SnapshotIO, StateMachine};
+use crate::consensus_state::{ConsensusState, Role};
+use crate::election::ElectionManager;
+use crate::io_action::{IoAction, IoActionBatch, IoStage};
+use crate::listener::Listener;
+use crate::node_state::NodeState;
+use crate::quorum_state::QuorumState;
+use crate::rpc::{RpcEnvelope, RpcPayload};
+use crate::traits::{Clock, StateMachine};
 use crate::types::Term;
-use crate::voter::VoterInfo;
 
-/// The single-threaded event loop that drives the Raft node.
-///
-/// This struct implements the commit-path integration for periodic
-/// snapshotting as described in architecture §4.1. The event loop:
-///
-/// 1. Applies committed entries to the `StateMachine`.
-/// 2. Advances the high watermark and checks if a snapshot is needed.
-/// 3. Prepares snapshots via `SnapshotCoordinator` (synchronous).
-/// 4. Dispatches I/O actions via `IoStage::execute()`.
-/// 5. Processes I/O results — on `SnapshotSaved`, schedules truncation;
-///    on `SnapshotSaveFailed`, resets the coordinator for retry.
-///
-/// The full event loop (RPC dispatch, election timeouts, proposal handling)
-/// is implemented in later stages. This module implements the snapshot-
-/// related commit path that was the missing integration piece.
-pub struct EventLoop<SM, L, S, N> {
-    state_machine: SM,
-    io_stage: IoStage<L, S, N>,
-    snapshot_coord: SnapshotCoordinator,
-    /// Current high watermark (exclusive upper bound of committed offsets).
-    high_watermark: u64,
-    /// Current term of the last committed entry.
-    current_term: Term,
-    /// Current voter set.
-    voters: Vec<VoterInfo>,
-    /// Current leader epoch.
-    leader_epoch: Term,
+/// Messages that can be sent to the event loop.
+pub enum EventLoopMessage {
+    Rpc(RpcEnvelope),
+    Shutdown,
 }
 
-impl<SM, L, S, N> EventLoop<SM, L, S, N>
-where
-    SM: StateMachine,
-    L: LogStore,
-    S: SnapshotIO,
-    N: NetworkSender,
-{
-    /// Construct the event loop. The `IoStage` is moved in (sole ownership).
+/// The single-threaded async event loop that drives all protocol state transitions.
+#[allow(dead_code)]
+pub struct EventLoop<S: StateMachine, L: Listener> {
+    pub state: NodeState,
+    pub config: RaftConfig,
+    pub clock: Box<dyn Clock>,
+    pub io_stage: IoStage,
+    pub state_machine: S,
+    pub listener: L,
+    pub msg_rx: mpsc::Receiver<EventLoopMessage>,
+    pub state_tx: watch::Sender<ConsensusState>,
+}
+
+impl<S: StateMachine, L: Listener> EventLoop<S, L> {
+    /// Create a new EventLoop.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        state_machine: SM,
-        io_stage: IoStage<L, S, N>,
-        config: &RaftConfig,
-        initial_snapshot_offset: Option<u64>,
+        state: NodeState,
+        config: RaftConfig,
+        clock: Box<dyn Clock>,
+        io_stage: IoStage,
+        state_machine: S,
+        listener: L,
+        msg_rx: mpsc::Receiver<EventLoopMessage>,
+        state_tx: watch::Sender<ConsensusState>,
     ) -> Self {
         Self {
-            state_machine,
+            state,
+            config,
+            clock,
             io_stage,
-            snapshot_coord: SnapshotCoordinator::new(config, initial_snapshot_offset),
-            high_watermark: initial_snapshot_offset.map_or(0, |o| o + 1),
-            current_term: Term(0),
-            voters: Vec::new(),
-            leader_epoch: Term(0),
+            state_machine,
+            listener,
+            msg_rx,
+            state_tx,
         }
     }
 
-    /// Set the current voter set (called when voters change).
-    pub fn set_voters(&mut self, voters: Vec<VoterInfo>) {
-        self.voters = voters;
-    }
+    /// Run the event loop until shutdown or fatal I/O error.
+    /// I/O errors are propagated rather than logged-and-continued because
+    /// state has already been mutated in-memory before I/O executes;
+    /// continuing would leave inconsistent leadership state.
+    pub async fn run(&mut self) -> Result<(), XraftError> {
+        loop {
+            let now = self.clock.now();
 
-    /// Set the leader epoch (called on leader change).
-    pub fn set_leader_epoch(&mut self, epoch: Term) {
-        self.leader_epoch = epoch;
-    }
-
-    /// Access the snapshot coordinator (for queries).
-    pub fn snapshot_coordinator(&self) -> &SnapshotCoordinator {
-        &self.snapshot_coord
-    }
-
-    /// Access the I/O stage (for log queries).
-    pub fn io_stage(&self) -> &IoStage<L, S, N> {
-        &self.io_stage
-    }
-
-    /// The commit-path handler: apply committed entries, advance HW,
-    /// trigger snapshotting if needed, and execute all resulting I/O.
-    ///
-    /// This is the production integration point. In a full Raft node,
-    /// this method is called by the event loop whenever the high watermark
-    /// advances (e.g., after processing a successful Fetch response that
-    /// reveals new committed entries).
-    ///
-    /// ## Processing order (architecture §4.1)
-    ///
-    /// 1. Apply each committed entry to the state machine.
-    /// 2. Advance HW and check if snapshot is needed.
-    /// 3. If needed, prepare snapshot (synchronous SM capture).
-    /// 4. Collect `IoAction::SaveSnapshot` into the batch.
-    /// 5. Execute the I/O batch via `IoStage`.
-    /// 6. Process results — on save success, schedule truncation in a
-    ///    follow-up batch; on save failure, reset for retry.
-    pub async fn apply_committed_entries(
-        &mut self,
-        entries: &[(u64, Term, AppRecord)],
-    ) -> std::io::Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-
-        // Phase 1: Apply entries to the state machine (synchronous callbacks).
-        for (offset, term, record) in entries {
-            self.state_machine.apply(*offset, record)?;
-            self.current_term = *term;
-        }
-
-        // Phase 2: Advance the high watermark.
-        let last_offset = entries.last().expect("non-empty").0;
-        let new_hw = last_offset + 1;
-        self.high_watermark = new_hw;
-
-        let needs_snapshot = self.snapshot_coord.on_high_watermark_advance(new_hw);
-
-        // Phase 3: Prepare snapshot if interval reached.
-        let mut batch = IoActionBatch::new();
-        if needs_snapshot {
-            if let Some(action) = self.snapshot_coord.prepare_snapshot(
-                new_hw,
-                self.current_term,
-                self.voters.clone(),
-                self.leader_epoch,
-                &self.state_machine,
-            ) {
-                match action {
-                    SnapshotAction::SaveSnapshot(snap) => {
-                        batch.push(IoAction::SaveSnapshot(snap));
-                    }
-                    SnapshotAction::TruncatePrefix(up_to) => {
-                        batch.push(IoAction::TruncatePrefix(up_to));
-                    }
+            // Check timers before waiting for messages
+            if self.state.role == Role::Leader {
+                if now >= self.state.check_quorum_deadline {
+                    self.handle_check_quorum().await?;
                 }
+            } else if (self.state.role == Role::Follower || self.state.role == Role::Candidate)
+                && now >= self.state.election_deadline
+            {
+                self.handle_election_timeout().await?;
             }
-        }
 
-        // Phase 4: Execute I/O batch (save snapshot).
-        if !batch.is_empty() {
-            let results = self.io_stage.execute(&mut batch).await;
-            self.process_io_results(results).await?;
-        }
+            // Calculate next timer deadline
+            let next_deadline = if self.state.role == Role::Leader {
+                self.state.check_quorum_deadline
+            } else {
+                self.state.election_deadline
+            };
 
-        Ok(())
-    }
-
-    /// Process I/O results from `IoStage::execute()`.
-    ///
-    /// When a `SnapshotSaved` result arrives, the coordinator produces
-    /// a `TruncatePrefix` action which is executed in a follow-up batch.
-    /// This ensures the snapshot is fully persisted (fsync) before any
-    /// log entries are truncated.
-    ///
-    /// When a `SnapshotSaveFailed` result arrives, the coordinator resets
-    /// and retries after the next `snapshot_interval` commits. No
-    /// truncation occurs — no data is lost.
-    async fn process_io_results(&mut self, results: Vec<IoResult>) -> std::io::Result<()> {
-        for result in results {
-            match result {
-                IoResult::SnapshotSaved => {
-                    // Snapshot persisted — schedule log prefix truncation.
-                    if let Some(SnapshotAction::TruncatePrefix(up_to)) =
-                        self.snapshot_coord.on_snapshot_saved()
-                    {
-                        info!(up_to, "executing log prefix truncation");
-                        let mut truncate_batch = IoActionBatch::new();
-                        truncate_batch.push(IoAction::TruncatePrefix(up_to));
-                        let truncate_results =
-                            self.io_stage.execute(&mut truncate_batch).await;
-                        for tr in truncate_results {
-                            match tr {
-                                IoResult::PrefixTruncated => {
-                                    self.snapshot_coord.on_truncation_completed();
-                                }
-                                IoResult::PrefixTruncateFailed(e) => {
-                                    // Snapshot is already durable; truncation
-                                    // can be retried on next startup.
-                                    warn!("prefix truncation failed \
-                                           (snapshot is durable): {e}");
-                                }
-                                _ => {}
-                            }
+            // Wait for a message or the next timer
+            tokio::select! {
+                msg = self.msg_rx.recv() => {
+                    match msg {
+                        Some(EventLoopMessage::Rpc(envelope)) => {
+                            self.handle_rpc(envelope).await?;
+                        }
+                        Some(EventLoopMessage::Shutdown) | None => {
+                            self.listener.begin_shutdown();
+                            break;
                         }
                     }
                 }
-                IoResult::SnapshotSaveFailed(_e) => {
-                    // Save failed — reset coordinator, skip truncation.
-                    self.snapshot_coord.on_snapshot_save_failed();
+                _ = self.clock.sleep_until(next_deadline) => {
+                    // Timer fired, will be handled at top of loop
                 }
-                IoResult::PrefixTruncated => {
-                    self.snapshot_coord.on_truncation_completed();
-                }
-                IoResult::PrefixTruncateFailed(e) => {
-                    warn!("prefix truncation failed: {e}");
-                }
-                // Other results are handled by their respective subsystems.
-                IoResult::LogAppended
-                | IoResult::SuffixTruncated
-                | IoResult::RpcSent
-                | IoResult::RpcFailed(_)
-                | IoResult::StorageFailed(_) => {}
             }
         }
         Ok(())
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::app_record::{AppRecord, AppSnapshot};
-    use crate::config::RaftConfig;
-    use crate::log_entry::{EntryType, LogEntry};
-    use crate::snapshot::{Snapshot, SnapshotId, SnapshotWriter};
-    use crate::types::Term;
-    use async_trait::async_trait;
-    use bytes::Bytes;
-    use std::io;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Mutex;
+    /// Handle the Check Quorum timer: verify majority of voters have
+    /// sent a Fetch within the `check_quorum_interval` window (the actual
+    /// randomized election-timeout that was set when this node became leader).
+    pub async fn handle_check_quorum(&mut self) -> Result<(), XraftError> {
+        let now = self.clock.now();
+        let interval = self.state.check_quorum_interval;
 
-    // ── In-memory LogStore ─────────────────────────────────────────
+        if self.state.check_quorum(now, interval) {
+            tracing::debug!(
+                node = %self.state.node_id,
+                term = %self.state.current_term,
+                "check quorum passed"
+            );
+            self.state.check_quorum_deadline = now + interval;
+        } else {
+            tracing::warn!(
+                node = %self.state.node_id,
+                term = %self.state.current_term,
+                "check quorum failed: stepping down to Follower"
+            );
+            // Preserve voted_for from the leader phase (Some(self.node_id)).
+            // Clearing it would allow this node to grant a same-term
+            // VoteRequest, violating Raft's at-most-one-leader-per-term
+            // safety property.
+            let preserved_voted_for = self.state.voted_for;
+            let deadline = now + self.clock.random_election_timeout();
+            self.state.become_follower(self.state.current_term, None, deadline);
+            self.state.voted_for = preserved_voted_for;
 
-    struct MemLog {
-        entries: Mutex<Vec<LogEntry>>,
-        start_offset: AtomicU64,
+            let mut batch = IoActionBatch::new();
+            batch.push(IoAction::PersistQuorumState(QuorumState {
+                current_term: self.state.current_term,
+                voted_for: preserved_voted_for,
+                leader_id: None,
+                leader_epoch: Term(0),
+            }));
+
+            // Publish state BEFORE I/O (architecture §3.2 step 4 before step 5)
+            let _ = self.state_tx.send(self.state.project());
+
+            self.io_stage.execute(&batch).await?;
+            return Ok(());
+        }
+
+        // Publish updated state BEFORE any I/O
+        let _ = self.state_tx.send(self.state.project());
+        Ok(())
     }
 
-    impl MemLog {
-        fn new() -> Self {
-            Self {
-                entries: Mutex::new(Vec::new()),
-                start_offset: AtomicU64::new(0),
+    /// Handle election timeout expiry.
+    pub async fn handle_election_timeout(&mut self) -> Result<(), XraftError> {
+        if !self.state.is_voter() {
+            let deadline = self.clock.now() + self.clock.random_election_timeout();
+            self.state.election_deadline = deadline;
+            return Ok(());
+        }
+
+        let mut batch = IoActionBatch::new();
+        ElectionManager::start_election(&mut self.state, &*self.clock, &self.config, &mut batch);
+
+        // Check if single-node cluster → became leader immediately
+        if self.state.voter_count() == 1 {
+            self.state.become_leader(self.clock.now(), self.clock.random_election_timeout());
+            self.on_become_leader(&mut batch);
+        }
+
+        // Publish state BEFORE I/O (architecture §3.2 step 4 before step 5)
+        let _ = self.state_tx.send(self.state.project());
+
+        self.io_stage.execute(&batch).await?;
+        Ok(())
+    }
+
+    /// Handle an incoming RPC message.
+    /// Validates cluster_id, applies higher-term step-down (except pre-vote),
+    /// and dispatches to payload-specific handlers.
+    pub async fn handle_rpc(&mut self, envelope: RpcEnvelope) -> Result<(), XraftError> {
+        // ── Cluster-id fencing ──────────────────────────────────────
+        if envelope.cluster_id != self.state.cluster_id {
+            tracing::warn!(
+                node = %self.state.node_id,
+                expected = ?self.state.cluster_id,
+                received = ?envelope.cluster_id,
+                source = %envelope.source,
+                "rejecting RPC: cluster_id mismatch"
+            );
+            return Ok(());
+        }
+
+        let source = envelope.source;
+        let mut batch = IoActionBatch::new();
+
+        // ── Determine if this is a pre-vote message ─────────────────
+        let is_pre_vote = match &envelope.payload {
+            RpcPayload::VoteRequest(req) => req.is_pre_vote,
+            RpcPayload::VoteResponse(resp) => resp.is_pre_vote,
+            _ => false,
+        };
+
+        // ── Effective term for higher-term step-down ────────────────
+        let effective_term = match &envelope.payload {
+            RpcPayload::VoteRequest(req) => req.term,
+            RpcPayload::VoteResponse(resp) => resp.term,
+            RpcPayload::FetchRequest(_) => envelope.leader_epoch,
+            RpcPayload::FetchResponse(resp) => resp.leader_epoch,
+            RpcPayload::FetchSnapshotRequest(_) => envelope.leader_epoch,
+            RpcPayload::FetchSnapshotResponse(_) => envelope.leader_epoch,
+        };
+
+        // Pre-vote messages must NOT cause term advancement or state changes.
+        // Only real (non-pre-vote) messages trigger higher-term step-down.
+        let stepped_down = if is_pre_vote {
+            false
+        } else {
+            let sd = ElectionManager::maybe_step_down_on_higher_term(
+                &mut self.state,
+                effective_term,
+                source,
+                &*self.clock,
+                &self.config,
+            );
+            if sd {
+                batch.push(IoAction::PersistQuorumState(QuorumState {
+                    current_term: self.state.current_term,
+                    voted_for: None,
+                    leader_id: None,
+                    leader_epoch: Term(0),
+                }));
+            }
+            sd
+        };
+
+        // ── Payload-specific handling ───────────────────────────────
+        match envelope.payload {
+            RpcPayload::VoteRequest(ref req) => {
+                if req.is_pre_vote {
+                    // Pre-vote: read-only evaluation, no state mutation
+                    ElectionManager::handle_pre_vote_request(
+                        &self.state,
+                        req,
+                        &mut batch,
+                    );
+                } else {
+                    // Real vote: may mutate term/voted_for
+                    ElectionManager::handle_vote_request(
+                        &mut self.state,
+                        req,
+                        &*self.clock,
+                        &self.config,
+                        &mut batch,
+                    );
+                }
+            }
+            RpcPayload::VoteResponse(ref resp) => {
+                // Skip pre-vote responses for real vote counting
+                if resp.is_pre_vote {
+                    // Pre-vote response: record in pre_votes_received (future pre-vote phase)
+                    if resp.vote_granted && resp.term == self.state.current_term {
+                        self.state.pre_votes_received.insert(source);
+                    }
+                } else if !stepped_down
+                    && self.state.role == Role::Candidate
+                    && resp.vote_granted
+                    && resp.term == self.state.current_term
+                {
+                    // Reject votes from nodes not in the voter set
+                    if !self.state.is_in_voter_set(source) {
+                        tracing::warn!(
+                            node = %self.state.node_id,
+                            source = %source,
+                            "ignoring VoteResponse from non-voter"
+                        );
+                    } else {
+                        let has_majority = ElectionManager::record_vote(
+                            &mut self.state,
+                            source,
+                        );
+                        if has_majority {
+                            self.state.become_leader(
+                                self.clock.now(),
+                                self.clock.random_election_timeout(),
+                            );
+                            self.on_become_leader(&mut batch);
+                        }
+                    }
+                }
+            }
+            RpcPayload::FetchRequest(ref req) => {
+                if self.state.role == Role::Leader {
+                    self.state.record_fetch(
+                        source,
+                        req.fetch_offset,
+                        self.clock.now(),
+                    );
+                }
+                // Full fetch response handling is in replication phase (Stage 5)
+            }
+            RpcPayload::FetchResponse(_) => {
+                // Full fetch response handling is in replication phase (Stage 5)
+            }
+            RpcPayload::FetchSnapshotRequest(_) | RpcPayload::FetchSnapshotResponse(_) => {
+                // Snapshot transfer handling is in snapshot phase (Stage 6).
             }
         }
+
+        // Publish state BEFORE I/O (architecture §3.2 step 4 before step 5)
+        let _ = self.state_tx.send(self.state.project());
+
+        self.io_stage.execute(&batch).await?;
+        Ok(())
     }
 
-    #[async_trait]
-    impl LogStore for MemLog {
-        async fn append(&self, entries: &[LogEntry]) -> io::Result<()> {
-            self.entries.lock().unwrap().extend(entries.iter().cloned());
-            Ok(())
-        }
-
-        async fn read(&self, start: u64, end: u64) -> io::Result<Vec<LogEntry>> {
-            let guard = self.entries.lock().unwrap();
-            let base = self.start_offset.load(Ordering::SeqCst);
-            Ok(guard
-                .iter()
-                .filter(|e| e.offset >= start && e.offset < end && e.offset >= base)
-                .cloned()
-                .collect())
-        }
-
-        async fn truncate_suffix(&self, from: u64) -> io::Result<()> {
-            self.entries.lock().unwrap().retain(|e| e.offset < from);
-            Ok(())
-        }
-
-        async fn truncate_prefix(&self, up_to_offset: u64) -> io::Result<()> {
-            self.entries
-                .lock()
-                .unwrap()
-                .retain(|e| e.offset >= up_to_offset);
-            self.start_offset.store(up_to_offset, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn log_start_offset(&self) -> u64 {
-            self.start_offset.load(Ordering::SeqCst)
-        }
-
-        fn log_end_offset(&self) -> u64 {
-            let guard = self.entries.lock().unwrap();
-            guard.last().map_or(
-                self.start_offset.load(Ordering::SeqCst),
-                |e| e.offset + 1,
-            )
-        }
-
-        async fn entry_at(&self, offset: u64) -> io::Result<Option<LogEntry>> {
-            Ok(self
-                .entries
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|e| e.offset == offset)
-                .cloned())
-        }
-    }
-
-    // ── In-memory SnapshotIO ───────────────────────────────────────
-
-    struct MemSnapshotIO {
-        saved: Mutex<Option<Snapshot>>,
-        fail_save: AtomicBool,
-    }
-
-    impl MemSnapshotIO {
-        fn new() -> Self {
-            Self {
-                saved: Mutex::new(None),
-                fail_save: AtomicBool::new(false),
-            }
-        }
-
-        fn set_fail_save(&self, fail: bool) {
-            self.fail_save.store(fail, Ordering::SeqCst);
-        }
-
-        fn saved_snapshot(&self) -> Option<Snapshot> {
-            self.saved.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait]
-    impl SnapshotIO for MemSnapshotIO {
-        async fn save(&self, snapshot: &Snapshot) -> io::Result<()> {
-            if self.fail_save.load(Ordering::SeqCst) {
-                return Err(io::Error::other("simulated IO error"));
-            }
-            *self.saved.lock().unwrap() = Some(snapshot.clone());
-            Ok(())
-        }
-
-        async fn load_latest(&self) -> io::Result<Option<Snapshot>> {
-            Ok(self.saved.lock().unwrap().clone())
-        }
-
-        async fn read_chunk(
-            &self,
-            _id: &SnapshotId,
-            _pos: u64,
-            _max: u32,
-        ) -> io::Result<(Bytes, bool)> {
-            unimplemented!()
-        }
-
-        async fn begin_receive(&self, _id: &SnapshotId) -> io::Result<SnapshotWriter> {
-            unimplemented!()
-        }
-    }
-
-    // ── Noop NetworkSender ───────────────────────────────────────
-
-    struct NoopNetwork;
-
-    #[async_trait]
-    impl NetworkSender for NoopNetwork {
-        async fn send(&self, _target: crate::types::NodeId, _data: Vec<u8>) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    // ── Trivial StateMachine ───────────────────────────────────────
-
-    struct CounterSM {
-        count: u64,
-    }
-
-    impl CounterSM {
-        fn new() -> Self {
-            Self { count: 0 }
-        }
-    }
-
-    impl StateMachine for CounterSM {
-        fn apply(&mut self, _offset: u64, _record: &AppRecord) -> io::Result<()> {
-            self.count += 1;
-            Ok(())
-        }
-
-        fn snapshot(&self) -> io::Result<AppSnapshot> {
-            Ok(AppSnapshot {
-                data: self.count.to_le_bytes().to_vec(),
-            })
-        }
-
-        fn restore(&mut self, snapshot: AppSnapshot) -> io::Result<()> {
-            let bytes: [u8; 8] = snapshot
-                .data
-                .try_into()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad snapshot"))?;
-            self.count = u64::from_le_bytes(bytes);
-            Ok(())
-        }
-    }
-
-    // ── Helpers ────────────────────────────────────────────────────
-
-    fn make_records(count: u64) -> Vec<(u64, Term, AppRecord)> {
-        (0..count)
-            .map(|i| {
-                (
-                    i,
-                    Term(1),
-                    AppRecord {
-                        data: Bytes::from(vec![0u8; 8]),
-                    },
-                )
-            })
-            .collect()
-    }
-
-    fn make_records_range(start: u64, count: u64, term: u64) -> Vec<(u64, Term, AppRecord)> {
-        (start..start + count)
-            .map(|i| {
-                (
-                    i,
-                    Term(term),
-                    AppRecord {
-                        data: Bytes::from(vec![0u8; 8]),
-                    },
-                )
-            })
-            .collect()
-    }
-
-    fn test_config(interval: u64) -> RaftConfig {
-        RaftConfig {
-            snapshot_interval: interval,
-            ..RaftConfig::default()
-        }
-    }
-
-    // ── Integration tests ─────────────────────────────────────────
-
-    /// Full EventLoop integration: committing 100 entries triggers
-    /// automatic snapshot at offset 99 and truncates log to offset 100.
-    #[tokio::test]
-    async fn eventloop_automatic_snapshot_at_interval() {
-        let config = test_config(100);
-        let log = MemLog::new();
-        let snap_io = MemSnapshotIO::new();
-
-        // Pre-populate log entries (in production, AppendLog IoAction does this).
-        let entries: Vec<LogEntry> = (0..100)
-            .map(|i| LogEntry {
-                offset: i,
-                term: Term(1),
-                entry_type: EntryType::Command,
-                payload: Some(AppRecord {
-                    data: Bytes::from(vec![0u8; 8]),
-                }),
-            })
-            .collect();
-        log.append(&entries).await.unwrap();
-
-        let io_stage = IoStage::new(log, snap_io, NoopNetwork);
-        let sm = CounterSM::new();
-        let mut event_loop = EventLoop::new(sm, io_stage, &config, None);
-
-        // Commit 100 entries through the real EventLoop path.
-        let records = make_records(100);
-        event_loop.apply_committed_entries(&records).await.unwrap();
-
-        // Verify: snapshot was taken at offset 99.
-        let snap = event_loop
-            .io_stage()
-            .snapshot_io()
-            .saved_snapshot()
-            .expect("snapshot should be saved");
-        assert_eq!(snap.metadata.last_included_offset, 99);
-        assert_eq!(snap.metadata.last_included_term, Term(1));
-
-        // Verify: log prefix truncated, log_start_offset = 100.
-        assert_eq!(event_loop.io_stage().log_store().log_start_offset(), 100);
-
-        // Verify: entries 0–99 are gone.
-        let remaining = event_loop
-            .io_stage()
-            .log_store()
-            .read(0, 100)
-            .await
-            .unwrap();
-        assert!(remaining.is_empty());
-
-        // Verify: coordinator bookkeeping.
-        assert_eq!(
-            event_loop.snapshot_coordinator().last_snapshot_offset(),
-            Some(99)
-        );
-        assert_eq!(event_loop.snapshot_coordinator().commits_since_snapshot(), 0);
-    }
-
-    /// EventLoop log reclamation: after snapshot at offset 499 (HW=500),
-    /// log_start_offset==500 and entries 0–499 are removed.
-    #[tokio::test]
-    async fn eventloop_log_reclamation() {
-        let config = test_config(500);
-        let log = MemLog::new();
-        let snap_io = MemSnapshotIO::new();
-
-        let entries: Vec<LogEntry> = (0..500)
-            .map(|i| LogEntry {
-                offset: i,
-                term: Term(1),
-                entry_type: EntryType::Command,
-                payload: Some(AppRecord {
-                    data: Bytes::from(vec![0u8; 8]),
-                }),
-            })
-            .collect();
-        log.append(&entries).await.unwrap();
-
-        let io_stage = IoStage::new(log, snap_io, NoopNetwork);
-        let sm = CounterSM::new();
-        let mut event_loop = EventLoop::new(sm, io_stage, &config, None);
-
-        let records = make_records(500);
-        event_loop.apply_committed_entries(&records).await.unwrap();
-
-        assert_eq!(event_loop.io_stage().log_store().log_start_offset(), 500);
-        let remaining = event_loop
-            .io_stage()
-            .log_store()
-            .read(0, 500)
-            .await
-            .unwrap();
-        assert!(remaining.is_empty());
-    }
-
-    /// EventLoop snapshot-before-truncation: if save fails, truncation
-    /// is skipped and no log data is lost.
-    #[tokio::test]
-    async fn eventloop_save_failure_skips_truncation() {
-        let config = test_config(100);
-        let log = MemLog::new();
-        let snap_io = MemSnapshotIO::new();
-        snap_io.set_fail_save(true);
-
-        let entries: Vec<LogEntry> = (0..100)
-            .map(|i| LogEntry {
-                offset: i,
-                term: Term(1),
-                entry_type: EntryType::Command,
-                payload: Some(AppRecord {
-                    data: Bytes::from(vec![0u8; 8]),
-                }),
-            })
-            .collect();
-        log.append(&entries).await.unwrap();
-
-        let io_stage = IoStage::new(log, snap_io, NoopNetwork);
-        let sm = CounterSM::new();
-        let mut event_loop = EventLoop::new(sm, io_stage, &config, None);
-
-        let records = make_records(100);
-        // EventLoop handles save failure gracefully — entries still applied.
-        event_loop.apply_committed_entries(&records).await.unwrap();
-
-        // Log must NOT be truncated.
-        assert_eq!(event_loop.io_stage().log_store().log_start_offset(), 0);
-        let remaining = event_loop
-            .io_stage()
-            .log_store()
-            .read(0, 100)
-            .await
-            .unwrap();
-        assert_eq!(remaining.len(), 100);
-
-        // No snapshot recorded.
-        assert_eq!(
-            event_loop.snapshot_coordinator().last_snapshot_offset(),
-            None
+    /// Called when this node transitions to Leader.
+    /// Appends LeaderChangeMessage and notifies listener synchronously.
+    fn on_become_leader(&mut self, batch: &mut IoActionBatch) {
+        tracing::info!(
+            node = %self.state.node_id,
+            term = %self.state.current_term,
+            "became leader"
         );
 
-        // Counter reset — retry after next interval.
-        assert_eq!(event_loop.snapshot_coordinator().commits_since_snapshot(), 0);
-    }
+        batch.push(IoAction::PersistQuorumState(QuorumState {
+            current_term: self.state.current_term,
+            voted_for: self.state.voted_for, // preserve voted_for=Some(self) for leader safety
+            leader_id: Some(self.state.node_id),
+            leader_epoch: self.state.current_term,
+        }));
 
-    /// Multi-batch commit: two full intervals produce two snapshots
-    /// with correct offsets and log truncation.
-    #[tokio::test]
-    async fn eventloop_multi_batch_snapshots() {
-        let config = test_config(10);
-        let log = MemLog::new();
-        let snap_io = MemSnapshotIO::new();
+        // Append LeaderChangeMessage control record
+        ElectionManager::append_leader_change_message(&mut self.state, batch);
 
-        let entries: Vec<LogEntry> = (0..25)
-            .map(|i| LogEntry {
-                offset: i,
-                term: Term(1),
-                entry_type: EntryType::Command,
-                payload: Some(AppRecord {
-                    data: Bytes::from(vec![0u8; 8]),
-                }),
-            })
-            .collect();
-        log.append(&entries).await.unwrap();
-
-        let io_stage = IoStage::new(log, snap_io, NoopNetwork);
-        let sm = CounterSM::new();
-        let mut event_loop = EventLoop::new(sm, io_stage, &config, None);
-
-        // Batch 1: 10 entries → snapshot at offset 9, truncate to 10.
-        let batch1 = make_records(10);
-        event_loop.apply_committed_entries(&batch1).await.unwrap();
-        assert_eq!(
-            event_loop.snapshot_coordinator().last_snapshot_offset(),
-            Some(9)
+        // Notify listener synchronously (before I/O, per architecture §4.1)
+        ElectionManager::notify_leader_change(
+            &mut self.listener,
+            self.state.node_id,
+            self.state.current_term,
         );
-        assert_eq!(event_loop.io_stage().log_store().log_start_offset(), 10);
-
-        // Batch 2: entries 10–19 → snapshot at offset 19, truncate to 20.
-        let batch2 = make_records_range(10, 10, 2);
-        event_loop.apply_committed_entries(&batch2).await.unwrap();
-        assert_eq!(
-            event_loop.snapshot_coordinator().last_snapshot_offset(),
-            Some(19)
-        );
-        assert_eq!(event_loop.io_stage().log_store().log_start_offset(), 20);
-
-        // Batch 3: entries 20–24 → not enough for another snapshot.
-        let batch3 = make_records_range(20, 5, 2);
-        event_loop.apply_committed_entries(&batch3).await.unwrap();
-        assert_eq!(
-            event_loop.snapshot_coordinator().last_snapshot_offset(),
-            Some(19)
-        );
-        assert_eq!(event_loop.snapshot_coordinator().commits_since_snapshot(), 5);
     }
 }
