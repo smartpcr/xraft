@@ -1,4 +1,5 @@
-use bytes::Bytes;
+use std::net::SocketAddr;
+
 use serde::{Deserialize, Serialize};
 
 use crate::types::Term;
