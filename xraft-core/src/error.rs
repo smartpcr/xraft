@@ -1,11 +1,14 @@
 use std::fmt;
+use std::io;
 
-/// Top-level error type for xraft operations.
+use crate::types::NodeId;
+
+/// Public error type for xraft operations.
 #[derive(Debug)]
 pub enum XraftError {
-    StorageError(std::io::Error),
-    TransportError(std::io::Error),
-    NotLeader { leader_id: Option<crate::types::NodeId> },
+    StorageError(io::Error),
+    TransportError(io::Error),
+    NotLeader { leader_id: Option<NodeId> },
     ProposalQueueFull,
     InvalidClusterId,
     Shutdown,
@@ -14,12 +17,14 @@ pub enum XraftError {
 impl fmt::Display for XraftError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::StorageError(e) => write!(f, "storage error: {e}"),
-            Self::TransportError(e) => write!(f, "transport error: {e}"),
-            Self::NotLeader { leader_id } => write!(f, "not leader (leader: {leader_id:?})"),
-            Self::ProposalQueueFull => write!(f, "proposal queue full"),
-            Self::InvalidClusterId => write!(f, "invalid cluster id"),
-            Self::Shutdown => write!(f, "shutting down"),
+            XraftError::StorageError(e) => write!(f, "storage error: {e}"),
+            XraftError::TransportError(e) => write!(f, "transport error: {e}"),
+            XraftError::NotLeader { leader_id } => {
+                write!(f, "not leader (leader: {leader_id:?})")
+            }
+            XraftError::ProposalQueueFull => write!(f, "proposal queue full"),
+            XraftError::InvalidClusterId => write!(f, "invalid cluster id"),
+            XraftError::Shutdown => write!(f, "node is shutting down"),
         }
     }
 }
@@ -27,14 +32,14 @@ impl fmt::Display for XraftError {
 impl std::error::Error for XraftError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::StorageError(e) | Self::TransportError(e) => Some(e),
+            XraftError::StorageError(e) | XraftError::TransportError(e) => Some(e),
             _ => None,
         }
     }
 }
 
-impl From<std::io::Error> for XraftError {
-    fn from(e: std::io::Error) -> Self {
-        Self::StorageError(e)
+impl From<io::Error> for XraftError {
+    fn from(e: io::Error) -> Self {
+        XraftError::StorageError(e)
     }
 }

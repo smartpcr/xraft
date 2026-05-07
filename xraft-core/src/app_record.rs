@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// application's `StateMachine` and `Listener` interpret the contents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppRecord {
-    pub data: bytes::Bytes,
+    pub data: Bytes,
 }
 
 impl AppRecord {

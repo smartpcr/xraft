@@ -8,5 +8,8 @@ workspace = true
 
 [dependencies]
 xraft-core = { path = "../xraft-core" }
-xraft-storage = { path = "../xraft-storage" }
-xraft-transport = { path = "../xraft-transport" }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros", "rt-multi-thread"] }
+async-trait = "0.1"
+bytes = "1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
