@@ -1,14 +1,20 @@
-use std::fmt;
-use std::io;
+use thiserror::Error;
 
-use crate::types::NodeId;
+use crate::membership::NodeId;
 
-/// Public error type for xraft operations.
-#[derive(Debug)]
+/// Top-level error type for xraft operations.
+#[derive(Debug, Error)]
 pub enum XraftError {
-    StorageError(io::Error),
-    TransportError(io::Error),
+    #[error("storage error: {0}")]
+    StorageError(String),
+
+    #[error("transport error: {0}")]
+    TransportError(String),
+
+    #[error("not leader (leader_id: {leader_id:?})")]
     NotLeader { leader_id: Option<NodeId> },
+
+    #[error("proposal queue full")]
     ProposalQueueFull,
 
     #[error("invalid cluster id")]
@@ -16,6 +22,12 @@ pub enum XraftError {
 
     #[error("shutdown")]
     Shutdown,
+
+    #[error("serialization error: {0}")]
+    SerializationError(String),
+
+    #[error("{0}")]
+    Other(String),
 }
 
 impl fmt::Display for XraftError {
