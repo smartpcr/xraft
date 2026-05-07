@@ -2,8 +2,6 @@ use std::io;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use tokio::time::Instant;
 
 use crate::error::Result;
 use crate::rpc::RpcEnvelope;
@@ -31,40 +29,19 @@ pub trait QuorumStateStore: Send + Sync + 'static {
 /// Snapshot I/O operations.
 #[async_trait]
 pub trait SnapshotIO: Send + Sync + 'static {
-    async fn save(&self, snapshot: &Snapshot) -> Result<(), io::Error>;
-    async fn load_latest(&self) -> Result<Option<Snapshot>, io::Error>;
+    async fn save(&self, snapshot: &Snapshot) -> Result<()>;
+    async fn load_latest(&self) -> Result<Option<Snapshot>>;
     async fn read_chunk(
         &self,
         id: &SnapshotId,
         position: u64,
         max_bytes: u32,
-    ) -> Result<(Bytes, bool), io::Error>;
-    async fn begin_receive(&self, id: &SnapshotId) -> Result<SnapshotWriter, io::Error>;
+    ) -> Result<(Vec<u8>, bool)>;
 }
 
-/// Outbound RPC transport (shared reference for concurrent sends).
-#[async_trait]
-pub trait TransportSender: Send + Sync + 'static {
-    async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<(), io::Error>;
-}
-
-/// Inbound RPC transport (exclusive access for sequential reads).
-#[async_trait]
-pub trait TransportReceiver: Send + 'static {
-    async fn recv(&mut self) -> Result<RpcEnvelope, io::Error>;
-}
-
-/// Runtime clock trait for timer management in the EventLoop.
-#[async_trait]
-pub trait Clock: Send + 'static {
-    fn now(&self) -> Instant;
-    async fn sleep_until(&self, deadline: Instant);
-    fn random_election_timeout(&self) -> Duration;
-}
-
-/// Application state machine — synchronous callbacks invoked by the EventLoop.
+/// Application state machine.
 pub trait StateMachine: Send + 'static {
-    fn apply(&mut self, offset: u64, record: &crate::app_record::AppRecord) -> Result<(), io::Error>;
-    fn snapshot(&self) -> Result<crate::app_record::AppSnapshot, io::Error>;
-    fn restore(&mut self, snapshot: crate::app_record::AppSnapshot) -> Result<(), io::Error>;
+    fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>;
+    fn snapshot(&self) -> Result<AppSnapshot>;
+    fn restore(&mut self, snapshot: AppSnapshot) -> Result<()>;
 }

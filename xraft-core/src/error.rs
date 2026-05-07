@@ -1,7 +1,6 @@
-use std::fmt;
-use std::io;
+use thiserror::Error;
 
-use crate::types::NodeId;
+use crate::membership::NodeId;
 
 /// Unified error type for all xraft public APIs.
 #[derive(Debug)]
@@ -20,6 +19,12 @@ pub enum XraftError {
 
     #[error("shutdown")]
     Shutdown,
+
+    #[error("serialization error: {0}")]
+    SerializationError(String),
+
+    #[error("{0}")]
+    Other(String),
 }
 
 impl fmt::Display for XraftError {
