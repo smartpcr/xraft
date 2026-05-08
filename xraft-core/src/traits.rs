@@ -1,6 +1,7 @@
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::time::{Duration, Instant};
 
 use crate::rpc::RpcEnvelope;
 use crate::types::NodeId;

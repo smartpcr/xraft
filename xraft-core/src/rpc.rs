@@ -1,6 +1,3 @@
-use std::net::SocketAddr;
-
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{ClusterId, NodeId, Term};
@@ -23,34 +20,23 @@ pub enum RpcPayload {
     FetchResponse(FetchResponse),
 }
 
-/// Request to update a voter's endpoint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateVoterRequest {
-    pub node_id: NodeId,
-    pub new_endpoint: SocketAddr,
+    pub voter: VoterInfo,
 }
 
-/// Response to any membership-change RPC.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipChangeResponse {
     pub success: bool,
-    /// If the receiving node is not the leader, redirects to the known leader.
-    pub leader_id: Option<NodeId>,
     pub error: Option<MembershipError>,
 }
 
-/// Reasons a membership-change request can be rejected.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MembershipError {
-    /// The receiving node is not the current leader.
     NotLeader { leader_id: Option<NodeId> },
-    /// An uncommitted VotersRecord already exists in the log.
     ChangeInProgress,
-    /// The node is already a voter in the current configuration.
     NodeAlreadyVoter,
-    /// The node was not found in the current configuration.
     NodeNotFound,
-    /// The observer's fetch_offset is behind the leader's current HW.
     NodeNotCaughtUp,
 }
 
