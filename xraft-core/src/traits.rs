@@ -4,7 +4,6 @@ use tokio::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::log_entry::LogEntry;
-use crate::snapshot::{Snapshot, SnapshotId};
 use crate::quorum_state::QuorumState;
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotWriter};
 
