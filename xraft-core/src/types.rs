@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
-/// Unique node identifier within a cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// Unique numeric identifier for a node within the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
 
 /// Monotonically increasing logical clock (epoch).
@@ -50,6 +51,30 @@ impl fmt::Display for Term {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClusterId(pub uuid::Uuid);
 
-/// Logical log offset (0-based, exclusive upper bound convention).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+impl ClusterId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+impl Default for ClusterId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ClusterId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Position in the log (0-indexed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Offset(pub u64);
+
+impl fmt::Display for Offset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "@{}", self.0)
+    }
+}

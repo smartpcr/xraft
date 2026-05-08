@@ -1,2 +1,3 @@
-#[cfg(test)]
-mod raft_node_tests;
+//! xraft-test: test utilities and mock implementations for xraft.
+
+pub mod mocks;
