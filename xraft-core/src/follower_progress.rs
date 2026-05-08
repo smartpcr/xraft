@@ -1,12 +1,11 @@
-use serde::{Deserialize, Serialize};
-
 use crate::types::NodeId;
+use tokio::time::Instant;
 
-/// Per-follower replication progress tracked by the leader.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Leader-side per-follower replication progress.
+#[derive(Debug, Clone)]
 pub struct FollowerProgress {
     pub node_id: NodeId,
     pub fetch_offset: u64,
-    /// Whether this follower counts for quorum.
+    pub last_fetch_timestamp: Instant,
     pub is_voter: bool,
 }
