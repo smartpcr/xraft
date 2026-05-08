@@ -24,7 +24,7 @@
     "contentHash": "f809348c72739f1ba21623ea03e0209328f6278bc85394296f62575199a998e7",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-rpc-message-types",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-rpc-message-types",
-    "status": "review"
+    "status": "complete"
   },
   {
     "title": "Trait Definitions (Storage, Transport, Runtime)",
@@ -222,7 +222,7 @@
     "contentHash": "19b5c547d678a140febf061f1bc8cdea34ed74f7e0a97ea29a2af0b814061b0f",
     "workstreamId": "ws-raft-raft-protocol-phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-cluster-bootstrap",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-persistence-crash-recovery-and-bootstrap-xraft-core-stage-cluster-bootstrap",
-    "status": "active"
+    "status": "complete"
   },
   {
     "title": "Periodic Snapshotting and Log Truncation",
