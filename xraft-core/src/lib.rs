@@ -1,10 +1,4 @@
 pub mod app_record;
-pub mod config;
-pub mod consensus_state;
-pub mod error;
-pub mod follower_progress;
-pub mod listener;
-pub mod listener_event;
 pub mod log_entry;
 pub mod quorum_state;
 pub mod snapshot;

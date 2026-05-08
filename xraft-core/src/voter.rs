@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 /// Information about a voter in the cluster.
@@ -11,6 +10,6 @@ pub struct VoterInfo {
 /// A record of the current voter set, appended to the log on membership changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VotersRecord {
-    pub version: u32,
+    pub version: u64,
     pub voters: Vec<VoterInfo>,
 }
