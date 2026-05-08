@@ -1,14 +1,13 @@
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::time::{Duration, Instant};
 
-use crate::app_record::{AppRecord, AppSnapshot};
-use crate::error::XraftResult;
 use crate::log_entry::LogEntry;
 use crate::quorum_state::QuorumState;
 use crate::rpc::{RpcEnvelope, SnapshotId};
 use crate::snapshot::{Snapshot, SnapshotWriter};
-use crate::types::NodeId;
+use crate::app_record::{AppRecord, AppSnapshot};
 
 /// Durable, append-only log store.
 ///

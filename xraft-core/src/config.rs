@@ -1,12 +1,11 @@
 use std::path::PathBuf;
 
-use crate::error::{XraftError, XraftResult};
 use crate::types::NodeId;
 
-/// Construction-time configuration for a `RaftNode`.
+/// Construction-time configuration for a RaftNode.
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
-    /// Unique identifier for this node within the cluster.
+    /// This node's unique identifier within the cluster.
     pub node_id: NodeId,
     /// Lower bound for randomised election timeout (ms).
     pub election_timeout_min_ms: u64,
@@ -27,10 +26,18 @@ pub struct RaftConfig {
     pub index_interval: u32,
 }
 
-impl Default for RaftConfig {
-    fn default() -> Self {
+impl RaftConfig {
+    /// Create a config with the given node_id and all other fields defaulted.
+    pub fn with_node_id(node_id: NodeId) -> Self {
         Self {
-            node_id: NodeId(1),
+            node_id,
+            ..Self::default_inner()
+        }
+    }
+
+    fn default_inner() -> Self {
+        Self {
+            node_id: NodeId(0),
             election_timeout_min_ms: 150,
             election_timeout_max_ms: 300,
             fetch_interval_ms: 50,
@@ -44,22 +51,27 @@ impl Default for RaftConfig {
     }
 }
 
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self::default_inner()
+    }
+}
+
 impl RaftConfig {
-    /// Validate the configuration invariants.
-    ///
-    /// Ensures: `fetch_interval_ms < election_timeout_min_ms < election_timeout_max_ms`
-    pub fn validate(&self) -> XraftResult<()> {
+    /// Validates configuration invariants.
+    /// `fetch_interval_ms < election_timeout_min_ms < election_timeout_max_ms`
+    pub fn validate(&self) -> Result<(), String> {
         if self.fetch_interval_ms >= self.election_timeout_min_ms {
-            return Err(XraftError::InvalidConfig(format!(
-                "fetch_interval_ms ({}) must be less than election_timeout_min_ms ({})",
+            return Err(format!(
+                "fetch_interval_ms ({}) must be < election_timeout_min_ms ({})",
                 self.fetch_interval_ms, self.election_timeout_min_ms
-            )));
+            ));
         }
         if self.election_timeout_min_ms >= self.election_timeout_max_ms {
-            return Err(XraftError::InvalidConfig(format!(
-                "election_timeout_min_ms ({}) must be less than election_timeout_max_ms ({})",
+            return Err(format!(
+                "election_timeout_min_ms ({}) must be < election_timeout_max_ms ({})",
                 self.election_timeout_min_ms, self.election_timeout_max_ms
-            )));
+            ));
         }
         Ok(())
     }

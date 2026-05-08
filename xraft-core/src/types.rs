@@ -1,8 +1,8 @@
 use std::fmt;
 use std::net::SocketAddr;
 
-/// Unique node identifier within a cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// Unique numeric identifier for a node within the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
 
 /// Monotonically increasing logical clock (epoch).
@@ -83,3 +83,9 @@ impl Default for ClusterId {
 /// Log position (0-indexed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 pub struct Offset(pub u64);
+
+impl fmt::Display for Offset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "@{}", self.0)
+    }
+}

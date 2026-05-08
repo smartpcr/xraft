@@ -1,29 +1,29 @@
-use crate::types::NodeId;
-use std::fmt;
 use std::io;
 
 /// Public error type for xraft operations.
 #[derive(Debug)]
 pub enum XraftError {
     /// Log, snapshot, or quorum-state I/O failure.
-    StorageError(io::Error),
+    #[error("storage error: {0}")]
+    StorageError(#[from] io::Error),
+
     /// Network send/recv failure.
-    TransportError(io::Error),
+    #[error("transport error: {reason}")]
+    TransportError { reason: String },
+
     /// propose() called on a non-leader node.
     NotLeader {
         leader_id: Option<crate::types::NodeId>,
     },
     /// BatchAccumulator back-pressure limit reached.
+    #[error("proposal queue full")]
     ProposalQueueFull,
+
     /// RPC cluster_id mismatch.
+    #[error("invalid cluster id")]
     InvalidClusterId,
     /// Node is shutting down.
     Shutdown,
-    /// Bootstrap precondition not met (log not empty, quorum-state exists, or snapshot exists).
-    BootstrapPreconditionFailed(String),
-    /// Invalid configuration parameters.
-    InvalidConfig(String),
-}
 
 impl fmt::Display for XraftError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -40,14 +40,9 @@ impl fmt::Display for XraftError {
     }
 }
 
-impl std::error::Error for XraftError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            XraftError::StorageError(e) | XraftError::TransportError(e) => Some(e),
-            _ => None,
-        }
-    }
-}
+    /// Bootstrap input validation failure.
+    #[error("invalid bootstrap configuration: {reason}")]
+    InvalidBootstrapConfig { reason: String },
 
 impl From<io::Error> for XraftError {
     fn from(e: io::Error) -> Self {
