@@ -1,5 +1,4 @@
-use std::net::SocketAddr;
-
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::log_entry::LogEntry;
@@ -208,14 +207,9 @@ impl MembershipChangeResponse {
 /// Errors that can occur during membership changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MembershipError {
-    /// This node is not the leader; includes leader_id for redirection.
-    NotLeader { leader_id: Option<NodeId> },
-    /// Another membership change is already in progress.
+    NotLeader,
     ChangeInProgress,
-    /// The node is already a voter.
     NodeAlreadyVoter,
-    /// The node was not found in the voter set.
     NodeNotFound,
-    /// The observer has not caught up to the leader's log.
     NodeNotCaughtUp,
 }

@@ -1,9 +1,10 @@
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::types::Term;
 use crate::voter::VotersRecord;
 
-/// Discriminator for log entry types.
+/// Discriminates the type of a log entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryType {
     /// Application-level state machine command.
@@ -15,7 +16,7 @@ pub enum EntryType {
 }
 
 /// A single entry in the replicated log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     /// Position in the log (0-indexed).
     pub offset: u64,
