@@ -1,8 +1,8 @@
 use std::fmt;
 use std::net::SocketAddr;
 
-/// Unique numeric identifier for a node within the cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Unique node identifier within a cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
 
 /// Monotonically increasing logical clock (epoch).

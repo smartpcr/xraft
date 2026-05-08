@@ -7,14 +7,9 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
-serde = { version = "1", features = ["derive"] }
-bincode = "1"
 bytes = { version = "1", features = ["serde"] }
-tracing = "0.1"
-uuid = { version = "1", features = ["v4", "serde"] }
-async-trait = "0.1"
-thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
+bincode = "1"
