@@ -1,6 +1,5 @@
-use std::net::SocketAddr;
-
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::types::NodeId;
 
@@ -11,7 +10,7 @@ pub struct VoterInfo {
     pub endpoint: SocketAddr,
 }
 
-/// A complete voter set record, appended to the log on membership changes.
+/// Encodes the complete new voter set (not a delta).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VotersRecord {
     pub version: u32,
