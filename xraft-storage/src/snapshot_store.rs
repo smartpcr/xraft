@@ -277,11 +277,11 @@ mod tests {
                 voters: vec![
                     VoterInfo {
                         node_id: NodeId(1),
-                        endpoint: "127.0.0.1:9000".to_string(),
+                        endpoint: "127.0.0.1:9000".parse().unwrap(),
                     },
                     VoterInfo {
                         node_id: NodeId(2),
-                        endpoint: "127.0.0.1:9001".to_string(),
+                        endpoint: "127.0.0.1:9001".parse().unwrap(),
                     },
                 ],
                 leader_epoch: Term(term),
