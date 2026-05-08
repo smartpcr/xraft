@@ -10,14 +10,16 @@ pub mod config;
 pub mod consensus_state;
 pub mod error;
 pub mod follower_progress;
+pub mod listener;
+pub mod listener_event;
 pub mod log_entry;
-pub mod membership;
-pub mod node_state;
 pub mod quorum_state;
+pub mod raft_node;
 pub mod rpc;
 pub mod snapshot;
 pub mod traits;
 pub mod types;
+pub mod voter;
 
 pub use consensus_state::{ConsensusState, Role};
 pub use error::{Result, XraftError};

@@ -8,7 +8,6 @@ use crate::types::{NodeId, Term};
 pub enum Role {
     /// Not attached to any leader; waiting for an election.
     Unattached,
-    /// Following a known leader.
     Follower,
     /// Running for leader election.
     Candidate,
@@ -30,7 +29,6 @@ impl fmt::Display for Role {
 /// Observable consensus state of a node, projected from internal state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusState {
-    pub node_id: NodeId,
     pub current_term: Term,
     pub role: Role,
     pub leader_id: Option<NodeId>,
