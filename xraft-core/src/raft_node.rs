@@ -1,139 +1,50 @@
-use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use std::collections::HashSet;
 
-use crate::app_record::AppRecord;
+use bytes::Bytes;
+
 use crate::config::RaftConfig;
 use crate::consensus_state::{ConsensusState, Role};
-use crate::error::{XraftError, XraftResult};
+use crate::error::XraftError;
+use crate::log_entry::{EntryType, LogEntry};
+use crate::node_state::NodeState;
 use crate::listener::Listener;
+use crate::quorum_state::QuorumState;
+use crate::rpc::{RpcEnvelope, RpcPayload, VoteRequest, VoteResponse};
 use crate::traits::{
     Clock, LogStore, QuorumStateStore, SnapshotIO, StateMachine, TransportReceiver,
     TransportSender,
 };
-use crate::types::{ClusterId, Offset, Term};
-use crate::voter::VoterInfo;
+use crate::types::{ClusterId, NodeId, Term};
+use crate::voter::{VoterInfo, VotersRecord};
 
-/// Internal message sent to the event loop via the mpsc channel.
-pub(crate) enum EventLoopMsg {
-    /// A client proposal carrying an `AppRecord` and a oneshot channel
-    /// for returning the assigned `Offset` once committed.
-    #[allow(dead_code)]
-    Propose {
-        record: AppRecord,
-        reply: tokio::sync::oneshot::Sender<XraftResult<Offset>>,
-    },
-    /// An inbound RPC envelope forwarded by the ReceiverTask.
-    #[allow(dead_code)]
-    Inbound(crate::rpc::RpcEnvelope),
-}
-
-/// Public entry point for an xraft consensus node.
+/// Public handle for a Raft consensus node.
 ///
-/// Generic over the application-provided `StateMachine` (`S`) and `Listener`
-/// (`L`) — monomorphised at compile time (architecture §4.1). I/O traits
-/// (`LogStore`, `TransportSender`, `TransportReceiver`, `QuorumStateStore`,
-/// `SnapshotIO`) and the `Clock` runtime trait are injected as `Box<dyn ...>`
-/// trait objects at construction time.
-///
-/// # Lifecycle
-///
-/// 1. **Construction** (`new`) — creates channels, stores all injected
-///    components. Does **not** start the event loop (Phase 4) or run
-///    recovery (Phase 6). Safe to call outside a Tokio runtime.
-/// 2. **Bootstrap** (`bootstrap`) — validates preconditions (empty log,
-///    no quorum-state file, no snapshot) and stores initial cluster
-///    configuration in memory. Full persistence is deferred to Phase 6.
-/// 3. **Propose / Read** — `propose()` returns `NotLeader` in the initial
-///    Unattached state; `read()` returns the latest `ConsensusState`
-///    from the watch channel.
-/// 4. **Shutdown** (`shutdown`) — invokes `Listener::begin_shutdown()`
-///    synchronously, drops the mpsc sender (causing the ReceiverTask to
-///    exit per architecture §4.4 once started in Phase 4), and awaits
-///    both task handles if they exist.
+/// Generic over `S: StateMachine` and `L: Listener` for zero-cost dispatch.
+/// I/O and runtime traits are injected as `Box<dyn ...>` trait objects.
 pub struct RaftNode<S: StateMachine, L: Listener> {
-    #[allow(dead_code)]
-    config: RaftConfig,
-
-    /// Handle for the event loop task. `None` until the event loop is
-    /// started in Phase 4.
-    #[allow(dead_code)]
-    event_loop_handle: Option<JoinHandle<()>>,
-
-    /// Handle for the receiver task. `None` until the ReceiverTask is
-    /// started in Phase 4.
-    #[allow(dead_code)]
-    receiver_task_handle: Option<JoinHandle<()>>,
-
-    /// Sender half of the mpsc channel used by `propose()` and (in
-    /// Phase 4) the ReceiverTask to feed messages into the event loop.
-    propose_tx: mpsc::Sender<EventLoopMsg>,
-
-    /// Receiver half of the mpsc channel. Held here until Phase 4
-    /// when it is passed to the EventLoop.
-    #[allow(dead_code)]
-    event_loop_rx: Option<mpsc::Receiver<EventLoopMsg>>,
-
-    /// Watch sender for `ConsensusState`. The event loop is the sole
-    /// writer (Phase 4). Held here until then.
-    #[allow(dead_code)]
-    state_tx: watch::Sender<ConsensusState>,
-
-    /// Watch receiver for the latest `ConsensusState`. `read()` clones
-    /// the current value.
-    state_rx: watch::Receiver<ConsensusState>,
-
-    // --- I/O trait objects held for Phase 4 ---
-
-    #[allow(dead_code)]
-    log_store: Box<dyn LogStore>,
-    #[allow(dead_code)]
-    quorum_state_store: Box<dyn QuorumStateStore>,
-    #[allow(dead_code)]
-    snapshot_io: Box<dyn SnapshotIO>,
-    #[allow(dead_code)]
-    transport_sender: Box<dyn TransportSender>,
-    #[allow(dead_code)]
-    transport_receiver: Option<Box<dyn TransportReceiver>>,
-    #[allow(dead_code)]
-    clock: Box<dyn Clock>,
-
-    // --- Application-provided types ---
-
-    #[allow(dead_code)]
-    state_machine: Option<S>,
-    listener: Option<L>,
-
-    /// Set by `bootstrap()` — stored in memory until Phase 6 persistence.
-    #[allow(dead_code)]
-    pub(crate) cluster_id: Option<ClusterId>,
-    /// Set by `bootstrap()` — stored in memory until Phase 6 persistence.
-    #[allow(dead_code)]
-    pub(crate) initial_voters: Option<Vec<VoterInfo>>,
-
-    /// Guard against calling bootstrap more than once.
-    bootstrapped: bool,
+    pub(crate) state: NodeState,
+    pub(crate) config: RaftConfig,
+    pub log_store: Box<dyn LogStore>,
+    pub quorum_state_store: Box<dyn QuorumStateStore>,
+    pub snapshot_io: Box<dyn SnapshotIO>,
+    pub(crate) transport_sender: Box<dyn TransportSender>,
+    pub(crate) transport_receiver: Box<dyn TransportReceiver>,
+    pub(crate) clock: Box<dyn Clock>,
+    pub(crate) state_machine: S,
+    pub(crate) listener: L,
+    pub(crate) bootstrapped: bool,
 }
 
 impl<S: StateMachine, L: Listener> RaftNode<S, L> {
-    /// Construct a new `RaftNode`.
+    /// Creates a new `RaftNode`.
     ///
-    /// Accepts I/O trait objects (separate `Box<dyn TransportSender>` and
-    /// `Box<dyn TransportReceiver>` — callers use `TcpTransport::split()`
-    /// or `ChannelTransport::split()` to obtain the halves per architecture
-    /// §4.4), the `Clock` runtime trait object (`Box<dyn Clock>` — passed
-    /// to the `EventLoop` for timer management, not the `IoStage`), and
-    /// application-provided `S` / `L` instances.
-    ///
-    /// Creates the `tokio::sync::watch` channel for `ConsensusState`
-    /// (writer end stored for the EventLoop, receiver end retained for
-    /// `read()`). Creates the `tokio::sync::mpsc` channel (sender
-    /// retained for `propose()`, receiver stored for the EventLoop).
-    ///
-    /// Does **not** start the event loop (started in Phase 4) or run
-    /// recovery (completed in Phase 6). Safe to call outside a Tokio
-    /// runtime — no tasks are spawned.
+    /// Uses `config.node_id` as the node's identity. If existing data is
+    /// detected (log, quorum-state, or snapshot), calls `recover()` to restore
+    /// state from persisted data and transitions to Follower. If the data
+    /// directory is empty, the node starts in `Unattached` role and waits for
+    /// `bootstrap()`.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub async fn new(
         config: RaftConfig,
         log_store: Box<dyn LogStore>,
         quorum_state_store: Box<dyn QuorumStateStore>,
@@ -143,787 +54,701 @@ impl<S: StateMachine, L: Listener> RaftNode<S, L> {
         clock: Box<dyn Clock>,
         state_machine: S,
         listener: L,
-    ) -> XraftResult<Self> {
-        config.validate()?;
+    ) -> Result<Self, XraftError> {
+        config
+            .validate()
+            .map_err(|reason| XraftError::InvalidConfig { reason })?;
 
-        let initial_state = ConsensusState {
-            current_term: Term(0),
-            role: Role::Unattached,
-            leader_id: None,
-            high_watermark: 0,
-            log_end_offset: 0,
-            voter_set: Vec::new(),
-            node_id: config.node_id,
-        };
+        let node_id = config.node_id;
+        let has_data = Self::has_existing_data(&*log_store, &*quorum_state_store, &*snapshot_io).await?;
 
-        let (state_tx, state_rx) = watch::channel(initial_state);
-        let (propose_tx, event_loop_rx) = mpsc::channel::<EventLoopMsg>(256);
+        let state = NodeState::new_unattached(node_id);
 
-        Ok(Self {
+        let mut node = Self {
+            state,
             config,
-            event_loop_handle: None,
-            receiver_task_handle: None,
-            propose_tx,
-            event_loop_rx: Some(event_loop_rx),
-            state_tx,
-            state_rx,
             log_store,
             quorum_state_store,
             snapshot_io,
             transport_sender,
-            transport_receiver: Some(transport_receiver),
+            transport_receiver,
             clock,
-            state_machine: Some(state_machine),
-            listener: Some(listener),
-            cluster_id: None,
-            initial_voters: None,
+            state_machine,
+            listener,
             bootstrapped: false,
-        })
+        };
+
+        if has_data {
+            match node.recover().await {
+                Ok(()) => { /* successfully recovered */ }
+                Err(XraftError::RecoveryRequired) => {
+                    // Data exists but is inconsistent (e.g. log entries without
+                    // quorum-state or snapshot). Mark bootstrapped to block
+                    // re-bootstrap, but stay Unattached for operator investigation.
+                    node.bootstrapped = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(node)
     }
 
-    /// Propose an application command to the Raft cluster.
+    /// Recovers node state from persisted data (log, quorum-state, snapshot).
     ///
-    /// Sends the `AppRecord` to the event loop via the internal mpsc
-    /// channel and returns a future that resolves to the committed
-    /// `Offset`. Returns `NotLeader` when no leader is active.
+    /// Restores the term, vote, cluster_id, voter set, and log boundaries from
+    /// whatever data is available. Transitions to Follower with an election
+    /// timer so the node can participate in elections.
     ///
-    /// # Phase 1.7 behavior
-    ///
-    /// The event loop is not running, so the role is always `Unattached`
-    /// and this method always returns `NotLeader`. In Phase 5, the
-    /// `NotLeader` check remains at the call-site for fast rejection,
-    /// and the command is sent to the event loop channel for consensus
-    /// processing.
-    pub async fn propose(&self, command: AppRecord) -> XraftResult<Offset> {
-        // Fast-path: check local watch state to reject non-leaders
-        // without entering the event loop's message queue.
-        let current = self.state_rx.borrow().clone();
-        if current.role != Role::Leader {
-            return Err(XraftError::NotLeader {
-                leader_id: current.leader_id,
-            });
+    /// Safety: only scans log VotersRecords when quorum-state confirms the node
+    /// participated in an election (implying data was committed). Full
+    /// committed-vs-pending VotersRecord distinction is Stage 6.1 scope.
+    async fn recover(&mut self) -> Result<(), XraftError> {
+        // Restore from quorum-state if present
+        let has_quorum_state = if let Some(qs) = self.quorum_state_store.load().await? {
+            self.state.current_term = qs.current_term;
+            self.state.voted_for = qs.voted_for;
+            self.state.leader_id = qs.leader_id;
+            self.state.cluster_id = qs.cluster_id;
+            true
+        } else {
+            false
+        };
+
+        // Restore from snapshot if present — snapshot voters become the voter set
+        // and snapshot boundaries set a floor for log_start_offset / high_watermark.
+        let mut has_voters_from_snapshot = false;
+        let mut snapshot_end: u64 = 0;
+        if let Some(snap) = self.snapshot_io.load_latest().await? {
+            self.state.voter_set = snap.metadata.voters.clone();
+            has_voters_from_snapshot = true;
+            snapshot_end = snap.metadata.last_included_offset + 1;
+            self.state.log_start_offset = snapshot_end;
+            self.state.high_watermark = snapshot_end;
+            self.state_machine.restore(snap.app_snapshot)?;
         }
 
-        // Send command to event loop via mpsc channel and await the
-        // committed offset via oneshot reply.
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.propose_tx
-            .send(EventLoopMsg::Propose {
-                record: command,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| XraftError::Shutdown)?;
+        // Restore log boundaries from the log store, taking the max with
+        // snapshot-derived values so we never regress.
+        let store_start = self.log_store.log_start_offset();
+        let store_end = self.log_store.log_end_offset();
+        if store_start > self.state.log_start_offset {
+            self.state.log_start_offset = store_start;
+        }
+        self.state.log_end_offset = std::cmp::max(store_end, snapshot_end);
 
-        reply_rx.await.map_err(|_| XraftError::Shutdown)?
-    }
-
-    /// Return the current committed protocol state.
-    ///
-    /// Clones the latest `ConsensusState` from the watch channel.
-    /// Never reads the `LogStore`, enters the event loop queue, or
-    /// contacts other nodes. Callable on any node role.
-    ///
-    /// The `high_watermark` in the returned state is an exclusive upper
-    /// bound: entry at offset O is committed when O < HW (architecture §3.1).
-    pub fn read(&self) -> XraftResult<ConsensusState> {
-        Ok(self.state_rx.borrow().clone())
-    }
-
-    /// Bootstrap the cluster with an initial voter set.
-    ///
-    /// Validates preconditions (empty log, no quorum-state file, no
-    /// existing snapshot, not already bootstrapped) and stores the cluster
-    /// configuration in memory.
-    ///
-    /// `ClusterId` is provided by the caller to ensure all nodes share
-    /// the same cluster identity.
-    ///
-    /// Full bootstrap persistence is deferred to Phase 6.
-    pub async fn bootstrap(
-        &mut self,
-        cluster_id: ClusterId,
-        initial_voters: Vec<VoterInfo>,
-    ) -> XraftResult<()> {
-        if self.bootstrapped {
-            return Err(XraftError::BootstrapPreconditionFailed(
-                "node has already been bootstrapped".into(),
-            ));
+        // Scan log for the latest VotersRecord only if:
+        // 1. snapshot didn't already provide voters, AND
+        // 2. quorum-state exists (confirming the node participated in elections,
+        //    so the VotersRecord is from a committed flow, not an uncommitted
+        //    membership change tail).
+        if !has_voters_from_snapshot && has_quorum_state && store_end > store_start {
+            let entries = self
+                .log_store
+                .read(store_start, store_end)
+                .await?;
+            for entry in entries.iter().rev() {
+                if entry.entry_type == EntryType::VotersRecord {
+                    if let Ok(record) = bincode::deserialize::<VotersRecord>(&entry.payload) {
+                        self.state.voter_set = record.voters;
+                        break;
+                    }
+                }
+            }
         }
 
-        // Storage preconditions first — reject if node already has durable state.
-        if self.log_store.log_end_offset() != 0 {
-            return Err(XraftError::BootstrapPreconditionFailed(
-                "log is not empty".into(),
-            ));
-        }
-
-        if self.quorum_state_store.load().await?.is_some() {
-            return Err(XraftError::BootstrapPreconditionFailed(
-                "quorum-state already exists".into(),
-            ));
-        }
-
-        if self.snapshot_io.load_latest().await?.is_some() {
-            return Err(XraftError::BootstrapPreconditionFailed(
-                "snapshot already exists".into(),
-            ));
-        }
-
-        // Input validation after storage preconditions.
-        if initial_voters.is_empty() {
-            return Err(XraftError::BootstrapPreconditionFailed(
-                "initial_voters must not be empty".into(),
-            ));
-        }
-
-        self.cluster_id = Some(cluster_id);
-        self.initial_voters = Some(initial_voters);
+        // Transition to Follower with election timer.
+        // Even with incomplete data (nil cluster_id or empty voters), we still
+        // transition to Follower to block re-bootstrap. The node will be limited:
+        // nil cluster_id fails RPC fencing, empty voters prevents elections.
+        // Full recovery validation is Stage 6.1 scope.
+        self.state.role = Role::Follower;
+        let timeout = self.clock.random_election_timeout();
+        self.state.election_deadline = self.clock.now() + timeout;
         self.bootstrapped = true;
 
         Ok(())
     }
 
-    /// Gracefully shut down the node.
+    /// First-time cluster formation per architecture §5.9.
     ///
-    /// 1. Invokes `Listener::begin_shutdown()` synchronously. In Phase 4+
-    ///    this call will be dispatched through the event loop to ensure
-    ///    single-threaded access; in Phase 1.7 it is called directly
-    ///    since no event loop is running.
-    /// 2. Drops the `propose_tx` sender (closing the mpsc channel). When
-    ///    the ReceiverTask is running (Phase 4+), this causes it to exit
-    ///    per architecture §4.4.
-    /// 3. Awaits both `event_loop_handle` and `receiver_task_handle`
-    ///    if they exist (they are `None` until tasks are spawned in
-    ///    Phase 4).
-    pub async fn shutdown(mut self) -> XraftResult<()> {
-        // Invoke begin_shutdown on the listener. In Phase 4+ this
-        // is dispatched through the event loop; in Phase 1.7 it is
-        // called directly since no event loop exists.
-        if let Some(ref mut listener) = self.listener {
-            listener.begin_shutdown();
+    /// Stores `cluster_id` and voter set in memory, sets term=0 with no vote,
+    /// transitions role from `Unattached` to `Follower`, and starts the
+    /// election timer. No log entries are written and no quorum-state file
+    /// is persisted — the quorum-state file is first created when the node
+    /// votes during the first election.
+    pub async fn bootstrap(
+        &mut self,
+        cluster_id: ClusterId,
+        initial_voters: Vec<VoterInfo>,
+    ) -> Result<(), XraftError> {
+        // Guard: reject if already bootstrapped or recovered
+        if self.bootstrapped {
+            return Err(XraftError::AlreadyBootstrapped {
+                reason: "node has already been bootstrapped or recovered".to_string(),
+            });
         }
-        // Prevent further use of the listener.
-        self.listener = None;
-
-        // Drop the propose sender to close the mpsc channel.
-        // In Phase 4+ this causes the ReceiverTask to exit.
-        drop(self.propose_tx);
-
-        // Await event loop handle if present (Phase 4+).
-        if let Some(handle) = self.event_loop_handle.take() {
-            handle.await.map_err(|_| XraftError::Shutdown)?;
+        if self.state.role != Role::Unattached {
+            return Err(XraftError::AlreadyBootstrapped {
+                reason: "node is not in Unattached state".to_string(),
+            });
         }
 
-        // Await receiver task handle if present (Phase 4+).
-        if let Some(handle) = self.receiver_task_handle.take() {
-            handle.await.map_err(|_| XraftError::Shutdown)?;
+        // Storage guard: re-check all three conditions
+        let has_data = Self::has_existing_data(
+            &*self.log_store,
+            &*self.quorum_state_store,
+            &*self.snapshot_io,
+        )
+        .await?;
+        if has_data {
+            return Err(XraftError::AlreadyBootstrapped {
+                reason: "existing data detected (log, quorum-state, or snapshot)".to_string(),
+            });
+        }
+
+        // Validate inputs
+        Self::validate_bootstrap_config(self.state.node_id, &cluster_id, &initial_voters)?;
+
+        // Apply bootstrap state in memory only
+        self.state.cluster_id = cluster_id;
+        self.state.voter_set = initial_voters;
+        self.state.current_term = Term::ZERO;
+        self.state.voted_for = None;
+        self.state.leader_id = None;
+        self.state.role = Role::Follower;
+        self.state.votes_received.clear();
+        self.state.pre_votes_received.clear();
+
+        // Start election timer using the injected clock
+        let timeout = self.clock.random_election_timeout();
+        self.state.election_deadline = self.clock.now() + timeout;
+
+        self.bootstrapped = true;
+
+        Ok(())
+    }
+
+    /// Advances the node one tick: checks the election timer and fires an
+    /// election timeout if the deadline has passed.
+    ///
+    /// Call this from the event loop or use `poll()` for async timer-driven
+    /// operation.
+    pub async fn tick(&mut self) -> Result<(), XraftError> {
+        let now = self.clock.now();
+        if (self.state.role == Role::Follower || self.state.role == Role::Candidate)
+            && now >= self.state.election_deadline
+        {
+            self.handle_election_timeout().await?;
+        }
+        Ok(())
+    }
+
+    /// Async timer-driven election: sleeps until the election deadline using
+    /// the injected clock, then fires `handle_election_timeout()`.
+    ///
+    /// This provides real timer-driven behaviour without a manual tick loop.
+    /// Returns immediately if the node is not a Follower or Candidate.
+    pub async fn poll(&mut self) -> Result<(), XraftError> {
+        if self.state.role != Role::Follower && self.state.role != Role::Candidate {
+            return Ok(());
+        }
+        self.clock.sleep_until(self.state.election_deadline).await;
+        self.handle_election_timeout().await
+    }
+
+    /// Single iteration of the event loop: checks the election timer and
+    /// processes one inbound RPC message from the transport receiver.
+    ///
+    /// This method combines timer-driven and message-driven processing into
+    /// a single step, suitable for being called in a loop by the application.
+    pub async fn step(&mut self) -> Result<(), XraftError> {
+        // Check election timer
+        self.tick().await?;
+
+        // Try to receive and process one inbound message
+        match self.transport_receiver.recv().await {
+            Ok(envelope) => {
+                self.handle_rpc(envelope).await?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => {
+                // No message available; continue
+            }
+            Err(e) => {
+                return Err(XraftError::TransportError {
+                    reason: format!("transport recv failed: {e}"),
+                });
+            }
         }
 
         Ok(())
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::app_record::{AppRecord, AppSnapshot};
-    use crate::config::RaftConfig;
-    use crate::log_entry::LogEntry;
-    use crate::quorum_state::QuorumState;
-    use crate::rpc::{RpcEnvelope, SnapshotId};
-    use crate::snapshot::{Snapshot, SnapshotWriter};
-    use crate::types::{ClusterId, NodeId, Term};
-    use crate::voter::VoterInfo;
-    use async_trait::async_trait;
-    use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
-    use tokio::time::Duration;
+    /// Dispatches an inbound RPC envelope to the appropriate handler.
+    pub async fn handle_rpc(&mut self, envelope: RpcEnvelope) -> Result<(), XraftError> {
+        // After bootstrap, reject any message with a nil or mismatched cluster_id.
+        if self.bootstrapped && !self.state.cluster_id.0.is_nil()
+            && (envelope.cluster_id.0.is_nil() || self.state.cluster_id != envelope.cluster_id)
+        {
+            return Err(XraftError::InvalidClusterId);
+        }
 
-    // ── Mock implementations ──
-
-    struct MockLogStore {
-        end_offset: AtomicU64,
-    }
-
-    impl MockLogStore {
-        fn new() -> Self {
-            Self {
-                end_offset: AtomicU64::new(0),
+        match envelope.payload {
+            RpcPayload::VoteRequest(req) => {
+                let response = self.handle_vote_request(req).await?;
+                let reply = RpcEnvelope {
+                    cluster_id: self.state.cluster_id,
+                    leader_epoch: Term::ZERO,
+                    source: self.state.node_id,
+                    payload: RpcPayload::VoteResponse(response),
+                };
+                self.transport_sender.send(envelope.source, reply).await
+                    .map_err(|e| XraftError::TransportError {
+                        reason: format!("failed to send VoteResponse: {e}"),
+                    })?;
+            }
+            RpcPayload::VoteResponse(resp) => {
+                self.handle_vote_response(envelope.source, resp).await?;
+            }
+            _ => {
+                // Other RPC types handled in later stages
             }
         }
 
-        fn with_end_offset(offset: u64) -> Self {
-            Self {
-                end_offset: AtomicU64::new(offset),
-            }
-        }
+        Ok(())
     }
 
-    #[async_trait]
-    impl LogStore for MockLogStore {
-        async fn append(&self, entries: &[LogEntry]) -> XraftResult<()> {
-            self.end_offset
-                .fetch_add(entries.len() as u64, Ordering::SeqCst);
-            Ok(())
-        }
-        async fn read(&self, _start: u64, _end: u64) -> XraftResult<Vec<LogEntry>> {
-            Ok(Vec::new())
-        }
-        async fn truncate_suffix(&self, _from: u64) -> XraftResult<()> {
-            Ok(())
-        }
-        async fn truncate_prefix(&self, _up_to: u64) -> XraftResult<()> {
-            Ok(())
-        }
-        fn log_start_offset(&self) -> u64 {
-            0
-        }
-        fn log_end_offset(&self) -> u64 {
-            self.end_offset.load(Ordering::SeqCst)
-        }
-        async fn entry_at(&self, _offset: u64) -> XraftResult<Option<LogEntry>> {
-            Ok(None)
-        }
-    }
-
-    struct MockQuorumStateStore {
-        state: Mutex<Option<QuorumState>>,
-    }
-
-    impl MockQuorumStateStore {
-        fn new() -> Self {
-            Self {
-                state: Mutex::new(None),
-            }
+    /// Handles an election timeout: transitions to Candidate, self-votes,
+    /// persists quorum-state (fsync-before-ack), broadcasts VoteRequests,
+    /// and checks for immediate win.
+    ///
+    /// For a single-node cluster, the node wins the election immediately,
+    /// transitions to Leader, and appends LeaderChangeMessage + VotersRecord.
+    pub async fn handle_election_timeout(&mut self) -> Result<(), XraftError> {
+        if self.state.role != Role::Follower && self.state.role != Role::Candidate {
+            return Err(XraftError::InvalidElectionState {
+                reason: format!(
+                    "cannot start election from role {:?}",
+                    self.state.role
+                ),
+            });
         }
 
-        fn with_existing() -> Self {
-            Self {
-                state: Mutex::new(Some(QuorumState {
-                    current_term: Term(1),
-                    voted_for: None,
-                    leader_id: None,
-                    leader_epoch: Term(0),
-                })),
-            }
-        }
-    }
+        // Increment term and vote for self
+        self.state.current_term = Term(self.state.current_term.0 + 1);
+        self.state.voted_for = Some(self.state.node_id);
+        self.state.role = Role::Candidate;
+        self.state.leader_id = None;
+        self.state.votes_received.clear();
+        self.state.votes_received.insert(self.state.node_id);
 
-    #[async_trait]
-    impl QuorumStateStore for MockQuorumStateStore {
-        async fn load(&self) -> XraftResult<Option<QuorumState>> {
-            Ok(self.state.lock().unwrap().clone())
-        }
-        async fn save(&self, state: &QuorumState) -> XraftResult<()> {
-            *self.state.lock().unwrap() = Some(state.clone());
-            Ok(())
-        }
-    }
-
-    struct MockSnapshotIO {
-        has_snapshot: bool,
-    }
-
-    impl MockSnapshotIO {
-        fn new() -> Self {
-            Self {
-                has_snapshot: false,
-            }
-        }
-
-        fn with_existing() -> Self {
-            Self {
-                has_snapshot: true,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl SnapshotIO for MockSnapshotIO {
-        async fn save(&self, _snapshot: &Snapshot) -> XraftResult<()> {
-            Ok(())
-        }
-        async fn load_latest(&self) -> XraftResult<Option<Snapshot>> {
-            if self.has_snapshot {
-                Ok(Some(Snapshot {
-                    metadata: crate::snapshot::SnapshotMetadata {
-                        last_included_offset: 0,
-                        last_included_term: Term(0),
-                        voters: Vec::new(),
-                        leader_epoch: Term(0),
-                    },
-                    app_snapshot: AppSnapshot {
-                        data: Vec::new(),
-                    },
-                }))
-            } else {
-                Ok(None)
-            }
-        }
-        async fn read_chunk(
-            &self,
-            _id: &SnapshotId,
-            _pos: u64,
-            _max: u32,
-        ) -> XraftResult<(bytes::Bytes, bool)> {
-            Ok((bytes::Bytes::new(), true))
-        }
-        async fn begin_receive(&self, _id: &SnapshotId) -> XraftResult<SnapshotWriter> {
-            Ok(SnapshotWriter { data: Vec::new() })
-        }
-    }
-
-    struct MockTransportSender;
-
-    #[async_trait]
-    impl TransportSender for MockTransportSender {
-        async fn send(&self, _target: NodeId, _msg: RpcEnvelope) -> XraftResult<()> {
-            Ok(())
-        }
-    }
-
-    struct MockTransportReceiver;
-
-    #[async_trait]
-    impl TransportReceiver for MockTransportReceiver {
-        async fn recv(&mut self) -> XraftResult<RpcEnvelope> {
-            std::future::pending().await
-        }
-    }
-
-    struct MockClock;
-
-    #[async_trait]
-    impl Clock for MockClock {
-        fn now(&self) -> tokio::time::Instant {
-            tokio::time::Instant::now()
-        }
-        async fn sleep_until(&self, deadline: tokio::time::Instant) {
-            tokio::time::sleep_until(deadline).await;
-        }
-        fn random_election_timeout(&self) -> Duration {
-            Duration::from_millis(200)
-        }
-    }
-
-    struct MockStateMachine;
-
-    impl StateMachine for MockStateMachine {
-        fn apply(&mut self, _offset: u64, _record: &AppRecord) -> XraftResult<()> {
-            Ok(())
-        }
-        fn snapshot(&self) -> XraftResult<AppSnapshot> {
-            Ok(AppSnapshot {
-                data: Vec::new(),
-            })
-        }
-        fn restore(&mut self, _snapshot: AppSnapshot) -> XraftResult<()> {
-            Ok(())
-        }
-    }
-
-    struct MockListener {
-        shutdown_called: Arc<AtomicBool>,
-    }
-
-    impl MockListener {
-        fn new() -> (Self, Arc<AtomicBool>) {
-            let flag = Arc::new(AtomicBool::new(false));
-            (
-                Self {
-                    shutdown_called: flag.clone(),
-                },
-                flag,
-            )
-        }
-    }
-
-    impl Listener for MockListener {
-        fn handle_commit(&mut self, _batch: &[(u64, AppRecord)]) {}
-        fn handle_load_snapshot(&mut self, _reader: crate::snapshot::SnapshotReader) {}
-        fn handle_leader_change(&mut self, _leader_id: NodeId, _term: Term) {}
-        fn begin_shutdown(&mut self) {
-            self.shutdown_called.store(true, Ordering::SeqCst);
-        }
-    }
-
-    fn test_config() -> RaftConfig {
-        RaftConfig::default()
-    }
-
-    fn test_config_with_node_id(id: u64) -> RaftConfig {
-        RaftConfig {
-            node_id: NodeId(id),
-            ..RaftConfig::default()
-        }
-    }
-
-    fn test_voters() -> Vec<VoterInfo> {
-        vec![
-            VoterInfo {
-                node_id: NodeId(1),
-                endpoint: "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
-            },
-            VoterInfo {
-                node_id: NodeId(2),
-                endpoint: "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
-            },
-            VoterInfo {
-                node_id: NodeId(3),
-                endpoint: "127.0.0.1:9002".parse::<SocketAddr>().unwrap(),
-            },
-        ]
-    }
-
-    fn test_cluster_id() -> ClusterId {
-        ClusterId(uuid::Uuid::new_v4())
-    }
-
-    fn build_node() -> (RaftNode<MockStateMachine, MockListener>, Arc<AtomicBool>) {
-        let (listener, shutdown_flag) = MockListener::new();
-        let node = RaftNode::new(
-            test_config(),
-            Box::new(MockLogStore::new()),
-            Box::new(MockQuorumStateStore::new()),
-            Box::new(MockSnapshotIO::new()),
-            Box::new(MockTransportSender),
-            Box::new(MockTransportReceiver),
-            Box::new(MockClock),
-            MockStateMachine,
-            listener,
-        )
-        .expect("construction should succeed");
-        (node, shutdown_flag)
-    }
-
-    fn build_node_with_stores(
-        log_store: MockLogStore,
-        qs_store: MockQuorumStateStore,
-        snap_io: MockSnapshotIO,
-    ) -> (RaftNode<MockStateMachine, MockListener>, Arc<AtomicBool>) {
-        let (listener, shutdown_flag) = MockListener::new();
-        let node = RaftNode::new(
-            test_config(),
-            Box::new(log_store),
-            Box::new(qs_store),
-            Box::new(snap_io),
-            Box::new(MockTransportSender),
-            Box::new(MockTransportReceiver),
-            Box::new(MockClock),
-            MockStateMachine,
-            listener,
-        )
-        .expect("construction should succeed");
-        (node, shutdown_flag)
-    }
-
-    // ── Construction tests ──
-
-    /// new() is safe to call outside a Tokio runtime — no tasks are spawned.
-    #[test]
-    fn new_succeeds_without_tokio_runtime() {
-        let (node, _) = build_node();
-        let state = node.read().unwrap();
-        assert_eq!(state.role, Role::Unattached);
-        assert!(node.cluster_id.is_none());
-        assert!(node.initial_voters.is_none());
-        // No task handles exist in Phase 1.7.
-        assert!(node.event_loop_handle.is_none());
-        assert!(node.receiver_task_handle.is_none());
-    }
-
-    #[test]
-    fn new_fails_with_invalid_config() {
-        let mut config = test_config();
-        config.fetch_interval_ms = 999;
-        config.election_timeout_min_ms = 100;
-        let (listener, _) = MockListener::new();
-        let result = RaftNode::new(
-            config,
-            Box::new(MockLogStore::new()),
-            Box::new(MockQuorumStateStore::new()),
-            Box::new(MockSnapshotIO::new()),
-            Box::new(MockTransportSender),
-            Box::new(MockTransportReceiver),
-            Box::new(MockClock),
-            MockStateMachine,
-            listener,
-        );
-        assert!(result.is_err());
-    }
-
-    // ── read() tests ──
-
-    #[test]
-    fn read_returns_initial_unattached_state() {
-        let (node, _) = build_node();
-        let state = node.read().unwrap();
-        assert_eq!(state.current_term, Term(0));
-        assert_eq!(state.role, Role::Unattached);
-        assert!(state.leader_id.is_none());
-        assert_eq!(state.high_watermark, 0);
-        assert_eq!(state.log_end_offset, 0);
-        assert!(state.voter_set.is_empty());
-    }
-
-    #[test]
-    fn read_returns_configured_node_id() {
-        let (listener, _) = MockListener::new();
-        let node = RaftNode::new(
-            test_config_with_node_id(42),
-            Box::new(MockLogStore::new()),
-            Box::new(MockQuorumStateStore::new()),
-            Box::new(MockSnapshotIO::new()),
-            Box::new(MockTransportSender),
-            Box::new(MockTransportReceiver),
-            Box::new(MockClock),
-            MockStateMachine,
-            listener,
-        )
-        .unwrap();
-        let state = node.read().unwrap();
-        assert_eq!(state.node_id, NodeId(42));
-    }
-
-    // ── propose() tests ──
-
-    #[tokio::test]
-    async fn propose_returns_not_leader_when_unattached() {
-        let (node, _) = build_node();
-        let record = AppRecord {
-            data: bytes::Bytes::from_static(b"test"),
+        // Persist quorum-state before sending any messages (fsync-before-ack)
+        let qs = QuorumState {
+            current_term: self.state.current_term,
+            voted_for: self.state.voted_for,
+            leader_id: None,
+            leader_epoch: Term::ZERO,
+            cluster_id: self.state.cluster_id,
         };
-        let result = node.propose(record).await;
-        assert!(
-            matches!(result, Err(XraftError::NotLeader { leader_id: None })),
-            "expected NotLeader with no leader, got {result:?}"
-        );
-    }
+        self.quorum_state_store.save(&qs).await?;
 
-    // ── bootstrap() tests ──
+        // Check if we already have a quorum (single-node cluster)
+        if self.has_quorum() {
+            self.become_leader().await?;
+        } else {
+            // Broadcast VoteRequest to all other voters
+            self.broadcast_vote_requests().await?;
 
-    #[tokio::test]
-    async fn bootstrap_succeeds_on_clean_state() {
-        let (mut node, _) = build_node();
-        let cid = test_cluster_id();
-        let voters = test_voters();
-        let result = node.bootstrap(cid, voters.clone()).await;
-        assert!(result.is_ok(), "bootstrap should succeed: {result:?}");
-    }
-
-    #[tokio::test]
-    async fn bootstrap_stores_cluster_id() {
-        let (mut node, _) = build_node();
-        let cid = test_cluster_id();
-        node.bootstrap(cid, test_voters()).await.unwrap();
-        assert_eq!(node.cluster_id, Some(cid));
-    }
-
-    #[tokio::test]
-    async fn bootstrap_stores_initial_voters_in_memory() {
-        let (mut node, _) = build_node();
-        let voters = test_voters();
-        node.bootstrap(test_cluster_id(), voters.clone())
-            .await
-            .unwrap();
-        assert_eq!(node.initial_voters, Some(voters));
-    }
-
-    #[tokio::test]
-    async fn bootstrap_does_not_persist_to_log_in_skeleton() {
-        let (mut node, _) = build_node();
-        node.bootstrap(test_cluster_id(), test_voters())
-            .await
-            .unwrap();
-        assert_eq!(node.log_store.log_end_offset(), 0);
-    }
-
-    #[tokio::test]
-    async fn bootstrap_does_not_persist_quorum_state_in_skeleton() {
-        let (mut node, _) = build_node();
-        node.bootstrap(test_cluster_id(), test_voters())
-            .await
-            .unwrap();
-        let loaded = node.quorum_state_store.load().await.unwrap();
-        assert!(loaded.is_none(), "quorum state should NOT be persisted in skeleton");
-    }
-
-    #[tokio::test]
-    async fn bootstrap_does_not_update_watch_in_skeleton() {
-        let (mut node, _) = build_node();
-        node.bootstrap(test_cluster_id(), test_voters())
-            .await
-            .unwrap();
-        let state = node.read().unwrap();
-        assert!(state.voter_set.is_empty());
-        assert_eq!(state.log_end_offset, 0);
-        assert_eq!(state.role, Role::Unattached);
-    }
-
-    #[tokio::test]
-    async fn bootstrap_fails_when_log_not_empty() {
-        let (mut node, _) = build_node_with_stores(
-            MockLogStore::with_end_offset(5),
-            MockQuorumStateStore::new(),
-            MockSnapshotIO::new(),
-        );
-        let result = node.bootstrap(test_cluster_id(), test_voters()).await;
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            XraftError::BootstrapPreconditionFailed(msg) => {
-                assert!(
-                    msg.contains("log is not empty"),
-                    "unexpected error message: {msg}"
-                );
-            }
-            other => panic!("expected BootstrapPreconditionFailed, got {other:?}"),
+            // Reset election timer for the next timeout
+            let timeout = self.clock.random_election_timeout();
+            self.state.election_deadline = self.clock.now() + timeout;
         }
-        assert!(node.cluster_id.is_none());
+
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn bootstrap_fails_when_quorum_state_exists() {
-        let (mut node, _) = build_node_with_stores(
-            MockLogStore::new(),
-            MockQuorumStateStore::with_existing(),
-            MockSnapshotIO::new(),
-        );
-        let result = node.bootstrap(test_cluster_id(), test_voters()).await;
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            XraftError::BootstrapPreconditionFailed(msg) => {
-                assert!(
-                    msg.contains("quorum-state already exists"),
-                    "unexpected error message: {msg}"
-                );
+    /// Handles an incoming VoteRequest from another candidate.
+    ///
+    /// Rejects candidates not in the voter set. Grants the vote if: the
+    /// candidate's term >= our term, we haven't voted for someone else in
+    /// this term, and the candidate's log is at least as up-to-date as ours.
+    /// Durably persists quorum-state on any term advancement.
+    pub async fn handle_vote_request(
+        &mut self,
+        request: VoteRequest,
+    ) -> Result<VoteResponse, XraftError> {
+        // Reject candidates not in the configured voter set
+        if !self.state.voter_set.iter().any(|v| v.node_id == request.candidate_id) {
+            return Ok(VoteResponse {
+                term: self.state.current_term,
+                vote_granted: false,
+                is_pre_vote: request.is_pre_vote,
+            });
+        }
+
+        // If the candidate's term is higher, step down and update our term.
+        // Durably persist the new term even if we don't grant the vote.
+        if request.term > self.state.current_term {
+            self.state.current_term = request.term;
+            self.state.voted_for = None;
+            self.state.role = Role::Follower;
+            self.state.leader_id = None;
+            self.state.votes_received.clear();
+            let timeout = self.clock.random_election_timeout();
+            self.state.election_deadline = self.clock.now() + timeout;
+
+            // Persist the higher term immediately (fsync-before-ack)
+            let qs = QuorumState {
+                current_term: self.state.current_term,
+                voted_for: None,
+                leader_id: None,
+                leader_epoch: Term::ZERO,
+                cluster_id: self.state.cluster_id,
+            };
+            self.quorum_state_store.save(&qs).await?;
+        }
+
+        // Reject if the candidate's term is stale
+        if request.term < self.state.current_term {
+            return Ok(VoteResponse {
+                term: self.state.current_term,
+                vote_granted: false,
+                is_pre_vote: request.is_pre_vote,
+            });
+        }
+
+        // Check if we can vote for this candidate
+        let can_vote = match self.state.voted_for {
+            None => true,
+            Some(voted) => voted == request.candidate_id,
+        };
+
+        // Check log up-to-date: candidate's log must be at least as current
+        let (our_last_offset, our_last_term) = self.last_log_info().await;
+        let log_ok = request.last_log_term > our_last_term
+            || (request.last_log_term == our_last_term
+                && request.last_log_offset >= our_last_offset);
+
+        let vote_granted = can_vote && log_ok;
+
+        if vote_granted && !request.is_pre_vote {
+            self.state.voted_for = Some(request.candidate_id);
+
+            // Persist quorum-state (fsync-before-ack)
+            let qs = QuorumState {
+                current_term: self.state.current_term,
+                voted_for: self.state.voted_for,
+                leader_id: None,
+                leader_epoch: Term::ZERO,
+                cluster_id: self.state.cluster_id,
+            };
+            self.quorum_state_store.save(&qs).await?;
+
+            // Reset election timer when granting a vote
+            let timeout = self.clock.random_election_timeout();
+            self.state.election_deadline = self.clock.now() + timeout;
+        }
+
+        Ok(VoteResponse {
+            term: self.state.current_term,
+            vote_granted,
+            is_pre_vote: request.is_pre_vote,
+        })
+    }
+
+    /// Broadcasts VoteRequest RPCs to all other voters in the cluster.
+    async fn broadcast_vote_requests(&self) -> Result<(), XraftError> {
+        let (last_log_offset, last_log_term) = self.last_log_info().await;
+
+        let vote_request = VoteRequest {
+            term: self.state.current_term,
+            candidate_id: self.state.node_id,
+            last_log_offset,
+            last_log_term,
+            is_pre_vote: false,
+        };
+
+        let envelope = RpcEnvelope {
+            cluster_id: self.state.cluster_id,
+            leader_epoch: Term::ZERO,
+            source: self.state.node_id,
+            payload: RpcPayload::VoteRequest(vote_request),
+        };
+
+        for voter in &self.state.voter_set {
+            if voter.node_id != self.state.node_id {
+                if let Err(e) = self.transport_sender.send(voter.node_id, envelope.clone()).await {
+                    tracing::warn!(
+                        target = %voter.node_id,
+                        error = %e,
+                        "failed to send VoteRequest"
+                    );
+                }
             }
-            other => panic!("expected BootstrapPreconditionFailed, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    /// Handles a VoteResponse from another node.
+    ///
+    /// Validates term, tracks the vote, and transitions to Leader if quorum
+    /// is reached.
+    pub async fn handle_vote_response(
+        &mut self,
+        from: NodeId,
+        response: VoteResponse,
+    ) -> Result<(), XraftError> {
+        // Higher term: step down to Follower
+        if response.term > self.state.current_term {
+            self.state.current_term = response.term;
+            self.state.voted_for = None;
+            self.state.role = Role::Follower;
+            self.state.leader_id = None;
+            self.state.votes_received.clear();
+            let timeout = self.clock.random_election_timeout();
+            self.state.election_deadline = self.clock.now() + timeout;
+
+            let qs = QuorumState {
+                current_term: self.state.current_term,
+                voted_for: None,
+                leader_id: None,
+                leader_epoch: Term::ZERO,
+                cluster_id: self.state.cluster_id,
+            };
+            self.quorum_state_store.save(&qs).await?;
+            return Ok(());
+        }
+
+        // Ignore if not Candidate or stale term
+        if self.state.role != Role::Candidate || response.term != self.state.current_term {
+            return Ok(());
+        }
+
+        // Ignore pre-vote responses here (only handle real votes)
+        if response.is_pre_vote {
+            return Ok(());
+        }
+
+        // Ignore vote from a node not in the voter set
+        if !self.state.voter_set.iter().any(|v| v.node_id == from) {
+            return Ok(());
+        }
+
+        if response.vote_granted {
+            self.state.votes_received.insert(from);
+
+            if self.has_quorum() {
+                self.become_leader().await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the current public consensus state projection.
+    pub fn read(&self) -> Result<ConsensusState, XraftError> {
+        Ok(self.state.project())
+    }
+
+    /// Returns `true` if the node has been bootstrapped.
+    pub fn is_bootstrapped(&self) -> bool {
+        self.bootstrapped
+    }
+
+    /// Returns the cluster ID assigned to this node.
+    pub fn cluster_id(&self) -> ClusterId {
+        self.state.cluster_id
+    }
+
+    /// Returns the node's own ID.
+    pub fn node_id(&self) -> NodeId {
+        self.state.node_id
+    }
+
+    /// Returns the current voter set (for testing/introspection).
+    pub fn voter_set(&self) -> &[VoterInfo] {
+        &self.state.voter_set
+    }
+
+    /// Returns the current election deadline (for testing).
+    pub fn election_deadline(&self) -> std::time::Instant {
+        self.state.election_deadline
+    }
+
+    /// Returns true if votes_received constitutes a majority of the voter set.
+    fn has_quorum(&self) -> bool {
+        let total = self.state.voter_set.len();
+        if total == 0 {
+            return false;
+        }
+        let needed = total / 2 + 1;
+        self.state.votes_received.len() >= needed
+    }
+
+    /// Returns (last_log_offset, last_log_term) by reading the actual log.
+    async fn last_log_info(&self) -> (u64, Term) {
+        let end = self.log_store.log_end_offset();
+        if end == 0 {
+            return (0, Term::ZERO);
+        }
+        let last_offset = end - 1;
+        match self.log_store.entry_at(last_offset).await {
+            Ok(Some(entry)) => (last_offset, entry.term),
+            _ => (last_offset, Term::ZERO),
         }
     }
 
-    #[tokio::test]
-    async fn bootstrap_fails_when_snapshot_exists() {
-        let (mut node, _) = build_node_with_stores(
-            MockLogStore::new(),
-            MockQuorumStateStore::new(),
-            MockSnapshotIO::with_existing(),
-        );
-        let result = node.bootstrap(test_cluster_id(), test_voters()).await;
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            XraftError::BootstrapPreconditionFailed(msg) => {
-                assert!(
-                    msg.contains("snapshot already exists"),
-                    "unexpected error message: {msg}"
-                );
-            }
-            other => panic!("expected BootstrapPreconditionFailed, got {other:?}"),
+    /// Returns true if the log contains at least one VotersRecord entry.
+    async fn log_has_voters_record(&self) -> bool {
+        let start = self.log_store.log_start_offset();
+        let end = self.log_store.log_end_offset();
+        if end <= start {
+            return false;
+        }
+        match self.log_store.read(start, end).await {
+            Ok(entries) => entries.iter().any(|e| e.entry_type == EntryType::VotersRecord),
+            Err(_) => false,
         }
     }
 
-    #[tokio::test]
-    async fn bootstrap_fails_when_already_bootstrapped() {
-        let (mut node, _) = build_node();
-        node.bootstrap(test_cluster_id(), test_voters())
-            .await
-            .unwrap();
-        let result = node.bootstrap(test_cluster_id(), test_voters()).await;
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            XraftError::BootstrapPreconditionFailed(msg) => {
-                assert!(
-                    msg.contains("already been bootstrapped"),
-                    "unexpected error message: {msg}"
-                );
+    /// Returns a reference to the log store (for test assertions).
+    pub fn log_store(&self) -> &dyn LogStore {
+        &*self.log_store
+    }
+
+    /// Returns a reference to the quorum state store (for test assertions).
+    pub fn quorum_state_store(&self) -> &dyn QuorumStateStore {
+        &*self.quorum_state_store
+    }
+
+    /// Returns a reference to the snapshot IO (for test assertions).
+    pub fn snapshot_io(&self) -> &dyn SnapshotIO {
+        &*self.snapshot_io
+    }
+
+    /// Transitions the node from Candidate to Leader after winning an election.
+    ///
+    /// Always appends a LeaderChangeMessage. Appends a VotersRecord only if
+    /// the log does not already contain one (i.e., during the initial bootstrap
+    /// election). This approach is more robust than a node-local flag because
+    /// it survives crash-recovery and works correctly when a different node
+    /// wins a subsequent election after the original leader crashed.
+    async fn become_leader(&mut self) -> Result<(), XraftError> {
+        // Check before appending: does the log already have a VotersRecord?
+        let needs_voters_record = !self.log_has_voters_record().await;
+
+        // Append LeaderChangeMessage as the first entry of the new term
+        let lcm_entry = LogEntry {
+            offset: self.log_store.log_end_offset(),
+            term: self.state.current_term,
+            entry_type: EntryType::LeaderChangeMessage,
+            payload: Bytes::new(),
+        };
+        self.log_store.append(&[lcm_entry]).await?;
+
+        // Append VotersRecord only if none exists yet (initial bootstrap election)
+        if needs_voters_record {
+            let voters_record = VotersRecord {
+                version: 1,
+                voters: self.state.voter_set.clone(),
+            };
+            let payload = bincode::serialize(&voters_record)
+                .map_err(std::io::Error::other)?;
+            let vr_entry = LogEntry {
+                offset: self.log_store.log_end_offset(),
+                term: self.state.current_term,
+                entry_type: EntryType::VotersRecord,
+                payload: Bytes::from(payload),
+            };
+            if let Err(e) = self.log_store.append(&[vr_entry]).await {
+                // Roll back the LCM entry to avoid partial state
+                let lcm_offset = self.log_store.log_end_offset().saturating_sub(1);
+                let _ = self.log_store.truncate_suffix(lcm_offset).await;
+                return Err(e.into());
             }
-            other => panic!("expected BootstrapPreconditionFailed, got {other:?}"),
         }
+
+        // Only transition to Leader after all appends succeeded
+        self.state.role = Role::Leader;
+        self.state.leader_id = Some(self.state.node_id);
+
+        // Update in-memory log boundaries
+        self.state.log_end_offset = self.log_store.log_end_offset();
+
+        // For single-node clusters, all entries are immediately committed
+        // since the leader is the only voter (majority of 1).
+        if self.state.voter_set.len() == 1 {
+            self.state.high_watermark = self.state.log_end_offset;
+        }
+
+        // Notify listener of leader change
+        self.listener
+            .handle_leader_change(self.state.node_id, self.state.current_term);
+
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn bootstrap_fails_when_initial_voters_empty() {
-        let (mut node, _) = build_node();
-        let result = node.bootstrap(test_cluster_id(), vec![]).await;
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            XraftError::BootstrapPreconditionFailed(msg) => {
-                assert!(
-                    msg.contains("initial_voters must not be empty"),
-                    "unexpected error message: {msg}"
-                );
+    /// Checks whether any existing data is present in the stores.
+    async fn has_existing_data(
+        log_store: &dyn LogStore,
+        quorum_state_store: &dyn QuorumStateStore,
+        snapshot_io: &dyn SnapshotIO,
+    ) -> Result<bool, XraftError> {
+        if log_store.log_start_offset() != 0 || log_store.log_end_offset() != 0 {
+            return Ok(true);
+        }
+
+        let qs = quorum_state_store.load().await?;
+        if qs.is_some() {
+            return Ok(true);
+        }
+
+        let snap = snapshot_io.load_latest().await?;
+        if snap.is_some() {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    /// Validates bootstrap configuration inputs.
+    fn validate_bootstrap_config(
+        node_id: NodeId,
+        cluster_id: &ClusterId,
+        initial_voters: &[VoterInfo],
+    ) -> Result<(), XraftError> {
+        if cluster_id.0.is_nil() {
+            return Err(XraftError::InvalidBootstrapConfig {
+                reason: "cluster_id must not be nil".to_string(),
+            });
+        }
+
+        if initial_voters.is_empty() {
+            return Err(XraftError::InvalidBootstrapConfig {
+                reason: "initial_voters must not be empty".to_string(),
+            });
+        }
+
+        let mut seen = HashSet::new();
+        for voter in initial_voters {
+            if !seen.insert(voter.node_id) {
+                return Err(XraftError::InvalidBootstrapConfig {
+                    reason: format!("duplicate node_id {} in initial_voters", voter.node_id),
+                });
             }
-            other => panic!("expected BootstrapPreconditionFailed, got {other:?}"),
         }
-    }
 
-    // ── shutdown() tests ──
+        if !initial_voters.iter().any(|v| v.node_id == node_id) {
+            return Err(XraftError::InvalidBootstrapConfig {
+                reason: format!(
+                    "this node ({}) must be included in initial_voters",
+                    node_id
+                ),
+            });
+        }
 
-    #[tokio::test]
-    async fn shutdown_invokes_begin_shutdown() {
-        let (node, shutdown_flag) = build_node();
-        assert!(!shutdown_flag.load(Ordering::SeqCst));
-        node.shutdown().await.unwrap();
-        assert!(
-            shutdown_flag.load(Ordering::SeqCst),
-            "begin_shutdown should have been called"
-        );
-    }
-
-    #[tokio::test]
-    async fn shutdown_succeeds_with_no_tasks() {
-        let (node, _) = build_node();
-        node.shutdown().await.unwrap();
-    }
-
-    // ── Integration-style tests ──
-
-    #[tokio::test]
-    async fn full_lifecycle_construct_bootstrap_read_shutdown() {
-        let (mut node, shutdown_flag) = build_node();
-
-        let state = node.read().unwrap();
-        assert_eq!(state.role, Role::Unattached);
-        assert!(state.voter_set.is_empty());
-        assert_eq!(state.node_id, NodeId(1)); // default config node_id
-
-        let cid = test_cluster_id();
-        node.bootstrap(cid, test_voters()).await.unwrap();
-
-        // Skeleton stores in memory only, watch unchanged.
-        let state = node.read().unwrap();
-        assert!(state.voter_set.is_empty());
-        assert_eq!(state.log_end_offset, 0);
-
-        assert_eq!(node.cluster_id, Some(cid));
-
-        let result = node
-            .propose(AppRecord {
-                data: bytes::Bytes::from_static(b"cmd"),
-            })
-            .await;
-        assert!(matches!(result, Err(XraftError::NotLeader { .. })));
-
-        node.shutdown().await.unwrap();
-        assert!(shutdown_flag.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn read_unaffected_by_skeleton_bootstrap() {
-        let (mut node, _) = build_node();
-
-        let before = node.read().unwrap();
-        assert!(before.voter_set.is_empty());
-        assert_eq!(before.log_end_offset, 0);
-
-        node.bootstrap(test_cluster_id(), test_voters())
-            .await
-            .unwrap();
-
-        let after = node.read().unwrap();
-        assert!(after.voter_set.is_empty());
-        assert_eq!(after.log_end_offset, 0);
-        assert_eq!(after.role, Role::Unattached);
+        Ok(())
     }
 }

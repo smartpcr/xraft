@@ -2,7 +2,6 @@ use std::io;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::time::{Duration, Instant};
 
 use crate::quorum_state::QuorumState;
 
