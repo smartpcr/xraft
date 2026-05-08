@@ -1,5 +1,4 @@
 use crate::types::NodeId;
-use tokio::time::Instant;
 
 /// Leader-side per-follower replication progress tracker.
 ///

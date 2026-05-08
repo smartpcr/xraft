@@ -6,10 +6,14 @@ use crate::voter::VoterInfo;
 /// The role a node occupies in the Raft protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Role {
-    /// Initial state before bootstrap or recovery completes.
+    /// Initial state before bootstrap or recovery; also terminal state
+    /// for a removed voter.
     Unattached,
+    /// Passive participant that accepts log entries from the leader.
     Follower,
+    /// Actively seeking votes to become leader.
     Candidate,
+    /// Active leader replicating log entries to followers.
     Leader,
 }
 
@@ -22,6 +26,7 @@ pub enum Role {
 /// `follower_state`, election/quorum deadlines, vote counters) are not exposed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsensusState {
+    pub node_id: NodeId,
     pub current_term: Term,
     pub role: Role,
     pub leader_id: Option<NodeId>,
@@ -31,5 +36,4 @@ pub struct ConsensusState {
     pub log_end_offset: u64,
     /// The committed voter set — does NOT include pending membership changes.
     pub voter_set: Vec<VoterInfo>,
-    pub node_id: NodeId,
 }
