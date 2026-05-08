@@ -1,7 +1,1 @@
-target/
-Cargo.lock
-*.swp
-*.swo
-*~
-.idea/
-.vscode/
+/target

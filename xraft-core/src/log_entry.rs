@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Offset, Term};
@@ -15,16 +14,23 @@ pub enum EntryType {
 }
 
 /// A single entry in the replicated log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogEntry {
-    /// Position in the log (0-indexed).
-    pub offset: u64,
-    /// Term when the entry was created.
+    pub offset: Offset,
     pub term: Term,
     /// Discriminator for entry content.
     pub entry_type: EntryType,
-    /// Serialised command or control record.
-    pub payload: Bytes,
+}
+
+/// Discriminates application records from consensus control records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EntryType {
+    /// Client-submitted command forwarded to the StateMachine.
+    Command(AppRecord),
+    /// Appended by a new leader to establish commit state for its term.
+    LeaderChangeMessage,
+    /// Records a membership change (voter set update).
+    VotersRecord(VotersRecord),
 }
 
 impl LogEntry {
