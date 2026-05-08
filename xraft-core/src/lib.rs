@@ -1,4 +1,11 @@
+//! xraft-core: Raft consensus protocol engine.
+
 pub mod app_record;
+pub mod config;
+pub mod consensus_state;
+pub mod error;
+pub mod follower_progress;
+pub mod listener;
 pub mod log_entry;
 pub mod quorum_state;
 pub mod snapshot;

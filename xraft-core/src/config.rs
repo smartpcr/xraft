@@ -3,7 +3,7 @@ use std::path::PathBuf;
 /// Configuration for the Raft node.
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
-    /// Unique identifier for this node within the cluster.
+    /// This node's unique identifier within the cluster.
     pub node_id: NodeId,
     /// Lower bound for randomised election timeout (ms).
     pub election_timeout_min_ms: u64,
@@ -21,18 +21,32 @@ pub struct RaftConfig {
     pub data_dir: PathBuf,
 }
 
-impl Default for RaftConfig {
-    fn default() -> Self {
+impl RaftConfig {
+    /// Create a config with the given node_id and all other fields defaulted.
+    pub fn with_node_id(node_id: NodeId) -> Self {
         Self {
-            node_id: NodeId(1),
+            node_id,
+            ..Self::default_inner()
+        }
+    }
+
+    fn default_inner() -> Self {
+        Self {
+            node_id: NodeId(0),
             election_timeout_min_ms: 150,
             election_timeout_max_ms: 300,
             fetch_interval_ms: 50,
             max_batch_size: 256,
-            max_fetch_bytes: 1024 * 1024, // 1 MiB
+            max_fetch_bytes: 1_048_576, // 1 MiB
             snapshot_interval: 10_000,
             data_dir: PathBuf::from("data"),
         }
+    }
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self::default_inner()
     }
 }
 
