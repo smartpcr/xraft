@@ -19,13 +19,7 @@ impl fmt::Display for NodeId {
 )]
 pub struct Term(pub u64);
 
-impl fmt::Display for Term {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Term({})", self.0)
-    }
-}
-
-/// Cluster identity for fencing.
+/// Cluster identity — every RPC carries this for fencing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClusterId(pub uuid::Uuid);
 

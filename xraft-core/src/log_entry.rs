@@ -1,28 +1,24 @@
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::types::Term;
-
-/// Discriminates the type of a log entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EntryType {
-    /// Application-level state machine command (wraps an `AppRecord`).
-    Command,
-    /// Appended by a new leader as the first entry of its term.
-    LeaderChangeMessage,
-    /// Appended when processing AddVoter/RemoveVoter/UpdateVoter RPCs.
-    VotersRecord,
-}
+use crate::app_record::AppRecord;
+use crate::types::{Offset, Term};
+use crate::voter::VotersRecord;
 
 /// A single entry in the replicated log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogEntry {
-    /// Position in the log (0-indexed).
-    pub offset: u64,
-    /// Term when the entry was created.
+    pub offset: Offset,
     pub term: Term,
-    /// Type discriminator.
     pub entry_type: EntryType,
-    /// Serialised command or control record.
-    pub payload: Bytes,
+}
+
+/// Discriminates application records from consensus control records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EntryType {
+    /// Client-submitted command forwarded to the StateMachine.
+    Command(AppRecord),
+    /// Appended by a new leader to establish commit state for its term.
+    LeaderChangeMessage,
+    /// Records a membership change (voter set update).
+    VotersRecord(VotersRecord),
 }
