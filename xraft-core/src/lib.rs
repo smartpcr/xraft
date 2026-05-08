@@ -5,8 +5,6 @@ pub mod listener;
 pub mod listener_event;
 pub mod log_entry;
 pub mod rpc;
-pub mod snapshot;
-pub mod traits;
 pub mod types;
 pub mod voter;
 

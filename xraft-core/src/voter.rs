@@ -1,5 +1,6 @@
-use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+
+use serde::{Deserialize, Serialize};
 
 use crate::types::NodeId;
 
@@ -13,6 +14,6 @@ pub struct VoterInfo {
 /// Membership change control record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VotersRecord {
-    pub version: u32,
+    pub version: u64,
     pub voters: Vec<VoterInfo>,
 }
