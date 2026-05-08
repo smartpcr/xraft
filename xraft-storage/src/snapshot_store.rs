@@ -1,144 +1,259 @@
 use std::path::{Path, PathBuf};
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use tokio::sync::Mutex;
-use xraft_core::snapshot::{Snapshot, SnapshotId, SnapshotWriter};
-use xraft_core::traits::SnapshotIO;
-use xraft_core::Result;
+use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-/// File-based snapshot store.
+use crate::error::{StorageError, StorageResult};
+use crate::model::{SnapshotChunk, SnapshotMetadata};
+
+/// Default chunk size for snapshot transfers (64 KiB).
+const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
+
+/// On-disk snapshot store.
 ///
-/// Snapshots are stored as `<snap_dir>/<offset>-<epoch>.snap`.
-/// Writes are atomic: write to temp file, fsync, rename.
+/// Snapshots are stored as flat files under `<base_dir>/<term>-<index>.snap`
+/// with an adjacent `.meta` JSON sidecar for metadata.
+#[derive(Debug, Clone)]
 pub struct SnapshotStore {
-    snap_dir: PathBuf,
-    latest: Mutex<Option<Snapshot>>,
+    base_dir: PathBuf,
+    chunk_size: usize,
 }
 
 impl SnapshotStore {
-    /// Open or create the snapshot store directory.
-    pub async fn open(snap_dir: &Path) -> Result<Self> {
-        tokio::fs::create_dir_all(snap_dir).await?;
-
-        // Load latest snapshot if any
-        let latest = Self::find_latest(snap_dir).await?;
-
-        Ok(Self {
-            snap_dir: snap_dir.to_path_buf(),
-            latest: Mutex::new(latest),
-        })
-    }
-
-    async fn find_latest(snap_dir: &Path) -> Result<Option<Snapshot>> {
-        let mut best: Option<(u64, PathBuf)> = None;
-
-        let mut entries = tokio::fs::read_dir(snap_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.ends_with(".snap") {
-                let stem = name_str.trim_end_matches(".snap");
-                if let Some((offset_str, _epoch_str)) = stem.split_once('-') {
-                    if let Ok(offset) = offset_str.parse::<u64>() {
-                        if best.as_ref().map_or(true, |(best_off, _)| offset > *best_off) {
-                            best = Some((offset, entry.path()));
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some((_, path)) = best {
-            let data = tokio::fs::read(&path).await?;
-            let snapshot: Snapshot = bincode::deserialize(&data).map_err(|e| {
-                xraft_core::XraftError::Corruption(format!("snapshot deserialize: {e}"))
-            })?;
-            Ok(Some(snapshot))
-        } else {
-            Ok(None)
+    /// Create a new [`SnapshotStore`] rooted at `base_dir`.
+    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            base_dir: base_dir.into(),
+            chunk_size: DEFAULT_CHUNK_SIZE,
         }
     }
 
-    /// Snapshot filename follows architecture §3.4: `<offset>-<term>.snap`.
-    /// `SnapshotId.epoch` carries the term value in this context.
-    fn snapshot_path(&self, id: &SnapshotId) -> PathBuf {
-        self.snap_dir
-            .join(format!("{}-{}.snap", id.end_offset, id.epoch))
+    /// Override the default chunk size used by [`read_chunk`].
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        assert!(chunk_size > 0, "chunk_size must be > 0");
+        self.chunk_size = chunk_size;
+        self
     }
-}
 
-#[async_trait]
-impl SnapshotIO for SnapshotStore {
-    async fn save(&self, snapshot: &Snapshot) -> Result<()> {
-        // File naming follows architecture §3.4: <offset>-<term>.snap
-        let id = SnapshotId {
-            end_offset: snapshot.metadata.last_included_offset,
-            epoch: snapshot.metadata.last_included_term,
-        };
+    // -----------------------------------------------------------------------
+    // Path helpers
+    // -----------------------------------------------------------------------
 
-        let data = bincode::serialize(snapshot).map_err(|e| {
-            xraft_core::XraftError::SerializationError(format!("snapshot serialize: {e}"))
-        })?;
+    fn snapshot_path(&self, meta: &SnapshotMetadata) -> PathBuf {
+        self.base_dir
+            .join(format!("{}-{}.snap", meta.term, meta.index))
+    }
 
-        // Use a unique temp name to avoid collisions with concurrent saves
-        let temp = self.snap_dir.join(format!(
-            "{}-{}.{}.snap.tmp",
-            id.end_offset, id.epoch, std::process::id()
-        ));
-        let final_path = self.snapshot_path(&id);
+    fn meta_path(&self, meta: &SnapshotMetadata) -> PathBuf {
+        self.base_dir
+            .join(format!("{}-{}.meta", meta.term, meta.index))
+    }
 
-        tokio::fs::write(&temp, &data).await?;
-        {
-            // Open with write access so sync_all works on Windows
-            let f = tokio::fs::OpenOptions::new()
-                .write(true)
-                .open(&temp)
-                .await?;
-            f.sync_all().await?;
-        }
-        tokio::fs::rename(&temp, &final_path).await?;
+    // -----------------------------------------------------------------------
+    // Public API
+    // -----------------------------------------------------------------------
 
-        // Hold lock only for cache update — serializes the logical "latest" state
-        *self.latest.lock().await = Some(snapshot.clone());
+    /// Persist `data` as a new snapshot described by `meta`.
+    pub async fn save_snapshot(
+        &self,
+        meta: &SnapshotMetadata,
+        data: &[u8],
+    ) -> StorageResult<()> {
+        fs::create_dir_all(&self.base_dir).await?;
+
+        let snap_path = self.snapshot_path(meta);
+        let meta_path = self.meta_path(meta);
+
+        let meta_json = serde_json::to_vec(meta)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        fs::write(&snap_path, data).await?;
+        fs::write(&meta_path, &meta_json).await?;
 
         Ok(())
     }
 
-    async fn load_latest(&self) -> Result<Option<Snapshot>> {
-        let latest = self.latest.lock().await;
-        Ok(latest.clone())
+    /// Load the full snapshot bytes for the given metadata.
+    pub async fn load_snapshot(
+        &self,
+        meta: &SnapshotMetadata,
+    ) -> StorageResult<Vec<u8>> {
+        let path = self.snapshot_path(meta);
+        if !path.exists() {
+            return Err(StorageError::NotFound(format!(
+                "snapshot file not found: {}",
+                path.display()
+            )));
+        }
+        let data = fs::read(&path).await?;
+        Ok(data)
     }
 
-    async fn read_chunk(
+    /// Return the total size in bytes of the snapshot file.
+    pub async fn snapshot_size(
         &self,
-        id: &SnapshotId,
-        position: u64,
-        max_bytes: u32,
-    ) -> Result<(Bytes, bool)> {
-        let path = self.snapshot_path(id);
-        let data = tokio::fs::read(&path).await?;
+        meta: &SnapshotMetadata,
+    ) -> StorageResult<u64> {
+        let path = self.snapshot_path(meta);
+        let file_meta = fs::metadata(&path).await?;
+        Ok(file_meta.len())
+    }
 
-        let start = position as usize;
-        if start >= data.len() {
-            return Ok((Bytes::new(), true));
+    /// Read a single chunk of a snapshot starting at `position`.
+    ///
+    /// Opens the file, seeks to `position`, and reads up to `chunk_size`
+    /// bytes — each call is O(1) in snapshot size regardless of `position`.
+    pub async fn read_chunk(
+        &self,
+        meta: &SnapshotMetadata,
+        position: u64,
+    ) -> StorageResult<SnapshotChunk> {
+        let path = self.snapshot_path(meta);
+        let file_len = fs::metadata(&path).await?.len();
+
+        if position >= file_len {
+            return Ok(SnapshotChunk {
+                data: Vec::new(),
+                position,
+                done: true,
+            });
         }
 
-        let end = std::cmp::min(start + max_bytes as usize, data.len());
-        let chunk = Bytes::copy_from_slice(&data[start..end]);
-        let done = end >= data.len();
+        let mut file = fs::File::open(&path).await?;
+        file.seek(std::io::SeekFrom::Start(position)).await?;
 
-        Ok((chunk, done))
+        let remaining = (file_len - position) as usize;
+        let to_read = remaining.min(self.chunk_size);
+        let mut buf = vec![0u8; to_read];
+        let n = file.read_exact(&mut buf).await.map(|_| to_read)?;
+
+        let next_position = position + n as u64;
+        Ok(SnapshotChunk {
+            data: buf,
+            position,
+            done: next_position >= file_len,
+        })
     }
 
-    async fn begin_receive(&self, id: &SnapshotId) -> Result<SnapshotWriter> {
-        let temp = self.snap_dir.join(format!(
-            "{}-{}.{}.snap.tmp",
-            id.end_offset, id.epoch, std::process::id()
-        ));
-        let final_path = self.snapshot_path(id);
+    /// Write a chunk received during snapshot installation.
+    ///
+    /// If `position == 0` the file is created/truncated; otherwise the chunk
+    /// is appended at the given offset.
+    pub async fn write_chunk(
+        &self,
+        meta: &SnapshotMetadata,
+        chunk: &SnapshotChunk,
+    ) -> StorageResult<()> {
+        fs::create_dir_all(&self.base_dir).await?;
+        let path = self.snapshot_path(meta);
 
-        let file = tokio::fs::File::create(&temp).await?;
-        Ok(SnapshotWriter::new(temp, final_path, file))
+        let mut file = if chunk.position == 0 {
+            fs::File::create(&path).await?
+        } else {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .await?
+        };
+
+        file.seek(std::io::SeekFrom::Start(chunk.position)).await?;
+        file.write_all(&chunk.data).await?;
+        file.flush().await?;
+
+        if chunk.done {
+            let meta_path = self.meta_path(meta);
+            let meta_json = serde_json::to_vec(meta)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            fs::write(&meta_path, &meta_json).await?;
+        }
+
+        Ok(())
+    }
+
+    /// List all snapshots available on disk, sorted by (term, index) desc.
+    pub async fn list_snapshots(&self) -> StorageResult<Vec<SnapshotMetadata>> {
+        let mut entries = Vec::new();
+        if !self.base_dir.exists() {
+            return Ok(entries);
+        }
+
+        let mut dir = fs::read_dir(&self.base_dir).await?;
+        while let Some(entry) = dir.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("meta") {
+                let bytes = fs::read(&path).await?;
+                let meta: SnapshotMetadata = serde_json::from_slice(&bytes)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                entries.push(meta);
+            }
+        }
+
+        entries.sort_by(|a, b| {
+            (b.term, b.index).cmp(&(a.term, a.index))
+        });
+
+        Ok(entries)
+    }
+
+    /// Delete all snapshots older than the one described by `keep`.
+    pub async fn purge_older_than(
+        &self,
+        keep: &SnapshotMetadata,
+    ) -> StorageResult<usize> {
+        let all = self.list_snapshots().await?;
+        let mut removed = 0usize;
+
+        for snap in &all {
+            if (snap.term, snap.index) < (keep.term, keep.index) {
+                let _ = fs::remove_file(self.snapshot_path(snap)).await;
+                let _ = fs::remove_file(self.meta_path(snap)).await;
+                removed += 1;
+            }
+        }
+
+        Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_meta() -> SnapshotMetadata {
+        SnapshotMetadata {
+            term: 3,
+            index: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_chunk_seeks_without_reading_entire_file() {
+        let dir = TempDir::new().unwrap();
+        let store = SnapshotStore::new(dir.path()).with_chunk_size(4);
+        let meta = test_meta();
+        let data = b"hello world!";
+
+        store.save_snapshot(&meta, data).await.unwrap();
+
+        // First chunk: "hell"
+        let c0 = store.read_chunk(&meta, 0).await.unwrap();
+        assert_eq!(c0.data, b"hell");
+        assert!(!c0.done);
+
+        // Second chunk: "o wo"
+        let c1 = store.read_chunk(&meta, 4).await.unwrap();
+        assert_eq!(c1.data, b"o wo");
+        assert!(!c1.done);
+
+        // Third chunk: "rld!"
+        let c2 = store.read_chunk(&meta, 8).await.unwrap();
+        assert_eq!(c2.data, b"rld!");
+        assert!(c2.done);
+
+        // Past-end: empty, done
+        let c3 = store.read_chunk(&meta, 12).await.unwrap();
+        assert!(c3.data.is_empty());
+        assert!(c3.done);
     }
 }
