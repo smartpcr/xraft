@@ -1,5 +1,9 @@
+//! xraft-core: Raft consensus protocol engine.
+
 pub mod app_record;
 pub mod rpc;
+pub mod snapshot;
+pub mod traits;
 pub mod types;
 pub mod voter;
 
