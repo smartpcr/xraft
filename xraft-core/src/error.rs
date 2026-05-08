@@ -1,5 +1,3 @@
-use crate::types::NodeId;
-use std::fmt;
 use std::io;
 
 /// Error types for the xraft system.
@@ -17,11 +15,6 @@ pub enum XraftError {
     InvalidClusterId,
     /// Node is shutting down.
     Shutdown,
-    /// Bootstrap precondition not met (log not empty, quorum-state exists, or snapshot exists).
-    BootstrapPreconditionFailed(String),
-    /// Invalid configuration parameters.
-    InvalidConfig(String),
-}
 
 impl fmt::Display for XraftError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -36,14 +29,9 @@ impl fmt::Display for XraftError {
     }
 }
 
-impl std::error::Error for XraftError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            XraftError::StorageError(e) | XraftError::TransportError(e) => Some(e),
-            _ => None,
-        }
-    }
-}
+    /// Bootstrap input validation failure.
+    #[error("invalid bootstrap configuration: {reason}")]
+    InvalidBootstrapConfig { reason: String },
 
 /// Alias for results using XraftError.
 pub type Result<T> = std::result::Result<T, XraftError>;

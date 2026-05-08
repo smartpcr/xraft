@@ -1,6 +1,5 @@
-use std::net::SocketAddr;
-
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::types::NodeId;
 
@@ -14,6 +13,6 @@ pub struct VoterInfo {
 /// A voters record describing the current voter set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VotersRecord {
-    pub version: u64,
+    pub version: u32,
     pub voters: Vec<VoterInfo>,
 }

@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::log_entry::LogEntry;
