@@ -24,7 +24,7 @@
     "contentHash": "f809348c72739f1ba21623ea03e0209328f6278bc85394296f62575199a998e7",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-rpc-message-types",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-rpc-message-types",
-    "status": "active"
+    "status": "review"
   },
   {
     "title": "Trait Definitions (Storage, Transport, Runtime)",
@@ -60,7 +60,7 @@
     "contentHash": "d6281a0a472e9c6cc4d6f0a0f1693efd9e9635e43a2f8f9839b693e7b8540d10",
     "workstreamId": "ws-raft-raft-protocol-phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-project-scaffolding-and-core-types-stage-raftnode-public-api-skeleton",
-    "status": "active"
+    "status": "complete"
   },
   {
     "title": "In-Memory Storage Backends and Simulated Clock (\u0060xraft-test\u0060)",
