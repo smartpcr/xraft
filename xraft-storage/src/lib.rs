@@ -1,2 +1,1 @@
-// xraft-storage: Durable log, snapshots, and quorum state persistence.
-// Implementation deferred to later stages.
+//! xraft-storage: durable log and snapshot storage.
