@@ -3,14 +3,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::Term;
 
-/// Discriminates the type of a log entry.
+/// Discriminator for log entry types.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryType {
-    /// Application-level state machine command (wraps an `AppRecord`).
+    /// Application-level state machine command (wraps an AppRecord).
     Command,
     /// Appended by a new leader as the first entry of its term.
     LeaderChangeMessage,
-    /// Appended when processing AddVoter/RemoveVoter/UpdateVoter RPCs.
+    /// Encodes the complete new voter set.
     VotersRecord,
 }
 
