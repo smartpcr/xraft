@@ -3,29 +3,31 @@ use serde::{Deserialize, Serialize};
 use crate::types::{NodeId, Term};
 use crate::voter::VoterInfo;
 
-/// Role in the Raft protocol.
+/// Node role in the Raft protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
-    /// Initial state before bootstrap or recovery completes.
+    /// Initial state before bootstrap or recovery; also terminal state
+    /// for a removed voter.
     Unattached,
+    /// Passive participant that accepts log entries from the leader.
     Follower,
+    /// Actively seeking votes to become leader.
     Candidate,
+    /// Active leader replicating log entries to followers.
     Leader,
 }
 
-/// Public projected subset of internal `NodeState`.
+/// Public projection of protocol state returned by `RaftNode::read()`.
 ///
-/// Returned by `RaftNode::read()`. Contains only protocol metadata
-/// fields — internal-only fields are not exposed.
+/// Contains only the subset of `NodeState` fields that are safe to expose.
+/// This is a separate type from the internal `NodeState`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusState {
+    pub node_id: NodeId,
     pub current_term: Term,
     pub role: Role,
     pub leader_id: Option<NodeId>,
-    /// Exclusive upper bound: entry at offset O is committed when O < HW.
-    pub high_watermark: u64,
     pub log_end_offset: u64,
-    /// Committed voter set.
+    pub high_watermark: u64,
     pub voter_set: Vec<VoterInfo>,
-    pub node_id: NodeId,
 }

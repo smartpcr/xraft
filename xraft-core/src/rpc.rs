@@ -1,10 +1,9 @@
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{ClusterId, NodeId, Term};
-use crate::voter::VoterInfo;
+use crate::voter::{VoterInfo, VotersRecord};
 
-/// Identity wrapper for every RPC message.
+/// Envelope wrapping every RPC message with cluster and leader identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcEnvelope {
     pub cluster_id: ClusterId,
@@ -13,7 +12,7 @@ pub struct RpcEnvelope {
     pub payload: RpcPayload,
 }
 
-/// Discriminated union of all RPC messages.
+/// Discriminated union of all RPC message types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RpcPayload {
     VoteRequest(VoteRequest),
@@ -77,7 +76,6 @@ pub struct SnapshotId {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchSnapshotRequest {
-    pub replica_id: NodeId,
     pub snapshot_id: SnapshotId,
     pub position: u64,
     pub max_bytes: u32,
@@ -85,7 +83,8 @@ pub struct FetchSnapshotRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchSnapshotResponse {
-    pub data: Bytes,
+    pub data: bytes::Bytes,
+    pub position: u64,
     pub is_last_chunk: bool,
 }
 
@@ -106,14 +105,21 @@ pub struct UpdateVoterRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipChangeResponse {
-    pub result: Result<(), MembershipError>,
+    pub success: bool,
+    pub error: Option<MembershipError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MembershipError {
-    NotLeader,
+    NotLeader { leader_id: Option<NodeId> },
     ChangeInProgress,
     NodeAlreadyVoter,
     NodeNotFound,
     NodeNotCaughtUp,
+}
+
+/// Consensus control record for voter set changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VotersRecordPayload {
+    pub record: VotersRecord,
 }
