@@ -330,7 +330,7 @@
     "contentHash": "89b6067f37f139f22fd4d47297cbd299f4640a1d866fe7131d0a41f00eb44dee",
     "workstreamId": "ws-raft-raft-protocol-phase-observability-documentation-and-polish-stage-api-documentation-and-readme",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-observability-documentation-and-polish-stage-api-documentation-and-readme",
-    "status": "active"
+    "status": "blocked"
   },
   {
     "title": "CI Pipeline and Release Readiness",
