@@ -312,7 +312,7 @@
     "contentHash": "98d3300d7d426a744f5a637dfa3a075a5d8d2097a9008062cbca425d54bbdb24",
     "workstreamId": "ws-raft-raft-protocol-phase-integration-testing-and-scenario-validation-stage-partition-snapshot-and-membership-scenario-tests",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-integration-testing-and-scenario-validation-stage-partition-snapshot-and-membership-scenario-tests",
-    "status": "active"
+    "status": "blocked"
   },
   {
     "title": "Metrics Collector",
