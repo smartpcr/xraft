@@ -321,7 +321,7 @@
     "contentHash": "4e156e9edea7423cf6466b95c5cebcd52f0c4f18069317358d5d3552b5d269b9",
     "workstreamId": "ws-raft-raft-protocol-phase-observability-documentation-and-polish-stage-metrics-collector",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-observability-documentation-and-polish-stage-metrics-collector",
-    "status": "active"
+    "status": "blocked"
   },
   {
     "title": "API Documentation and README",
