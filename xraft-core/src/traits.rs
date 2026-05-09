@@ -1,61 +1,68 @@
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::time::{Duration, Instant};
 
-use crate::app_record::{AppRecord, AppSnapshot};
-use crate::error::XraftResult;
 use crate::log_entry::LogEntry;
 use crate::quorum_state::QuorumState;
 use crate::rpc::{RpcEnvelope, SnapshotId};
 use crate::snapshot::{Snapshot, SnapshotWriter};
-use crate::types::NodeId;
+use crate::app_record::{AppRecord, AppSnapshot};
 
-/// Durable append-only log.
+/// Append-only replicated log storage.
+/// All methods take `&self` with interior mutability and require `Sync`.
 #[async_trait]
 pub trait LogStore: Send + Sync + 'static {
-    async fn append(&self, entries: &[LogEntry]) -> XraftResult<()>;
-    async fn read(&self, start_offset: u64, end_offset: u64) -> XraftResult<Vec<LogEntry>>;
-    async fn truncate_suffix(&self, from_offset: u64) -> XraftResult<()>;
-    async fn truncate_prefix(&self, up_to_offset: u64) -> XraftResult<()>;
+    async fn append(&self, entries: &[LogEntry]) -> std::io::Result<()>;
+    async fn read(&self, start_offset: u64, end_offset: u64) -> std::io::Result<Vec<LogEntry>>;
+    async fn truncate_suffix(&self, from_offset: u64) -> std::io::Result<()>;
+    async fn truncate_prefix(&self, up_to_offset: u64) -> std::io::Result<()>;
     fn log_start_offset(&self) -> u64;
     fn log_end_offset(&self) -> u64;
-    async fn entry_at(&self, offset: u64) -> XraftResult<Option<LogEntry>>;
+    async fn entry_at(&self, offset: u64) -> std::io::Result<Option<LogEntry>>;
 }
 
-/// Persisted voting state.
+/// Persists voting state separately from the log.
 #[async_trait]
 pub trait QuorumStateStore: Send + Sync + 'static {
-    async fn load(&self) -> XraftResult<Option<QuorumState>>;
-    async fn save(&self, state: &QuorumState) -> XraftResult<()>;
+    /// Returns `None` when no quorum-state file exists (fresh node).
+    async fn load(&self) -> std::io::Result<Option<QuorumState>>;
+    async fn save(&self, state: &QuorumState) -> std::io::Result<()>;
 }
 
-/// Snapshot storage.
+/// Manages snapshot files on disk.
 #[async_trait]
 pub trait SnapshotIO: Send + Sync + 'static {
-    async fn save(&self, snapshot: &Snapshot) -> XraftResult<()>;
-    async fn load_latest(&self) -> XraftResult<Option<Snapshot>>;
+    async fn save(&self, snapshot: &Snapshot) -> std::io::Result<()>;
+    /// Returns `None` when no snapshot exists.
+    async fn load_latest(&self) -> std::io::Result<Option<Snapshot>>;
     async fn read_chunk(
         &self,
         id: &SnapshotId,
         position: u64,
         max_bytes: u32,
-    ) -> XraftResult<(Bytes, bool)>;
-    async fn begin_receive(&self, id: &SnapshotId) -> XraftResult<SnapshotWriter>;
+    ) -> std::io::Result<(Bytes, bool)>;
+    async fn begin_receive(&self, id: &SnapshotId) -> std::io::Result<SnapshotWriter>;
 }
 
-/// Outbound RPC sender. Takes `&self` for concurrent sends.
+/// Outbound RPC transport. Takes `&self` for concurrent sends.
 #[async_trait]
 pub trait TransportSender: Send + Sync + 'static {
-    async fn send(&self, target: NodeId, message: RpcEnvelope) -> XraftResult<()>;
+    async fn send(
+        &self,
+        target: crate::types::NodeId,
+        message: RpcEnvelope,
+    ) -> std::io::Result<()>;
 }
 
-/// Inbound RPC receiver. Takes `&mut self` — exclusive access by ReceiverTask.
+/// Inbound RPC transport. Takes `&mut self` for exclusive read access.
 #[async_trait]
 pub trait TransportReceiver: Send + 'static {
-    async fn recv(&mut self) -> XraftResult<RpcEnvelope>;
+    async fn recv(&mut self) -> std::io::Result<RpcEnvelope>;
 }
 
-/// Deterministic time source. Used by EventLoop for timer management.
+/// Runtime clock for timer management (election timeouts, check-quorum).
+/// Used by the EventLoop, not mediated by IoAction.
 #[async_trait]
 pub trait Clock: Send + 'static {
     fn now(&self) -> Instant;
@@ -63,9 +70,9 @@ pub trait Clock: Send + 'static {
     fn random_election_timeout(&self) -> Duration;
 }
 
-/// Application state machine. Synchronous — invoked by EventLoop.
+/// Application state machine. Synchronous callbacks invoked by the EventLoop.
 pub trait StateMachine: Send + 'static {
-    fn apply(&mut self, offset: u64, record: &AppRecord) -> XraftResult<()>;
-    fn snapshot(&self) -> XraftResult<AppSnapshot>;
-    fn restore(&mut self, snapshot: AppSnapshot) -> XraftResult<()>;
+    fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<(), crate::error::XraftError>;
+    fn snapshot(&self) -> Result<AppSnapshot, crate::error::XraftError>;
+    fn restore(&mut self, snapshot: AppSnapshot) -> Result<(), crate::error::XraftError>;
 }
