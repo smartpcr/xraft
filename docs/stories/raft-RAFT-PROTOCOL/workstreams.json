@@ -276,7 +276,7 @@
     "contentHash": "a5571443e210a87516e9a91d9335d85b5e91f2f2a053921033d838c1f472195f",
     "workstreamId": "ws-raft-raft-protocol-phase-test-harness-xraft-test-stage-simulated-cluster",
     "branch": "ws/raft-RAFT-PROTOCOL/phase-test-harness-xraft-test-stage-simulated-cluster",
-    "status": "active"
+    "status": "blocked"
   },
   {
     "title": "Invariant Checker",
