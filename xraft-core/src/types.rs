@@ -7,7 +7,7 @@ pub struct NodeId(pub u64);
 
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "NodeId({})", self.0)
+        write!(f, "N{}", self.0)
     }
 }
 
@@ -15,19 +15,35 @@ impl fmt::Display for NodeId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Term(pub u64);
 
+impl Term {
+    pub const ZERO: Term = Term(0);
+}
+
 impl fmt::Display for Term {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Term({})", self.0)
+        write!(f, "T{}", self.0)
     }
 }
 
-/// Cluster identity for fencing.
+/// Cluster identity for fencing. Generated once by the operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClusterId(pub uuid::Uuid);
 
+impl ClusterId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+impl Default for ClusterId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl fmt::Display for ClusterId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ClusterId({})", self.0)
+        write!(f, "{}", self.0)
     }
 }
 
@@ -37,6 +53,6 @@ pub struct Offset(pub u64);
 
 impl fmt::Display for Offset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Offset({})", self.0)
+        write!(f, "@{}", self.0)
     }
 }

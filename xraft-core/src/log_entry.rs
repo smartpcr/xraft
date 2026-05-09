@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::types::Term;
 use crate::voter::VotersRecord;
 
-/// Discriminates the type of a log entry.
+/// Discriminator for log entry types.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryType {
     /// Application-level state machine command.

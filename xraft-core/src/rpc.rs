@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::log_entry::LogEntry;
@@ -207,9 +206,15 @@ impl MembershipChangeResponse {
 /// Errors that can occur during membership changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MembershipError {
-    NotLeader,
+    NotLeader { leader_id: Option<NodeId> },
     ChangeInProgress,
     NodeAlreadyVoter,
     NodeNotFound,
     NodeNotCaughtUp,
+}
+
+/// Consensus control record for voter set changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VotersRecordPayload {
+    pub record: VotersRecord,
 }
