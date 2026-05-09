@@ -13,7 +13,7 @@ pub struct SnapshotMetadata {
     pub leader_epoch: Term,
 }
 
-/// Complete snapshot: consensus metadata + application payload.
+/// Composite snapshot: consensus metadata + application payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub metadata: SnapshotMetadata,
@@ -27,5 +27,25 @@ pub struct SnapshotReader {
 
 /// Wraps a chunked write session for receiving snapshots from leader.
 pub struct SnapshotWriter {
-    pub data: Vec<u8>,
+    pub chunks: Vec<Vec<u8>>,
+}
+
+impl SnapshotWriter {
+    pub fn new() -> Self {
+        Self { chunks: Vec::new() }
+    }
+
+    pub fn write_chunk(&mut self, chunk: &[u8]) {
+        self.chunks.push(chunk.to_vec());
+    }
+
+    pub fn finalize(self) -> Vec<u8> {
+        self.chunks.into_iter().flatten().collect()
+    }
+}
+
+impl Default for SnapshotWriter {
+    fn default() -> Self {
+        Self::new()
+    }
 }

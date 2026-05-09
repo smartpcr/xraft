@@ -1,5 +1,3 @@
-use crate::types::NodeId;
-use std::fmt;
 use std::io;
 
 /// Errors produced by xraft operations.
@@ -9,9 +7,13 @@ pub enum XraftError {
     TransportError(String),
     NotLeader,
     ProposalQueueFull,
+
     /// RPC cluster_id mismatch.
+    #[error("invalid cluster id")]
     InvalidClusterId,
+
     /// Node is shutting down; no new operations accepted.
+    #[error("node is shutting down")]
     Shutdown,
 
 impl fmt::Display for XraftError {

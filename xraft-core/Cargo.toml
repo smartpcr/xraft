@@ -1,7 +1,8 @@
 [package]
 name = "xraft-core"
-version = "0.1.0"
 edition.workspace = true
+version.workspace = true
+license.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
