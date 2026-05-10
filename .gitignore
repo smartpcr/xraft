@@ -1,7 +1,18 @@
-target/
+# Rust build artifacts
+/target/
+**/target/
+
+# Cargo.lock is generated for binary crates; exclude from version control
+# For library crates, consider committing Cargo.lock per Cargo docs
+Cargo.lock
+
+# IDE and editor files
+.idea/
+.vscode/
 *.swp
 *.swo
 *~
-.idea/
-.vscode/
-*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
