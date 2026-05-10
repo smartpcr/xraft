@@ -47,6 +47,7 @@ impl QuorumStateStore for MemoryQuorumStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xraft_core::term::Term;
 
     #[test]
     fn load_returns_none_when_empty() {
@@ -58,12 +59,47 @@ mod tests {
     fn save_then_load_round_trips() {
         let store = MemoryQuorumStateStore::new();
         let qs = QuorumState {
+            current_term: Term(5),
             voted_for: Some(1),
-            current_term: 5,
+            leader_id: None,
+            leader_epoch: Term(3),
         };
         store.save(qs.clone()).unwrap();
         let loaded = store.load().unwrap().expect("should be Some");
         assert_eq!(loaded.current_term, qs.current_term);
         assert_eq!(loaded.voted_for, qs.voted_for);
+        assert_eq!(loaded.leader_id, qs.leader_id);
+        assert_eq!(loaded.leader_epoch, qs.leader_epoch);
+    }
+
+    #[test]
+    fn save_overwrites_previous_state() {
+        let store = MemoryQuorumStateStore::new();
+        let qs1 = QuorumState {
+            current_term: Term(1),
+            voted_for: Some(1),
+            leader_id: Some(1),
+            leader_epoch: Term(1),
+        };
+        store.save(qs1).unwrap();
+
+        let qs2 = QuorumState {
+            current_term: Term(2),
+            voted_for: None,
+            leader_id: None,
+            leader_epoch: Term(0),
+        };
+        store.save(qs2.clone()).unwrap();
+        let loaded = store.load().unwrap().expect("should be Some");
+        assert_eq!(loaded.current_term, qs2.current_term);
+        assert_eq!(loaded.voted_for, qs2.voted_for);
+        assert_eq!(loaded.leader_id, qs2.leader_id);
+        assert_eq!(loaded.leader_epoch, qs2.leader_epoch);
+    }
+
+    #[test]
+    fn default_creates_empty_store() {
+        let store = MemoryQuorumStateStore::default();
+        assert!(store.load().unwrap().is_none());
     }
 }
