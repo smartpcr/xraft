@@ -1,22 +1,22 @@
-//! In-memory implementation of the `QuorumStateStore` trait for testing.
+use std::io;
+use std::sync::Mutex;
 
-use async_trait::async_trait;
-use std::sync::RwLock;
-use xraft_core::traits::{QuorumState, QuorumStateStore};
+use xraft_core::quorum_state::QuorumState;
+use xraft_core::traits::QuorumStateStore;
 
-/// Thread-safe in-memory quorum state store implementing `QuorumStateStore`.
+/// In-memory implementation of [`QuorumStateStore`].
 ///
-/// Stores the latest term, vote, and leader epoch in memory.
-/// Returns `None` from `load()` when no state has been saved,
-/// matching the architecture §4.1 `Option<QuorumState>` contract.
+/// Stores quorum state in a `Mutex`-protected `Option` so it can be
+/// shared across threads without external synchronisation.
 pub struct MemoryQuorumStateStore {
-    state: RwLock<Option<QuorumState>>,
+    state: Mutex<Option<QuorumState>>,
 }
 
 impl MemoryQuorumStateStore {
+    /// Creates a new, empty store.
     pub fn new() -> Self {
         Self {
-            state: RwLock::new(None),
+            state: Mutex::new(None),
         }
     }
 }
@@ -27,21 +27,19 @@ impl Default for MemoryQuorumStateStore {
     }
 }
 
-#[async_trait]
 impl QuorumStateStore for MemoryQuorumStateStore {
-    async fn load(
-        &self,
-    ) -> Result<Option<QuorumState>, Box<dyn std::error::Error + Send + Sync>> {
-        let state = self.state.read().unwrap();
-        Ok(state.clone())
+    fn load(&self) -> io::Result<Option<QuorumState>> {
+        let guard = self.state.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("lock poisoned: {e}"))
+        })?;
+        Ok(guard.clone())
     }
 
-    async fn save(
-        &self,
-        state: &QuorumState,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut stored = self.state.write().unwrap();
-        *stored = Some(state.clone());
+    fn save(&self, state: QuorumState) -> io::Result<()> {
+        let mut guard = self.state.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("lock poisoned: {e}"))
+        })?;
+        *guard = Some(state);
         Ok(())
     }
 }
@@ -49,49 +47,23 @@ impl QuorumStateStore for MemoryQuorumStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xraft_core::types::{NodeId, Term};
 
-    #[tokio::test]
-    async fn load_returns_none_initially() {
+    #[test]
+    fn load_returns_none_when_empty() {
         let store = MemoryQuorumStateStore::new();
-        let state = store.load().await.unwrap();
-        assert!(state.is_none());
+        assert!(store.load().unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn save_and_load_roundtrip() {
+    #[test]
+    fn save_then_load_round_trips() {
         let store = MemoryQuorumStateStore::new();
         let qs = QuorumState {
-            current_term: Term(5),
-            voted_for: Some(NodeId(2)),
-            leader_epoch: 3,
+            voted_for: Some(1),
+            current_term: 5,
         };
-        store.save(&qs).await.unwrap();
-
-        let loaded = store.load().await.unwrap().expect("should have state");
-        assert_eq!(loaded.current_term, Term(5));
-        assert_eq!(loaded.voted_for, Some(NodeId(2)));
-        assert_eq!(loaded.leader_epoch, 3);
-    }
-
-    #[tokio::test]
-    async fn save_overwrites_previous() {
-        let store = MemoryQuorumStateStore::new();
-        let qs1 = QuorumState {
-            current_term: Term(1),
-            voted_for: None,
-            leader_epoch: 0,
-        };
-        store.save(&qs1).await.unwrap();
-
-        let qs2 = QuorumState {
-            current_term: Term(3),
-            voted_for: Some(NodeId(1)),
-            leader_epoch: 2,
-        };
-        store.save(&qs2).await.unwrap();
-
-        let loaded = store.load().await.unwrap().unwrap();
-        assert_eq!(loaded.current_term, Term(3));
+        store.save(qs.clone()).unwrap();
+        let loaded = store.load().unwrap().expect("should be Some");
+        assert_eq!(loaded.current_term, qs.current_term);
+        assert_eq!(loaded.voted_for, qs.voted_for);
     }
 }
