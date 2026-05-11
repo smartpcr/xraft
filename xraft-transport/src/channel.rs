@@ -1,136 +1,79 @@
 use std::collections::HashMap;
-use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
-use async_trait::async_trait;
-use tokio::sync::{mpsc, Mutex};
+use crate::message::RaftMessage;
+use crate::transport::Transport;
+use crate::NodeId;
 
-use xraft_core::error::XraftError;
-use xraft_core::rpc::RpcEnvelope;
-use xraft_core::traits::{TransportReceiver, TransportSender};
-use xraft_core::types::NodeId;
+/// A pair of sender/receiver endpoints for one node.
+pub struct ChannelEndpoint {
+    pub tx: mpsc::Sender<RaftMessage>,
+    pub rx: Option<mpsc::Receiver<RaftMessage>>,
+}
 
-/// In-process transport using `tokio::sync::mpsc` channels per node.
+/// In-process channel-based transport.
 ///
-/// Each node has a single inbound queue. Senders route messages into
-/// the target node's inbox. Provides `split()` for sender/receiver
-/// separation as required by the architecture.
+/// Every node gets a bounded mpsc channel. `send()` looks up the
+/// destination's sender; `take_receiver()` hands the receive half
+/// to the node's driver loop.
 pub struct ChannelTransport {
-    inboxes: Arc<HashMap<NodeId, mpsc::Sender<RpcEnvelope>>>,
-    receivers: HashMap<NodeId, mpsc::Receiver<RpcEnvelope>>,
+    endpoints: HashMap<NodeId, ChannelEndpoint>,
 }
 
 impl ChannelTransport {
-    /// Create a new channel transport mesh for the given set of node IDs.
-    /// Each node gets an inbound mpsc channel with the specified buffer capacity.
-    pub fn new(node_ids: &[NodeId], buffer_size: usize) -> Self {
+    /// Create a new transport with channels pre-allocated for `nodes`.
+    pub fn new(nodes: &[NodeId], buffer: usize) -> Self {
+        let mut endpoints = HashMap::new();
+        for &id in nodes {
+            let (tx, rx) = mpsc::channel(buffer);
+            endpoints.insert(id, ChannelEndpoint { tx, rx: Some(rx) });
+        }
+        Self { endpoints }
+    }
+
+    /// Split into a shared sender handle and per-node receivers.
+    pub fn split(self) -> (Arc<Mutex<HashMap<NodeId, mpsc::Sender<RaftMessage>>>>,
+                           HashMap<NodeId, mpsc::Receiver<RaftMessage>>) {
         let mut senders = HashMap::new();
         let mut receivers = HashMap::new();
-
-        for &node_id in node_ids {
-            let (tx, rx) = mpsc::channel(buffer_size);
-            senders.insert(node_id, tx);
-            receivers.insert(node_id, rx);
+        for (id, ep) in self.endpoints {
+            senders.insert(id, ep.tx);
+            if let Some(rx) = ep.rx {
+                receivers.insert(id, rx);
+            }
         }
-
-        Self {
-            inboxes: Arc::new(senders),
-            receivers,
-        }
+        (Arc::new(Mutex::new(senders)), receivers)
     }
-}
 
-    /// Split the transport into per-node sender/receiver pairs.
+    /// Return a snapshot of all node-to-sender mappings (for the simulator).
+    pub fn inboxes(&self) -> HashMap<NodeId, mpsc::Sender<RaftMessage>> {
+        self.endpoints
+            .iter()
+            .map(|(&id, ep)| (id, ep.tx.clone()))
+            .collect()
+    }
+
+    /// Take the receive half for `node`, leaving `None` in its place.
     ///
-    /// Returns a map from NodeId to (sender, receiver). Each sender can
-    /// deliver messages to any node in the cluster; each receiver only
-    /// receives messages destined for that specific node.
-    pub fn split(
-        mut self,
-    ) -> HashMap<NodeId, (Box<dyn TransportSender>, Box<dyn TransportReceiver>)> {
-        let mut result = HashMap::new();
-        let node_ids: Vec<NodeId> = self.receivers.keys().copied().collect();
-        for node_id in node_ids {
-            let rx = self
-                .receivers
-                .remove(&node_id)
-                .expect("receiver must exist for node");
-            let sender = ChannelSender {
-                inboxes: Arc::clone(&self.inboxes),
-            };
-            let receiver = ChannelReceiver { rx };
-            result.insert(
-                node_id,
-                (
-                    Box::new(sender) as Box<dyn TransportSender>,
-                    Box::new(receiver) as Box<dyn TransportReceiver>,
-                ),
-            );
-        }
-        result
-    }
-
-    /// Get a reference to the shared inbox senders (used by NetworkSimulator).
-    pub fn inboxes(&self) -> Arc<HashMap<NodeId, mpsc::Sender<RpcEnvelope>>> {
-        Arc::clone(&self.inboxes)
-    }
-
-    /// Take the receiver for a specific node (used by NetworkSimulator).
-    pub fn take_receiver(&mut self, node_id: NodeId) -> Option<mpsc::Receiver<RpcEnvelope>> {
-        self.receivers.remove(&node_id)
+    /// Panics if the receiver was already taken or the node doesn't exist.
+    pub fn take_receiver(&mut self, node: NodeId) -> mpsc::Receiver<RaftMessage> {
+        self.endpoints
+            .get_mut(&node)
+            .expect("unknown node")
+            .rx
+            .take()
+            .expect("receiver already taken")
     }
 }
 
-/// Sender half: can deliver messages to any node's inbox.
-#[derive(Clone)]
-pub struct ChannelSender {
-    inboxes: Arc<HashMap<NodeId, mpsc::Sender<RpcEnvelope>>>,
-}
-
-#[async_trait]
-impl TransportSender for ChannelSender {
-    async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<(), XraftError> {
-        let tx = self.inboxes.get(&target).ok_or_else(|| {
-            XraftError::TransportError(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no channel for target node {target}"),
-            ))
-        })?;
-        tx.send(message).await.map_err(|_| {
-            XraftError::TransportError(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("channel closed for target node {target}"),
-            ))
-        })
-    }
-}
-
-/// Receiver half: receives messages from this node's inbound queue.
-pub struct ChannelReceiver {
-    rx: mpsc::Receiver<RpcEnvelope>,
-}
-
-#[async_trait]
-impl TransportReceiver for ChannelReceiver {
-    async fn recv(&mut self) -> Result<RpcEnvelope, XraftError> {
-        self.rx.recv().await.ok_or_else(|| {
-            XraftError::TransportError(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "all senders dropped",
-            ))
-        })
-    }
-}
-
-/// Wraps a `ChannelReceiver` with thread-safe access for the simulator.
-pub struct SharedChannelReceiver {
-    pub(crate) inner: Mutex<mpsc::Receiver<RpcEnvelope>>,
-}
-
-impl SharedChannelReceiver {
-    pub fn new(rx: mpsc::Receiver<RpcEnvelope>) -> Self {
-        Self {
-            inner: Mutex::new(rx),
-        }
+#[async_trait::async_trait]
+impl Transport for ChannelTransport {
+    async fn send(&self, to: NodeId, msg: RaftMessage) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let sender = self
+            .endpoints
+            .get(&to)
+            .ok_or_else(|| format!("no channel for node {to:?}"))?;
+        sender.tx.send(msg).await.map_err(|e| Box::new(e) as _)
     }
 }
