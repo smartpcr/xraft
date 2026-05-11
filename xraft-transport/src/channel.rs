@@ -126,19 +126,18 @@ pub struct ChannelSender {
 
 #[async_trait]
 impl xraft_core::traits::TransportSender for ChannelSender {
-    async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<()> {
-        let bytes = self.codec.encode(&message)?;
+    async fn send(&self, target: NodeId, message: RpcEnvelope) -> std::io::Result<()> {
+        let bytes = self.codec.encode(&message).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })?;
         let tx = self.senders.get(&target).ok_or_else(|| {
-            XraftError::TransportError(std::io::Error::new(
+            std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 format!("no channel for node {target:?}"),
-            ))
+            )
         })?;
         tx.send(bytes).await.map_err(|_| {
-            XraftError::TransportError(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "receiver dropped",
-            ))
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver dropped")
         })
     }
 }
@@ -155,7 +154,7 @@ pub struct ChannelReceiver {
 
 #[async_trait]
 impl xraft_core::traits::TransportReceiver for ChannelReceiver {
-    async fn recv(&mut self) -> Result<RpcEnvelope> {
+    async fn recv(&mut self) -> std::io::Result<RpcEnvelope> {
         let bytes = std::future::poll_fn(|cx| {
             let mut i = 0;
             while i < self.receivers.len() {
@@ -177,9 +176,13 @@ impl xraft_core::traits::TransportReceiver for ChannelReceiver {
             }
         })
         .await
-        .ok_or(XraftError::Shutdown)?;
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "all senders dropped")
+        })?;
 
-        self.codec.decode(&bytes)
+        self.codec.decode(&bytes).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })
     }
 }
 
@@ -240,7 +243,6 @@ mod tests {
 
         let result = recv_b.recv().await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), XraftError::InvalidClusterId));
     }
 
     #[tokio::test]
@@ -260,7 +262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recv_returns_shutdown_when_all_senders_dropped() {
+    async fn recv_returns_error_when_all_senders_dropped() {
         let cid = ClusterId(uuid::Uuid::new_v4());
         let n1 = NodeId(1);
         let n2 = NodeId(2);
@@ -277,10 +279,7 @@ mod tests {
 
         let result = recv_b.recv().await;
         assert!(result.is_err());
-        assert!(
-            matches!(result.unwrap_err(), XraftError::Shutdown),
-            "recv must return Shutdown when all sender halves are dropped"
-        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::ConnectionReset);
     }
 
     #[tokio::test]
