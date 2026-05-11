@@ -6,6 +6,8 @@ pub mod follower_progress;
 pub mod listener;
 pub mod listener_event;
 pub mod log_entry;
+pub mod membership;
+pub mod node_state;
 pub mod quorum_state;
 pub mod snapshot;
 pub mod traits;
