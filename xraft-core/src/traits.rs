@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio::time::Instant;
 
 use crate::error::Result;
 use crate::log_entry::LogEntry;
-use crate::snapshot::{Snapshot, SnapshotId};
 use crate::quorum_state::QuorumState;
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotWriter};
 
