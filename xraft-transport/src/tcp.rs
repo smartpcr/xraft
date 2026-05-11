@@ -370,7 +370,7 @@ impl Drop for TcpReceiver {
         //    the sender side immediately, regardless of whether the reader
         //    task has been polled/aborted yet.
         {
-            let mut sockets = self.accepted_sockets.lock().unwrap();
+            let mut sockets = self.accepted_sockets.lock().unwrap_or_else(|e| e.into_inner());
             for socket in sockets.drain(..) {
                 let _ = socket.shutdown(Shutdown::Both);
             }
@@ -378,7 +378,7 @@ impl Drop for TcpReceiver {
 
         // 3. Abort reader tasks to clean up resources.
         {
-            let handles = self.reader_handles.lock().unwrap();
+            let handles = self.reader_handles.lock().unwrap_or_else(|e| e.into_inner());
             for handle in handles.iter() {
                 handle.abort();
             }
