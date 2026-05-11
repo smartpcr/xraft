@@ -1,149 +1,133 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio::time::Instant;
 
+use crate::app_record::{AppRecord, AppSnapshot};
 use crate::error::Result;
 use crate::log_entry::LogEntry;
-use crate::snapshot::{Snapshot, SnapshotId};
 use crate::quorum_state::QuorumState;
 use crate::rpc::RpcEnvelope;
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotWriter};
-use crate::types::NodeId;
-
-/// Result type used across all trait methods.
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 // ---------------------------------------------------------------------------
 // Storage traits
 // ---------------------------------------------------------------------------
 
-/// Durable, append-only replicated log.
-///
-/// All methods take `&self`; implementations use interior mutability
-/// (e.g. `tokio::sync::Mutex<File>`) so the store is `Sync` and can be
-/// dispatched concurrently from `IoStage`.
+/// Trait for log storage. All methods take `&self` — implementations use
+/// interior mutability (e.g., `tokio::sync::Mutex`) consistent with the
+/// `Send + Sync` bound.
 #[async_trait]
 pub trait LogStore: Send + Sync + 'static {
-    async fn append(&self, entries: &[LogEntry]) -> std::io::Result<()>;
-    async fn read(&self, start_offset: u64, end_offset: u64) -> std::io::Result<Vec<LogEntry>>;
-    async fn truncate_suffix(&self, from_offset: u64) -> std::io::Result<()>;
-    async fn truncate_prefix(&self, up_to_offset: u64) -> std::io::Result<()>;
+    /// Append entries. Must fsync before returning Ok.
+    async fn append(&self, entries: &[LogEntry]) -> Result<()>;
+
+    /// Read entries in [start_offset, end_offset).
+    async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>>;
+
+    /// Truncate the log suffix starting at the given offset (for divergence).
+    async fn truncate_suffix(&self, from_offset: u64) -> Result<()>;
+
+    /// Truncate the log prefix up to the given offset (after snapshot).
+    async fn truncate_prefix(&self, up_to_offset: u64) -> Result<()>;
+
+    /// The first offset still in the log.
     fn log_start_offset(&self) -> u64;
     fn log_end_offset(&self) -> u64;
-    async fn entry_at(&self, offset: u64) -> std::io::Result<Option<LogEntry>>;
+
+    /// Read the entry at the given offset.
+    async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>>;
 }
 
-/// Persisted quorum state (current term + voted-for).
+/// Trait for quorum state persistence. Must fsync before returning Ok.
 #[async_trait]
 pub trait QuorumStateStore: Send + Sync + 'static {
-    /// Returns `None` when no quorum-state file exists (fresh node).
-    async fn load(&self) -> std::io::Result<Option<QuorumState>>;
-    async fn save(&self, state: &QuorumState) -> std::io::Result<()>;
+    /// Load persisted quorum state.
+    async fn load(&self) -> Result<Option<QuorumState>>;
+
+    /// Persist quorum state. Must fsync before returning Ok.
+    async fn save(&self, state: &QuorumState) -> Result<()>;
 }
 
-/// Snapshot persistence: save, load, and streaming chunk I/O.
+/// Trait for snapshot I/O. Method names match architecture §4.1.
 #[async_trait]
 pub trait SnapshotIO: Send + Sync + 'static {
+    /// Write a complete snapshot atomically.
     async fn save(&self, snapshot: &Snapshot) -> Result<()>;
+
+    /// Load the latest snapshot, if any.
     async fn load_latest(&self) -> Result<Option<Snapshot>>;
+
+    /// Read a chunk of the snapshot at the given byte position.
+    /// Returns (data, is_last_chunk).
     async fn read_chunk(
         &self,
         id: &SnapshotId,
         position: u64,
         max_bytes: u32,
     ) -> Result<(Bytes, bool)>;
+
+    /// Begin writing a snapshot received from a leader, chunk by chunk.
     async fn begin_receive(&self, id: &SnapshotId) -> Result<SnapshotWriter>;
+
+    /// Finalize a received snapshot, persisting the accumulated data.
+    async fn complete_receive(
+        &self,
+        writer: SnapshotWriter,
+        metadata: crate::snapshot::SnapshotMetadata,
+    ) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
 // Transport traits
 // ---------------------------------------------------------------------------
 
-/// Sends RPC messages to peer nodes.
+/// Trait for sending RPC messages to peers.
 ///
-/// Takes `&self` (shared reference) because `IoStage` may send to multiple
-/// peers concurrently.
+/// Each `TransportSender` instance is typically bound to a single peer
+/// connection, so no target address is needed at send time.
 #[async_trait]
 pub trait TransportSender: Send + Sync + 'static {
-    async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<()>;
+    /// Send an RPC envelope to the peer. Returns once the message has been
+    /// handed off to the transport layer (not necessarily acknowledged).
+    async fn send(&self, envelope: RpcEnvelope) -> Result<()>;
 }
 
-/// Receives RPC messages from the network.
-///
-/// Takes `&mut self` (exclusive access) because only the `ReceiverTask`
-/// reads from the network.
-#[async_trait]
-pub trait QuorumStateStore: Send + Sync + 'static {
-    async fn load(&self) -> Result<Option<crate::quorum_state::QuorumState>>;
-    async fn save(&self, state: &crate::quorum_state::QuorumState) -> Result<()>;
-}
-
-/// Snapshot I/O operations.
-#[async_trait]
-pub trait SnapshotIO: Send + Sync + 'static {
-    async fn save(&self, snapshot: &Snapshot) -> std::io::Result<()>;
-    /// Returns `None` when no snapshot exists.
-    async fn load_latest(&self) -> std::io::Result<Option<Snapshot>>;
-    async fn read_chunk(
-        &self,
-        id: &SnapshotId,
-        position: u64,
-        max_bytes: u32,
-    ) -> std::io::Result<(Bytes, bool)>;
-    async fn begin_receive(&self, id: &SnapshotId) -> std::io::Result<SnapshotWriter>;
-}
-
-/// Outbound RPC transport. Takes `&self` for concurrent sends.
-#[async_trait]
-pub trait TransportSender: Send + Sync + 'static {
-    async fn send(
-        &self,
-        target: crate::types::NodeId,
-        message: RpcEnvelope,
-    ) -> std::io::Result<()>;
-}
-
-/// Inbound RPC transport. Takes `&mut self` for exclusive read access.
+/// Trait for receiving inbound RPC messages.
 #[async_trait]
 pub trait TransportReceiver: Send + 'static {
-    async fn recv(&mut self) -> std::io::Result<RpcEnvelope>;
-}
-
-/// Runtime clock for timer management (election timeouts, check-quorum).
-/// Used by the EventLoop, not mediated by IoAction.
-#[async_trait]
-pub trait Clock: Send + 'static {
-    fn now(&self) -> Instant;
-    async fn sleep_until(&self, deadline: Instant);
-    fn random_election_timeout(&self) -> Duration;
-}
-
-/// Application state machine. Synchronous callbacks invoked by the EventLoop.
-pub trait StateMachine: Send + 'static {
-    fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<(), crate::error::XraftError>;
-    fn snapshot(&self) -> Result<AppSnapshot, crate::error::XraftError>;
-    fn restore(&mut self, snapshot: AppSnapshot) -> Result<(), crate::error::XraftError>;
+    /// Block until the next inbound RPC envelope arrives.
+    async fn recv(&self) -> Result<RpcEnvelope>;
 }
 
 // ---------------------------------------------------------------------------
 // Runtime traits
 // ---------------------------------------------------------------------------
 
-/// Clock abstraction for the event loop (election timeouts, check-quorum).
-///
-/// Used directly by `EventLoop`, NOT mediated by `IoAction` / `IoStage`.
-/// Does not require `Sync` — only the single-threaded event loop calls it.
+/// Clock trait for time management. Used directly by the EventLoop
+/// for timer management, NOT mediated by IoAction.
 #[async_trait]
 pub trait Clock: Send + 'static {
+    /// Current instant.
     fn now(&self) -> Instant;
+
+    /// Sleep until the given deadline.
     async fn sleep_until(&self, deadline: Instant);
+
+    /// Generate a random election timeout in [min, max].
     fn random_election_timeout(&self) -> Duration;
 }
 
-/// Application state machine driven synchronously by the event loop.
-pub trait StateMachine: Send + 'static {
-    fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>;
-    fn snapshot(&self) -> Result<AppSnapshot>;
-    fn restore(&mut self, snapshot: AppSnapshot) -> Result<()>;
+/// Trait for the application state machine driven by committed log entries.
+#[async_trait]
+pub trait StateMachine: Send + Sync + 'static {
+    /// Apply a committed record to the state machine.
+    async fn apply(&self, record: AppRecord) -> Result<()>;
+
+    /// Produce a point-in-time snapshot of the current state.
+    async fn snapshot(&self) -> Result<AppSnapshot>;
+
+    /// Restore state from a previously captured snapshot.
+    async fn restore(&self, snapshot: AppSnapshot) -> Result<()>;
 }
