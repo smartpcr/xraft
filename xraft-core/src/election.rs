@@ -95,9 +95,10 @@ impl ElectionManager {
             }
         }
 
-        // Check if single-node cluster → immediately become leader
+        // Single-node cluster: record self-vote so votes_received reflects
+        // the majority and the event loop can transition to Leader.
         if state.voter_count() == 1 && state.is_voter() {
-            // sole voter wins immediately
+            Self::record_vote(state, state.node_id);
         }
     }
 
