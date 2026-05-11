@@ -1,28 +1,15 @@
 [package]
 name = "xraft-core"
-edition.workspace = true
-version.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+description = "Core traits and types for the xraft Raft protocol implementation"
 
 [dependencies]
-async-trait = "0.1"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 serde = { version = "1", features = ["derive"] }
-bincode = "1"
-bytes = "1"
-tokio = { version = "1", features = ["sync", "time"] }
-tracing = "0.1"
-
-[lints]
-workspace = true
-
-[dependencies]
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-bincode = "1"
+serde_json = "1"
 bytes = { version = "1", features = ["serde"] }
 tracing = "0.1"
-uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
 async-trait = "0.1"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["full", "test-util"] }
+rand = "0.8"
