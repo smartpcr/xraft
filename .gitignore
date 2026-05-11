@@ -1,4 +1,14 @@
-target/
-Cargo.lock
-**/*.rs.bk
-Cargo.lock
+# Rust build artifacts
+/target/
+**/target/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
