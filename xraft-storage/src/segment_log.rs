@@ -455,18 +455,19 @@ impl LogStore for SegmentLog {
 
         // Remove segments whose entries are ALL before effective_offset
         // (i.e., segment.next_offset() <= effective_offset).
-        while !inner.segments.is_empty() {
-            if inner.segments[0].next_offset() <= effective_offset {
-                let seg = inner.segments.remove(0);
-                debug!(
-                    base_offset = seg.base_offset(),
-                    next_offset = seg.next_offset(),
-                    "removing prefix segment"
-                );
-                seg.remove()?;
-            } else {
-                break;
-            }
+        // Use drain(..count) to avoid O(n²) shifts from repeated remove(0).
+        let remove_count = inner
+            .segments
+            .iter()
+            .take_while(|s| s.next_offset() <= effective_offset)
+            .count();
+        for seg in inner.segments.drain(..remove_count) {
+            debug!(
+                base_offset = seg.base_offset(),
+                next_offset = seg.next_offset(),
+                "removing prefix segment"
+            );
+            seg.remove()?;
         }
 
         // If all segments were removed, create a fresh one at the new start.
