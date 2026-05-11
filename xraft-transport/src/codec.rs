@@ -2,6 +2,13 @@ use xraft_core::error::{Result, XraftError};
 use xraft_core::rpc::RpcEnvelope;
 use xraft_core::types::ClusterId;
 
+/// Maximum allowed frame payload size (64 MiB).
+///
+/// Protects against multi-GB allocations when composing this codec with a
+/// streaming TCP reader — a corrupt or malicious length prefix cannot cause
+/// the allocator to hand out more than this.
+const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
+
 /// Length-prefixed bincode codec for `RpcEnvelope`.
 ///
 /// Wire format: `[payload_len: u32 big-endian][bincode bytes]`
@@ -32,6 +39,14 @@ impl RpcCodec {
                 "envelope too large for u32 length prefix",
             ))
         })?;
+        if len > MAX_FRAME_LEN {
+            return Err(XraftError::TransportError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "encoded envelope ({len} bytes) exceeds MAX_FRAME_LEN ({MAX_FRAME_LEN} bytes)"
+                ),
+            )));
+        }
         let mut buf = Vec::with_capacity(4 + payload.len());
         buf.extend_from_slice(&len.to_be_bytes());
         buf.extend_from_slice(&payload);
@@ -42,6 +57,7 @@ impl RpcCodec {
     ///
     /// Rejects envelopes whose `cluster_id` doesn't match.
     /// Rejects frames with trailing bytes after the declared payload length.
+    /// Rejects frames whose declared length exceeds `MAX_FRAME_LEN`.
     pub fn decode(&self, buf: &[u8]) -> Result<RpcEnvelope> {
         if buf.len() < 4 {
             return Err(XraftError::TransportError(std::io::Error::new(
@@ -49,7 +65,16 @@ impl RpcCodec {
                 "buffer too short for length prefix",
             )));
         }
-        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if len > MAX_FRAME_LEN {
+            return Err(XraftError::TransportError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "declared frame length ({len} bytes) exceeds MAX_FRAME_LEN ({MAX_FRAME_LEN} bytes)"
+                ),
+            )));
+        }
+        let len = len as usize;
         let payload = &buf[4..];
         if payload.len() < len {
             return Err(XraftError::TransportError(std::io::Error::new(
@@ -153,5 +178,19 @@ mod tests {
         let codec = RpcCodec::new(cid);
         let result = codec.decode(&[]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn oversized_frame_rejected_on_decode() {
+        // Craft a buffer with a length prefix exceeding MAX_FRAME_LEN.
+        let len = MAX_FRAME_LEN + 1;
+        let mut buf = Vec::with_capacity(8);
+        buf.extend_from_slice(&len.to_be_bytes());
+        // Only need a few dummy payload bytes — the guard fires before reading payload.
+        buf.extend_from_slice(&[0u8; 4]);
+        let cid = ClusterId(uuid::Uuid::new_v4());
+        let codec = RpcCodec::new(cid);
+        let result = codec.decode(&buf);
+        assert!(result.is_err(), "decode must reject frames exceeding MAX_FRAME_LEN");
     }
 }
