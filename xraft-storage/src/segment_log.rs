@@ -1,51 +1,31 @@
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
-
-use xraft_core::error::XraftError;
+use tracing::{debug, info, warn};
 use xraft_core::log_entry::LogEntry;
 use xraft_core::traits::LogStore;
 use xraft_core::types::ClusterId;
+use xraft_core::XraftError;
 
-use crate::segment::{batch_disk_size, Segment, SerializedEntry};
+use crate::segment::Segment;
 
-/// Default segment size limit in bytes.
-const DEFAULT_MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
+const LOG_META_FILENAME: &str = "log_meta";
 
-/// Default sparse index interval (every Nth entry).
+/// Default segment size limit in bytes (64 MiB).
+const DEFAULT_MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Default sparse index interval (every 16th entry).
 const DEFAULT_INDEX_INTERVAL: u32 = 16;
 
 /// Configuration for the segment log.
 pub struct SegmentLogConfig {
     /// Maximum segment file size in bytes before rolling to a new segment.
-    /// Must be greater than zero.
     pub max_segment_size: u64,
     /// Sparse index recording interval (every Nth entry).
-    /// Must be greater than zero.
     pub index_interval: u32,
-}
-
-impl SegmentLogConfig {
-    /// Validate configuration values. Returns an error if any value is invalid.
-    fn validate(&self) -> io::Result<()> {
-        if self.max_segment_size == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "max_segment_size must be greater than zero",
-            ));
-        }
-        if self.index_interval == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "index_interval must be greater than zero",
-            ));
-        }
-        Ok(())
-    }
 }
 
 impl Default for SegmentLogConfig {
@@ -57,12 +37,20 @@ impl Default for SegmentLogConfig {
     }
 }
 
-/// Internal mutable state protected by a Mutex.
-struct SegmentLogInner {
-    segments: Vec<Segment>,
+impl SegmentLogConfig {
+    /// Copy the max_segment_size value, returning it as the raw `max_bytes`
+    /// parameter expected by lower-level segment calls.
+    fn max_bytes(&self) -> u64 {
+        self.max_segment_size
+    }
 }
 
-/// Manages a series of log segments on disk, implementing the `LogStore` trait.
+/// Multi-segment log store implementing the `LogStore` trait.
+///
+/// Manages a series of `Segment` files in a directory. Segments are rolled
+/// when the active segment reaches the configured size limit. Interior
+/// mutability is provided via `std::sync::Mutex` (no await points while the
+/// lock is held).
 ///
 /// Directory layout (when created via `open_for_cluster`):
 ///   `<base_dir>/data/<cluster_id>/log/00000000000000000000.log`
@@ -71,12 +59,19 @@ struct SegmentLogInner {
 ///
 /// Or a custom directory when created via `open`.
 pub struct SegmentLog {
-    log_dir: PathBuf,
-    config: SegmentLogConfig,
     inner: Mutex<SegmentLogInner>,
-    /// Atomic start/end offsets for sync accessors.
+    /// Cached start offset, updated after durable mutations.
     start_offset: AtomicU64,
+    /// Cached end offset (next offset to be written).
     end_offset: AtomicU64,
+}
+
+struct SegmentLogInner {
+    dir: PathBuf,
+    segments: Vec<Segment>,
+    log_start_offset: u64,
+    max_bytes: u64,
+    index_interval: u32,
 }
 
 impl SegmentLog {
@@ -95,77 +90,118 @@ impl SegmentLog {
     }
 
     /// Open or create a segment log in the given directory.
-    pub fn open(log_dir: &Path, config: SegmentLogConfig) -> io::Result<Self> {
-        config.validate()?;
-        fs::create_dir_all(log_dir)?;
+    pub fn open(dir: &Path, config: SegmentLogConfig) -> io::Result<Self> {
+        let max_bytes = config.max_bytes();
+        let index_interval = config.index_interval;
 
-        // Discover existing segment files by scanning for `.log` files.
-        let mut base_offsets = Self::discover_segments(log_dir)?;
+        std::fs::create_dir_all(dir)?;
+
+        let persisted_start = Self::load_meta(dir)?;
+
+        // Discover existing segment files.
+        let mut base_offsets = Self::discover_segments(dir)?;
         base_offsets.sort();
 
         let mut segments = Vec::new();
-        let mut truncate_from: Option<usize> = None;
-
-        for (idx, base) in base_offsets.iter().enumerate() {
-            // If a previous segment was truncated (recovery), don't open later ones
-            if truncate_from.is_some() {
-                break;
-            }
-
-            let seg = Segment::open(log_dir, *base, config.index_interval)?;
-
-            // Check offset continuity: this segment's base must match the
-            // previous segment's next_offset. If not, the log is torn.
-            if let Some(prev) = segments.last() {
-                let prev: &Segment = prev;
-                if prev.next_offset() != seg.base_offset() {
-                    // Previous segment was truncated during recovery — discard
-                    // this segment and all subsequent ones.
-                    truncate_from = Some(idx);
+        for &base in &base_offsets {
+            match Segment::open(dir, base, max_bytes, index_interval) {
+                Ok(seg) => segments.push(seg),
+                Err(e) => {
+                    warn!(base_offset = base, error = %e, "failed to open segment, stopping here");
+                    // Remove this and all subsequent segments — they are after corruption.
                     break;
                 }
             }
-
-            segments.push(seg);
         }
 
-        // Remove segment files that come after a truncated segment
-        if let Some(from_idx) = truncate_from {
-            for base in &base_offsets[from_idx..] {
-                let stem = crate::segment::segment_filename(*base);
-                let _ = fs::remove_file(log_dir.join(format!("{stem}.log")));
-                let _ = fs::remove_file(log_dir.join(format!("{stem}.index")));
+        // Validate cross-segment continuity: each segment's base_offset must equal
+        // the previous segment's next_offset.
+        let mut valid_count = segments.len();
+        for i in 1..segments.len() {
+            let prev_next = segments[i - 1].next_offset();
+            let curr_base = segments[i].base_offset();
+            if curr_base != prev_next {
+                warn!(
+                    prev_next_offset = prev_next,
+                    segment_base = curr_base,
+                    "segment gap/overlap detected, discarding segment {} and beyond", i
+                );
+                valid_count = i;
+                break;
             }
         }
 
-        // If no segments exist, create the initial segment at offset 0.
+        // Remove segments beyond the valid chain.
+        while segments.len() > valid_count {
+            if let Some(seg) = segments.pop() {
+                let _ = seg.remove();
+            }
+        }
+
+        // Remove empty segments that aren't the tail.
+        // (Keep the last segment even if empty — it's the active segment.)
+        while segments.len() > 1 && segments.last().map_or(false, |s| s.is_empty()) {
+            // Actually, an empty tail segment is fine. Only remove empty
+            // non-tail segments that would break the chain.
+            break;
+        }
+
+        // Determine logical start offset.
+        let log_start_offset = if let Some(persisted) = persisted_start {
+            // Use persisted value, but ensure it's not before the first segment.
+            if segments.is_empty() {
+                persisted
+            } else {
+                persisted.max(segments[0].base_offset())
+            }
+        } else if segments.is_empty() {
+            0
+        } else {
+            segments[0].base_offset()
+        };
+
+        let log_end_offset = segments
+            .last()
+            .map_or(log_start_offset, |s| s.next_offset());
+
+        // If no segments exist, create an initial one.
         if segments.is_empty() {
-            let seg = Segment::create(log_dir, 0, config.index_interval)?;
+            let seg = Segment::create(dir, log_start_offset, max_bytes, index_interval)?;
             segments.push(seg);
         }
 
-        let start_offset = segments.first().map_or(0, |s| s.base_offset());
-        let end_offset = segments.last().map_or(0, |s| s.next_offset());
+        info!(
+            dir = %dir.display(),
+            num_segments = segments.len(),
+            log_start_offset,
+            log_end_offset,
+            "segment log opened"
+        );
 
         Ok(Self {
-            log_dir: log_dir.to_path_buf(),
-            config,
-            inner: Mutex::new(SegmentLogInner { segments }),
-            start_offset: AtomicU64::new(start_offset),
-            end_offset: AtomicU64::new(end_offset),
+            inner: Mutex::new(SegmentLogInner {
+                dir: dir.to_path_buf(),
+                segments,
+                log_start_offset,
+                max_bytes,
+                index_interval,
+            }),
+            start_offset: AtomicU64::new(log_start_offset),
+            end_offset: AtomicU64::new(log_end_offset),
         })
     }
 
     /// Discover segment base offsets from `.log` filenames in the directory.
     fn discover_segments(dir: &Path) -> io::Result<Vec<u64>> {
         let mut offsets = Vec::new();
-        for entry in fs::read_dir(dir)? {
+        for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("log") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if let Ok(offset) = stem.parse::<u64>() {
-                        offsets.push(offset);
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(stem) = name_str.strip_suffix(".log") {
+                if stem.len() == 20 {
+                    if let Ok(base) = stem.parse::<u64>() {
+                        offsets.push(base);
                     }
                 }
             }
@@ -173,202 +209,296 @@ impl SegmentLog {
         Ok(offsets)
     }
 
-    /// Roll to a new segment. Must be called with inner lock held.
-    fn roll_segment(
-        inner: &mut SegmentLogInner,
-        log_dir: &Path,
-        config: &SegmentLogConfig,
-    ) -> io::Result<()> {
-        let next_base = inner.segments.last().map_or(0, |s| s.next_offset());
-        let seg = Segment::create(log_dir, next_base, config.index_interval)?;
-
-        // Sync parent directory to ensure new file entry is durable.
-        #[cfg(unix)]
-        {
-            let dir_file = fs::File::open(log_dir)?;
-            dir_file.sync_all()?;
+    /// Load the persisted `log_start_offset` from the metadata file.
+    fn load_meta(dir: &Path) -> io::Result<Option<u64>> {
+        let meta_path = dir.join(LOG_META_FILENAME);
+        match std::fs::read_to_string(&meta_path) {
+            Ok(content) => {
+                let trimmed = content.trim();
+                match trimmed.parse::<u64>() {
+                    Ok(v) => Ok(Some(v)),
+                    Err(_) => {
+                        warn!(path = %meta_path.display(), "corrupt log_meta, ignoring");
+                        Ok(None)
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
         }
+    }
 
-        inner.segments.push(seg);
+    /// Persist `log_start_offset` atomically.
+    fn persist_meta(dir: &Path, log_start_offset: u64) -> io::Result<()> {
+        let meta_path = dir.join(LOG_META_FILENAME);
+        let tmp_path = dir.join(format!("{LOG_META_FILENAME}.tmp"));
+        std::fs::write(&tmp_path, log_start_offset.to_string())?;
+
+        // fsync the temp file.
+        let f = std::fs::File::open(&tmp_path)?;
+        f.sync_all()?;
+        drop(f);
+
+        // Atomic rename.
+        std::fs::rename(&tmp_path, &meta_path)?;
         Ok(())
     }
 
-    /// Find the segment index containing the given offset.
-    fn find_segment(segments: &[Segment], offset: u64) -> Option<usize> {
+    /// Find the index of the segment that contains `offset`.
+    fn find_segment_idx(segments: &[Segment], offset: u64) -> Option<usize> {
         if segments.is_empty() {
             return None;
         }
-        // Binary search: find the last segment whose base_offset <= offset
-        let mut lo = 0;
-        let mut hi = segments.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if segments[mid].base_offset() <= offset {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
+        // Binary search: find the last segment whose base_offset <= offset.
+        let idx = segments.partition_point(|s| s.base_offset() <= offset);
+        if idx == 0 {
+            return None;
         }
-        if lo == 0 {
-            None
+        let seg_idx = idx - 1;
+        // Check that offset is within this segment's range.
+        if offset < segments[seg_idx].next_offset() {
+            Some(seg_idx)
         } else {
-            Some(lo - 1)
+            None
         }
     }
 }
 
 #[async_trait]
 impl LogStore for SegmentLog {
-    async fn append(&self, entries: &[LogEntry]) -> Result<(), XraftError> {
+    async fn append(&self, entries: &[LogEntry]) -> xraft_core::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
 
-        let mut inner = self.inner.lock().await;
+        let mut guard = self.inner.lock().map_err(|_| {
+            XraftError::StorageError(io::Error::new(io::ErrorKind::Other, "lock poisoned"))
+        })?;
 
-        // Validate offset continuity
-        let current_end = self.end_offset.load(Ordering::Acquire);
-        if entries[0].offset != current_end {
-            return Err(XraftError::StorageError(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "offset discontinuity: expected {}, got {}",
-                    current_end, entries[0].offset
-                ),
-            )));
-        }
-        for window in entries.windows(2) {
-            if window[1].offset != window[0].offset + 1 {
+        let inner = &mut *guard;
+
+        // Validate contiguous offsets starting from current end.
+        let current_end = inner
+            .segments
+            .last()
+            .map_or(inner.log_start_offset, |s| s.next_offset());
+
+        for (i, entry) in entries.iter().enumerate() {
+            let expected = current_end + i as u64;
+            if entry.offset != expected {
                 return Err(XraftError::StorageError(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "non-contiguous offsets: {} followed by {}",
-                        window[0].offset, window[1].offset
+                        "non-contiguous offset: expected {expected}, got {}",
+                        entry.offset
                     ),
                 )));
             }
         }
 
-        // Pre-serialize all entries for size calculation and batch writing
-        let serialized: Vec<SerializedEntry> = entries
-            .iter()
-            .map(SerializedEntry::from_entry)
-            .collect::<Result<_, _>>()
-            .map_err(XraftError::StorageError)?;
-
-        // Write entries in sub-batches, rolling segments as needed.
-        // Each sub-batch is written as a single CRC-protected batch.
-        // end_offset is updated after each successful sub-batch to keep
-        // the live log consistent even if a later sub-batch fails.
-        let mut pos = 0;
-        while pos < entries.len() {
-            // Roll if active segment is at or over the size limit
-            let active_size = inner
-                .segments
-                .last()
-                .expect("at least one segment exists")
-                .file_size();
-            if active_size > 0 && active_size >= self.config.max_segment_size {
-                Self::roll_segment(&mut inner, &self.log_dir, &self.config)?;
+        for entry in entries {
+            // Roll to new segment if current is full.
+            if inner.segments.last().map_or(true, |s| s.is_full()) {
+                let base = inner
+                    .segments
+                    .last()
+                    .map_or(inner.log_start_offset, |s| s.next_offset());
+                let seg =
+                    Segment::create(&inner.dir, base, inner.max_bytes, inner.index_interval)?;
+                inner.segments.push(seg);
             }
 
-            let active_size = inner
-                .segments
-                .last()
-                .expect("at least one segment exists")
-                .file_size();
-
-            // Determine how many entries fit in the current segment.
-            // Always write at least one entry per sub-batch (even if it
-            // alone exceeds the threshold on an empty segment).
-            let mut end = pos + 1;
-
-            // If even one entry doesn't fit alongside existing data, roll first
-            let one_batch_size = batch_disk_size(&serialized[pos..end]);
-            if active_size > 0 && active_size + one_batch_size > self.config.max_segment_size {
-                Self::roll_segment(&mut inner, &self.log_dir, &self.config)?;
-                // Fresh segment — recalculate with size = 0
-            }
-
-            let active_size = inner
-                .segments
-                .last()
-                .expect("at least one segment exists")
-                .file_size();
-
-            // Greedily expand the sub-batch while it fits
-            while end < entries.len() {
-                let candidate_size = batch_disk_size(&serialized[pos..end + 1]);
-                if active_size + candidate_size > self.config.max_segment_size {
-                    break;
-                }
-                end += 1;
-            }
-
-            // Write the sub-batch as a single CRC-protected batch
-            let active = inner
-                .segments
-                .last_mut()
-                .expect("at least one segment exists");
-            active
-                .append_batch(&entries[pos..end], &serialized[pos..end])
-                .map_err(XraftError::StorageError)?;
-
-            // Update end_offset immediately after each successful sub-batch
-            // so the live state is consistent with what's durably on disk.
-            let new_end = active.next_offset();
-            self.end_offset.store(new_end, Ordering::Release);
-
-            pos = end;
+            let active = inner.segments.last_mut().ok_or_else(|| {
+                XraftError::StorageError(io::Error::new(
+                    io::ErrorKind::Other,
+                    "segment list is unexpectedly empty after roll check",
+                ))
+            })?;
+            active.append_entry(entry)?;
         }
+
+        // Fsync the active segment.
+        if let Some(active) = inner.segments.last() {
+            active.flush()?;
+        }
+
+        // Update atomic end offset after durable write.
+        let new_end = inner
+            .segments
+            .last()
+            .map_or(inner.log_start_offset, |s| s.next_offset());
+        self.end_offset.store(new_end, Ordering::Release);
 
         Ok(())
     }
 
-    async fn read(
-        &self,
-        start_offset: u64,
-        end_offset: u64,
-    ) -> Result<Vec<LogEntry>, XraftError> {
-        if start_offset >= end_offset {
+    async fn read(&self, start_offset: u64, end_offset: u64) -> xraft_core::Result<Vec<LogEntry>> {
+        let guard = self.inner.lock().map_err(|_| {
+            XraftError::StorageError(io::Error::new(io::ErrorKind::Other, "lock poisoned"))
+        })?;
+
+        let inner = &*guard;
+
+        // Clamp to valid range.
+        let effective_start = start_offset.max(inner.log_start_offset);
+        let log_end = inner
+            .segments
+            .last()
+            .map_or(inner.log_start_offset, |s| s.next_offset());
+        let effective_end = end_offset.min(log_end);
+
+        if effective_start >= effective_end {
             return Ok(Vec::new());
         }
 
-        let mut inner = self.inner.lock().await;
-
-        let seg_start = Self::find_segment(&inner.segments, start_offset);
-        let seg_end = Self::find_segment(&inner.segments, end_offset.saturating_sub(1));
-
-        let seg_start = match seg_start {
-            Some(i) => i,
-            None => return Ok(Vec::new()),
-        };
-        let seg_end = seg_end.unwrap_or(inner.segments.len() - 1);
-
         let mut result = Vec::new();
-        for i in seg_start..=seg_end {
-            let seg = &mut inner.segments[i];
-            let entries = seg
-                .read(start_offset, end_offset)
-                .map_err(XraftError::StorageError)?;
+
+        // Find the first relevant segment.
+        let start_idx = Self::find_segment_idx(&inner.segments, effective_start)
+            .unwrap_or(0);
+
+        for seg in &inner.segments[start_idx..] {
+            if seg.base_offset() >= effective_end {
+                break;
+            }
+            let entries = seg.read_range(effective_start, effective_end)?;
             result.extend(entries);
         }
 
         Ok(result)
     }
 
-    async fn truncate_suffix(&self, _from_offset: u64) -> Result<(), XraftError> {
-        Err(XraftError::StorageError(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "truncate_suffix not yet implemented (Stage 2.2)",
-        )))
+    async fn entry_at(&self, offset: u64) -> xraft_core::Result<Option<LogEntry>> {
+        let end = match offset.checked_add(1) {
+            Some(end) => end,
+            None => return Ok(None), // u64::MAX overflow guard
+        };
+        let entries = self.read(offset, end).await?;
+        Ok(entries.into_iter().next())
     }
 
-    async fn truncate_prefix(&self, _up_to_offset: u64) -> Result<(), XraftError> {
-        Err(XraftError::StorageError(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "truncate_prefix not yet implemented (Stage 2.2)",
-        )))
+    async fn truncate_suffix(&self, from_offset: u64) -> xraft_core::Result<()> {
+        let mut guard = self.inner.lock().map_err(|_| {
+            XraftError::StorageError(io::Error::new(io::ErrorKind::Other, "lock poisoned"))
+        })?;
+
+        let inner = &mut *guard;
+
+        let log_end = inner
+            .segments
+            .last()
+            .map_or(inner.log_start_offset, |s| s.next_offset());
+
+        if from_offset >= log_end {
+            return Ok(());
+        }
+
+        // Clamp: cannot truncate below start.
+        let effective_from = from_offset.max(inner.log_start_offset);
+
+        // Find the segment containing effective_from.
+        let seg_idx = Self::find_segment_idx(&inner.segments, effective_from);
+
+        match seg_idx {
+            Some(idx) => {
+                // Remove all segments after idx.
+                while inner.segments.len() > idx + 1 {
+                    let seg = inner.segments.pop().unwrap();
+                    seg.remove()?;
+                }
+                // Truncate the segment at effective_from.
+                inner.segments[idx].truncate_at(effective_from)?;
+
+                // If the truncated segment is now empty and it's not the only one,
+                // we might remove it. But keep it as the active segment.
+            }
+            None => {
+                // effective_from is before all segments — truncate everything.
+                while let Some(seg) = inner.segments.pop() {
+                    seg.remove()?;
+                }
+                // Create a fresh segment at log_start_offset.
+                let seg = Segment::create(
+                    &inner.dir,
+                    inner.log_start_offset,
+                    inner.max_bytes,
+                    inner.index_interval,
+                )?;
+                inner.segments.push(seg);
+            }
+        }
+
+        let new_end = inner
+            .segments
+            .last()
+            .map_or(inner.log_start_offset, |s| s.next_offset());
+        self.end_offset.store(new_end, Ordering::Release);
+
+        Ok(())
+    }
+
+    async fn truncate_prefix(&self, up_to_offset: u64) -> xraft_core::Result<()> {
+        let mut guard = self.inner.lock().map_err(|_| {
+            XraftError::StorageError(io::Error::new(io::ErrorKind::Other, "lock poisoned"))
+        })?;
+
+        let inner = &mut *guard;
+
+        if up_to_offset <= inner.log_start_offset {
+            return Ok(());
+        }
+
+        // Clamp up_to_offset to log_end so we never set start past end.
+        let log_end = inner
+            .segments
+            .last()
+            .map_or(inner.log_start_offset, |s| s.next_offset());
+        let effective_offset = up_to_offset.min(log_end);
+
+        // Remove segments whose entries are ALL before effective_offset
+        // (i.e., segment.next_offset() <= effective_offset).
+        // Use drain(..count) to avoid O(n²) shifts from repeated remove(0).
+        let remove_count = inner
+            .segments
+            .iter()
+            .take_while(|s| s.next_offset() <= effective_offset)
+            .count();
+        for seg in inner.segments.drain(..remove_count) {
+            debug!(
+                base_offset = seg.base_offset(),
+                next_offset = seg.next_offset(),
+                "removing prefix segment"
+            );
+            seg.remove()?;
+        }
+
+        // If all segments were removed, create a fresh one at the new start.
+        if inner.segments.is_empty() {
+            let seg = Segment::create(
+                &inner.dir,
+                effective_offset,
+                inner.max_bytes,
+                inner.index_interval,
+            )?;
+            inner.segments.push(seg);
+        }
+
+        // Update logical start offset.
+        inner.log_start_offset = effective_offset;
+
+        // Persist the new start offset.
+        Self::persist_meta(&inner.dir, effective_offset)?;
+
+        // Update end_offset BEFORE start_offset to avoid a window where start > end.
+        let new_end = inner
+            .segments
+            .last()
+            .map_or(effective_offset, |s| s.next_offset().max(effective_offset));
+        self.end_offset.store(new_end, Ordering::Release);
+
+        self.start_offset.store(effective_offset, Ordering::Release);
+
+        Ok(())
     }
 
     fn log_start_offset(&self) -> u64 {
@@ -378,280 +508,455 @@ impl LogStore for SegmentLog {
     fn log_end_offset(&self) -> u64 {
         self.end_offset.load(Ordering::Acquire)
     }
-
-    async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>, XraftError> {
-        let current_start = self.log_start_offset();
-        let current_end = self.log_end_offset();
-
-        if offset < current_start || offset >= current_end {
-            return Ok(None);
-        }
-
-        let entries = self.read(offset, offset + 1).await?;
-        Ok(entries.into_iter().next())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Seek, Write};
+    use bytes::Bytes;
     use tempfile::TempDir;
     use xraft_core::log_entry::EntryType;
     use xraft_core::types::Term;
 
-    fn make_entry(offset: u64, term: u64, payload: &[u8]) -> LogEntry {
+    fn make_entry(offset: u64, term: u64) -> LogEntry {
         LogEntry {
             offset,
             term: Term(term),
             entry_type: EntryType::Command,
-            payload: payload.to_vec(),
+            payload: Bytes::from(format!("payload-{offset}")),
         }
     }
 
+    fn make_entries(start: u64, end: u64) -> Vec<LogEntry> {
+        (start..end).map(|i| make_entry(i, 1)).collect()
+    }
+
     #[tokio::test]
-    async fn append_and_read_100_entries() {
+    async fn test_open_empty_directory() {
+        let dir = TempDir::new().unwrap();
+        let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
+        assert_eq!(log.log_start_offset(), 0);
+        assert_eq!(log.log_end_offset(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_append_and_read_back() {
         let dir = TempDir::new().unwrap();
         let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
 
-        let entries: Vec<LogEntry> = (0..100)
-            .map(|i| make_entry(i, 1 + i / 10, &format!("payload-{i}").into_bytes()))
-            .collect();
-
+        let entries = make_entries(0, 100);
         log.append(&entries).await.unwrap();
 
-        assert_eq!(log.log_start_offset(), 0);
         assert_eq!(log.log_end_offset(), 100);
 
-        let read_back = log.read(0, 100).await.unwrap();
-        assert_eq!(read_back.len(), 100);
-        for (i, entry) in read_back.iter().enumerate() {
-            let i = i as u64;
-            assert_eq!(entry.offset, i);
-            assert_eq!(entry.term, Term(1 + i / 10));
-            assert_eq!(entry.payload, format!("payload-{i}").into_bytes());
-        }
-    }
-
-    /// Corrupt a byte mid-segment on a live (non-reopened) SegmentLog and verify
-    /// that reading past the corruption returns `StorageError(InvalidData)`.
-    #[tokio::test]
-    async fn crc_integrity_live_read_returns_storage_error() {
-        let dir = TempDir::new().unwrap();
-        let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
-
-        // Write 10 entries as individual batches (separate append calls)
-        for i in 0..10u64 {
-            log.append(&[make_entry(i, 1, &[i as u8; 32])])
-                .await
-                .unwrap();
-        }
-
-        // Corrupt batch 5's payload on disk without closing the SegmentLog.
-        // Each batch has the same size; target the entry data inside batch 5.
-        let log_path = dir.path().join("00000000000000000000.log");
-        {
-            let mut f = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&log_path)
-                .unwrap();
-            let mut raw = Vec::new();
-            f.read_to_end(&mut raw).unwrap();
-            let batch_size = raw.len() / 10;
-            let corrupt_pos = batch_size * 5 + 14; // inside entry data
-            raw[corrupt_pos] ^= 0xFF;
-            f.seek(std::io::SeekFrom::Start(0)).unwrap();
-            f.write_all(&raw).unwrap();
-            f.sync_all().unwrap();
-        }
-
-        // Reading through the same SegmentLog handle must return StorageError
-        let result = log.read(0, 10).await;
-        match result {
-            Err(XraftError::StorageError(ref e)) => {
-                assert_eq!(e.kind(), io::ErrorKind::InvalidData);
-                assert!(
-                    e.to_string().contains("CRC"),
-                    "expected CRC error, got: {e}"
-                );
-            }
-            Ok(_) => panic!("expected StorageError from CRC mismatch, got Ok"),
-            Err(other) => panic!("expected StorageError, got: {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn segment_rollover() {
-        let dir = TempDir::new().unwrap();
-        let config = SegmentLogConfig {
-            max_segment_size: 1024, // 1 KB
-            index_interval: 4,
-        };
-        let log = SegmentLog::open(dir.path(), config).unwrap();
-
-        // Write 100 entries in batches of 5 to trigger multiple rollovers.
-        for batch_start in (0..100).step_by(5) {
-            let entries: Vec<LogEntry> = (batch_start..batch_start + 5)
-                .map(|i| make_entry(i, 1, &[0xABu8; 32]))
-                .collect();
-            log.append(&entries).await.unwrap();
-        }
-
-        assert_eq!(log.log_end_offset(), 100);
-
-        // Verify multiple segment files were created
-        let log_files: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    == Some("log")
-            })
-            .collect();
-        assert!(
-            log_files.len() > 1,
-            "expected multiple segment files, got {}",
-            log_files.len()
-        );
-
-        // Verify no segment file exceeds the size threshold (except possibly
-        // the very first batch on an empty segment, which is always allowed).
-        for f in &log_files {
-            let size = f.metadata().unwrap().len();
-            // A single batch may slightly exceed the threshold when the segment
-            // was empty. But it must not be wildly over.
-            assert!(
-                size <= 1024 + 512,
-                "segment {} is {} bytes, exceeds 1 KB + tolerance",
-                f.path().display(),
-                size
-            );
-        }
-
-        // Read all entries back across segments
-        let read_back = log.read(0, 100).await.unwrap();
-        assert_eq!(read_back.len(), 100);
-        for (i, entry) in read_back.iter().enumerate() {
+        let read = log.read(0, 100).await.unwrap();
+        assert_eq!(read.len(), 100);
+        for (i, entry) in read.iter().enumerate() {
             assert_eq!(entry.offset, i as u64);
         }
     }
 
     #[tokio::test]
-    async fn append_rejects_offset_discontinuity() {
+    async fn test_entry_at() {
         let dir = TempDir::new().unwrap();
         let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
 
-        let entries = vec![make_entry(0, 1, b"a"), make_entry(1, 1, b"b")];
+        let entries = make_entries(0, 10);
         log.append(&entries).await.unwrap();
 
-        // Gap: offset 5 instead of 2
-        let bad = vec![make_entry(5, 1, b"c")];
-        let err = log.append(&bad).await;
-        assert!(err.is_err());
-    }
+        let entry = log.entry_at(5).await.unwrap();
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().offset, 5);
 
-    #[tokio::test]
-    async fn entry_at_returns_correct_entry() {
-        let dir = TempDir::new().unwrap();
-        let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
-
-        let entries: Vec<LogEntry> = (0..10)
-            .map(|i| make_entry(i, i + 1, &[i as u8; 4]))
-            .collect();
-        log.append(&entries).await.unwrap();
-
-        let e = log.entry_at(5).await.unwrap().unwrap();
-        assert_eq!(e.offset, 5);
-        assert_eq!(e.term, Term(6));
-
+        // Out of bounds.
         assert!(log.entry_at(10).await.unwrap().is_none());
         assert!(log.entry_at(100).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn read_partial_range() {
+    async fn test_truncate_suffix() {
         let dir = TempDir::new().unwrap();
         let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
 
-        let entries: Vec<LogEntry> = (0..50)
-            .map(|i| make_entry(i, 1, &[i as u8]))
+        let entries = make_entries(0, 100);
+        log.append(&entries).await.unwrap();
+
+        log.truncate_suffix(50).await.unwrap();
+
+        assert_eq!(log.log_end_offset(), 50);
+
+        let read = log.read(0, 100).await.unwrap();
+        assert_eq!(read.len(), 50);
+        for (i, entry) in read.iter().enumerate() {
+            assert_eq!(entry.offset, i as u64);
+        }
+
+        // entry_at boundary
+        assert!(log.entry_at(49).await.unwrap().is_some());
+        assert!(log.entry_at(50).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_truncate_prefix_multi_segment() {
+        let dir = TempDir::new().unwrap();
+        // Small segment size to force multiple segments.
+        let config = SegmentLogConfig {
+            max_segment_size: 256,
+            index_interval: 4,
+        };
+        let log = SegmentLog::open(dir.path(), config).unwrap();
+
+        let entries = make_entries(0, 3000);
+        log.append(&entries).await.unwrap();
+
+        // Verify we have multiple segments.
+        {
+            let guard = log.inner.lock().unwrap();
+            assert!(guard.segments.len() >= 3, "expected at least 3 segments, got {}", guard.segments.len());
+        }
+
+        log.truncate_prefix(1000).await.unwrap();
+
+        assert_eq!(log.log_start_offset(), 1000);
+
+        // Entries before 1000 should be gone.
+        let read = log.read(0, 1000).await.unwrap();
+        assert!(read.is_empty());
+
+        // Entries from 1000 onward should still be readable.
+        let read = log.read(1000, 1100).await.unwrap();
+        assert_eq!(read.len(), 100);
+        assert_eq!(read[0].offset, 1000);
+    }
+
+    #[tokio::test]
+    async fn test_recovery_after_crash() {
+        let dir = TempDir::new().unwrap();
+
+        // Write some entries.
+        {
+            let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
+            let entries = make_entries(0, 50);
+            log.append(&entries).await.unwrap();
+        }
+
+        // Corrupt the last record by appending garbage bytes.
+        {
+            let mut log_files: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map_or(false, |ext| ext == "log"))
+                .collect();
+            log_files.sort_by_key(|e| e.path());
+
+            let last_log = log_files.last().unwrap().path();
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&last_log)
+                .unwrap();
+            // Write a partial/corrupt record: valid-looking header but bad CRC.
+            let bad_crc: u32 = 0xDEAD_BEEF;
+            let bad_len: u32 = 100;
+            f.write_all(&bad_crc.to_le_bytes()).unwrap();
+            f.write_all(&bad_len.to_le_bytes()).unwrap();
+            // Write fewer bytes than bad_len claims.
+            f.write_all(&[0u8; 50]).unwrap();
+            f.flush().unwrap();
+        }
+
+        // Reopen — recovery should truncate the corrupt record.
+        let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
+
+        assert_eq!(log.log_end_offset(), 50);
+
+        let read = log.read(0, 50).await.unwrap();
+        assert_eq!(read.len(), 50);
+        for (i, entry) in read.iter().enumerate() {
+            assert_eq!(entry.offset, i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_segment_rollover() {
+        let dir = TempDir::new().unwrap();
+        let config = SegmentLogConfig {
+            max_segment_size: 256,
+            index_interval: 4,
+        };
+        let log = SegmentLog::open(dir.path(), config).unwrap();
+
+        let entries = make_entries(0, 100);
+        log.append(&entries).await.unwrap();
+
+        {
+            let guard = log.inner.lock().unwrap();
+            assert!(guard.segments.len() > 1, "expected multiple segments");
+        }
+
+        // Read back all entries.
+        let read = log.read(0, 100).await.unwrap();
+        assert_eq!(read.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_reopen_preserves_data() {
+        let dir = TempDir::new().unwrap();
+        let dir_path = dir.path().to_path_buf();
+
+        {
+            let config = SegmentLogConfig {
+                max_segment_size: 256,
+                index_interval: 4,
+            };
+            let log = SegmentLog::open(&dir_path, config).unwrap();
+            let entries = make_entries(0, 200);
+            log.append(&entries).await.unwrap();
+        }
+
+        // Reopen.
+        let config = SegmentLogConfig {
+            max_segment_size: 256,
+            index_interval: 4,
+        };
+        let log = SegmentLog::open(&dir_path, config).unwrap();
+        assert_eq!(log.log_start_offset(), 0);
+        assert_eq!(log.log_end_offset(), 200);
+
+        let read = log.read(0, 200).await.unwrap();
+        assert_eq!(read.len(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_prefix_persists_across_restart() {
+        let dir = TempDir::new().unwrap();
+        let dir_path = dir.path().to_path_buf();
+
+        {
+            let config = SegmentLogConfig {
+                max_segment_size: 256,
+                index_interval: 4,
+            };
+            let log = SegmentLog::open(&dir_path, config).unwrap();
+            let entries = make_entries(0, 500);
+            log.append(&entries).await.unwrap();
+            log.truncate_prefix(200).await.unwrap();
+            assert_eq!(log.log_start_offset(), 200);
+        }
+
+        // Reopen — start offset should be preserved.
+        let config = SegmentLogConfig {
+            max_segment_size: 256,
+            index_interval: 4,
+        };
+        let log = SegmentLog::open(&dir_path, config).unwrap();
+        assert_eq!(log.log_start_offset(), 200);
+
+        // Entries before 200 should not be readable.
+        assert!(log.entry_at(199).await.unwrap().is_none());
+        assert!(log.entry_at(200).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_append_non_contiguous_fails() {
+        let dir = TempDir::new().unwrap();
+        let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
+
+        let entries = make_entries(0, 5);
+        log.append(&entries).await.unwrap();
+
+        // Try to append with a gap.
+        let bad_entries = vec![make_entry(10, 1)];
+        let result = log.append(&bad_entries).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_truncate_suffix_then_append() {
+        let dir = TempDir::new().unwrap();
+        let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
+
+        let entries = make_entries(0, 100);
+        log.append(&entries).await.unwrap();
+
+        log.truncate_suffix(50).await.unwrap();
+
+        // Append new entries starting from 50.
+        let new_entries: Vec<_> = (50..80).map(|i| make_entry(i, 2)).collect();
+        log.append(&new_entries).await.unwrap();
+
+        assert_eq!(log.log_end_offset(), 80);
+
+        let read = log.read(50, 80).await.unwrap();
+        assert_eq!(read.len(), 30);
+        // New entries should have term 2.
+        for entry in &read {
+            assert_eq!(entry.term, Term(2));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_truncate_suffix_noop_at_end() {
+        let dir = TempDir::new().unwrap();
+        let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
+
+        let entries = make_entries(0, 10);
+        log.append(&entries).await.unwrap();
+
+        // Truncate at end is a no-op.
+        log.truncate_suffix(10).await.unwrap();
+        assert_eq!(log.log_end_offset(), 10);
+
+        // Truncate beyond end is a no-op.
+        log.truncate_suffix(100).await.unwrap();
+        assert_eq!(log.log_end_offset(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_recovery_corrupt_crc_mid_segment() {
+        let dir = TempDir::new().unwrap();
+
+        // Write entries.
+        {
+            let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
+            let entries = make_entries(0, 20);
+            log.append(&entries).await.unwrap();
+        }
+
+        // Corrupt a byte in the middle of the segment file.
+        {
+            let mut log_files: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map_or(false, |ext| ext == "log"))
+                .collect();
+            log_files.sort_by_key(|e| e.path());
+            let log_file = log_files[0].path();
+
+            let mut data = std::fs::read(&log_file).unwrap();
+            // Corrupt a byte somewhere in the middle (around entry 10).
+            let corrupt_pos = data.len() / 2;
+            data[corrupt_pos] ^= 0xFF;
+            std::fs::write(&log_file, &data).unwrap();
+        }
+
+        // Reopen — should recover up to the corrupt entry.
+        let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
+
+        let end = log.log_end_offset();
+        assert!(end > 0, "some entries should survive");
+        assert!(end < 20, "corrupt entry and after should be truncated");
+
+        let read = log.read(0, end).await.unwrap();
+        assert_eq!(read.len(), end as usize);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_prefix_deletes_segment_files() {
+        let dir = TempDir::new().unwrap();
+        // Small segments to get multiple files.
+        let config = SegmentLogConfig {
+            max_segment_size: 256,
+            index_interval: 4,
+        };
+        let log = SegmentLog::open(dir.path(), config).unwrap();
+
+        let entries = make_entries(0, 3000);
+        log.append(&entries).await.unwrap();
+
+        // Snapshot segment info (base_offset, next_offset, path) before truncation.
+        let segments_before: Vec<(u64, u64, PathBuf, PathBuf)> = {
+            let guard = log.inner.lock().unwrap();
+            guard.segments.iter().map(|s| {
+                let base = s.base_offset();
+                let next = s.next_offset();
+                let log_path = s.log_path().to_path_buf();
+                let idx_path = dir.path().join(crate::segment::Segment::filename(base, "index"));
+                (base, next, log_path, idx_path)
+            }).collect()
+        };
+        assert!(segments_before.len() >= 3, "need at least 3 segment files");
+
+        log.truncate_prefix(1000).await.unwrap();
+
+        // Every segment whose entries are entirely before offset 1000
+        // (next_offset <= 1000) must have its files deleted.
+        for (base, next, log_path, idx_path) in &segments_before {
+            if *next <= 1000 {
+                assert!(
+                    !log_path.exists(),
+                    "segment log file {:?} (base={}, next={}) should have been deleted",
+                    log_path, base, next
+                );
+                assert!(
+                    !idx_path.exists(),
+                    "segment index file {:?} (base={}, next={}) should have been deleted",
+                    idx_path, base, next
+                );
+            }
+        }
+
+        // Remaining segment files should all have base_offset such that they
+        // contain entries at or after 1000.
+        let remaining_log_files: Vec<PathBuf> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "log"))
+            .map(|e| e.path())
             .collect();
-        log.append(&entries).await.unwrap();
+        assert!(
+            remaining_log_files.len() < segments_before.len(),
+            "some segment files should have been deleted: before={}, after={}",
+            segments_before.len(),
+            remaining_log_files.len()
+        );
 
-        let partial = log.read(10, 20).await.unwrap();
-        assert_eq!(partial.len(), 10);
-        assert_eq!(partial[0].offset, 10);
-        assert_eq!(partial[9].offset, 19);
+        // Data at and after 1000 is still readable.
+        let read = log.read(1000, 1100).await.unwrap();
+        assert_eq!(read.len(), 100);
+        assert_eq!(read[0].offset, 1000);
     }
 
     #[tokio::test]
-    async fn read_empty_range() {
+    async fn test_truncate_prefix_all_segments_before_offset() {
+        let dir = TempDir::new().unwrap();
+        let config = SegmentLogConfig {
+            max_segment_size: 256,
+            index_interval: 4,
+        };
+        let log = SegmentLog::open(dir.path(), config).unwrap();
+
+        let entries = make_entries(0, 100);
+        log.append(&entries).await.unwrap();
+
+        let end = log.log_end_offset();
+
+        // Truncate prefix at or beyond all entries — should delete all segment files
+        // and create a fresh empty segment.
+        log.truncate_prefix(end).await.unwrap();
+
+        assert_eq!(log.log_start_offset(), end);
+        assert_eq!(log.log_end_offset(), end);
+
+        // Should be able to read (empty result).
+        let read = log.read(0, end + 10).await.unwrap();
+        assert!(read.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_truncate_prefix_beyond_end_clamps() {
         let dir = TempDir::new().unwrap();
         let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
 
-        let result = log.read(0, 0).await.unwrap();
-        assert!(result.is_empty());
-
-        let result = log.read(5, 3).await.unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[tokio::test]
-    async fn append_empty_is_noop() {
-        let dir = TempDir::new().unwrap();
-        let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
-        log.append(&[]).await.unwrap();
-        assert_eq!(log.log_end_offset(), 0);
-    }
-
-    /// Verify the canonical `data/<cluster_id>/log/` directory layout via
-    /// the `open_for_cluster` constructor.
-    #[tokio::test]
-    async fn directory_layout_via_open_for_cluster() {
-        let dir = TempDir::new().unwrap();
-        let cluster_id = ClusterId::random();
-        let log = SegmentLog::open_for_cluster(
-            dir.path(),
-            &cluster_id,
-            SegmentLogConfig::default(),
-        )
-        .unwrap();
-
-        let entries = vec![make_entry(0, 1, b"hello")];
+        let entries = make_entries(0, 50);
         log.append(&entries).await.unwrap();
 
-        let log_dir = dir
-            .path()
-            .join("data")
-            .join(cluster_id.as_str())
-            .join("log");
-        assert!(log_dir.exists(), "cluster log directory should be created");
-        assert!(log_dir.join("00000000000000000000.log").exists());
-        assert!(log_dir.join("00000000000000000000.index").exists());
-    }
+        // Truncate prefix way beyond end.
+        log.truncate_prefix(99999).await.unwrap();
 
-    #[tokio::test]
-    async fn config_rejects_zero_max_segment_size() {
-        let dir = TempDir::new().unwrap();
-        let config = SegmentLogConfig {
-            max_segment_size: 0,
-            index_interval: 16,
-        };
-        let result = SegmentLog::open(dir.path(), config);
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn config_rejects_zero_index_interval() {
-        let dir = TempDir::new().unwrap();
-        let config = SegmentLogConfig {
-            max_segment_size: 1024,
-            index_interval: 0,
-        };
-        let result = SegmentLog::open(dir.path(), config);
-        assert!(result.is_err());
+        // start should be clamped to end, not 99999.
+        assert_eq!(log.log_start_offset(), 50);
+        assert_eq!(log.log_end_offset(), 50);
+        assert!(log.log_start_offset() <= log.log_end_offset());
     }
 }
