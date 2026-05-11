@@ -74,6 +74,49 @@ struct SegmentLogInner {
     index_interval: u32,
 }
 
+/// Rename `from` to `to`, replacing `to` if it already exists.
+///
+/// On Unix this delegates to `std::fs::rename` which is atomic.
+/// On Windows we use `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` and
+/// `MOVEFILE_WRITE_THROUGH` so the replace is a single durable syscall
+/// (the standard library's `rename` does **not** overwrite on Windows).
+#[cfg(not(windows))]
+fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    fn to_wide(p: &Path) -> Vec<u16> {
+        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    extern "system" {
+        fn MoveFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            dwFlags: u32,
+        ) -> i32;
+    }
+
+    let from_wide = to_wide(from);
+    let to_wide = to_wide(to);
+
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    let ret = unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), flags) };
+    if ret == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 impl SegmentLog {
     /// Open or create a segment log using the canonical cluster directory
     /// layout: `<base_dir>/data/<cluster_id>/log/`.
@@ -228,7 +271,7 @@ impl SegmentLog {
         }
     }
 
-    /// Persist `log_start_offset` atomically.
+    /// Persist `log_start_offset` durably via write-to-temp + rename.
     fn persist_meta(dir: &Path, log_start_offset: u64) -> io::Result<()> {
         let meta_path = dir.join(LOG_META_FILENAME);
         let tmp_path = dir.join(format!("{LOG_META_FILENAME}.tmp"));
@@ -239,8 +282,12 @@ impl SegmentLog {
         f.sync_all()?;
         drop(f);
 
-        // Atomic rename.
-        std::fs::rename(&tmp_path, &meta_path)?;
+        // Replace-rename: on Unix `rename(2)` is atomic even when the target
+        // exists. On Windows `std::fs::rename` fails with `AlreadyExists` when
+        // the destination is present, so we call `MoveFileExW` with
+        // `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` for a durable,
+        // single-syscall replace.
+        rename_replace(&tmp_path, &meta_path)?;
         Ok(())
     }
 
