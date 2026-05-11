@@ -195,7 +195,7 @@ mod tests {
     fn vote_request_envelope(cluster_id: ClusterId, source: NodeId) -> RpcEnvelope {
         RpcEnvelope {
             cluster_id,
-            leader_epoch: Term(1),
+            leader_epoch: 1,
             source,
             payload: RpcPayload::VoteRequest(VoteRequest {
                 term: Term(2),
@@ -377,11 +377,11 @@ mod tests {
         let (_s2, mut recv_b) = t2.split();
 
         let mut env = vote_request_envelope(cid, n1);
-        env.leader_epoch = Term(999);
+        env.leader_epoch = 999;
 
         sender_a.send(n2, env.clone()).await.unwrap();
         let received = recv_b.recv().await.unwrap();
-        assert_eq!(received.leader_epoch, Term(999));
+        assert_eq!(received.leader_epoch, 999);
     }
 
     #[tokio::test]
