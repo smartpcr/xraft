@@ -1,3 +1,3 @@
-//! xraft-test: test utilities and mock implementations for xraft.
+//! `xraft-test` — Deterministic simulation harness and integration test utilities.
 
-pub mod mocks;
+pub mod test_listener;
