@@ -1,502 +1,553 @@
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use tracing::warn;
-use xraft_core::LogEntry;
+/// A single log entry in the Raft log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogEntry {
+    pub term: u64,
+    pub index: u64,
+    pub data: Vec<u8>,
+}
 
-use crate::segment_index::SegmentIndex;
+/// On-disk format helpers.
+/// Entry wire format: [4-byte big-endian payload length][payload]
+/// Payload: [8-byte term][8-byte index][remaining data bytes]
+const HEADER_LEN: usize = 4;
+const TERM_LEN: usize = 8;
+const INDEX_LEN: usize = 8;
+const ENTRY_META_LEN: usize = TERM_LEN + INDEX_LEN;
 
-/// Record format in a .log file (one record per log entry):
+/// A single segment file that stores a contiguous range of log entries.
 ///
-/// ```text
-/// [4 bytes: CRC-32C of (entry_len bytes + entry_data bytes)]
-/// [4 bytes: entry_len (u32 LE) — length of the serialized LogEntry]
-/// [entry_len bytes: bincode-serialized LogEntry]
-/// ```
-const RECORD_HEADER_SIZE: usize = 8; // 4 (CRC) + 4 (len)
-
-/// A single segment file covering a contiguous range of log offsets.
+/// The file handle is kept open for the lifetime of the `Segment` to avoid
+/// reopening the file on every append (see review feedback on I/O overhead).
 pub struct Segment {
-    /// Base offset — the first offset stored in this segment.
-    base_offset: u64,
-    /// Path to the `.log` file.
-    log_path: PathBuf,
-    /// The next offset to be written (one past the last entry in this segment).
-    next_offset: u64,
-    /// Current file size in bytes.
-    file_size: u64,
-    /// Sparse index for this segment.
-    index: SegmentIndex,
-    /// Maximum segment file size.
-    max_bytes: u64,
+    /// The first log index stored in this segment.
+    pub base_index: u64,
+    /// Number of entries currently in this segment.
+    entry_count: u64,
+    /// On-disk path.
+    path: PathBuf,
+    /// Cached writer — avoids reopening the file on every `append_entry` call.
+    writer: BufWriter<File>,
 }
 
 impl Segment {
-    /// Create a new, empty segment starting at `base_offset`.
-    pub fn create(dir: &Path, base_offset: u64, max_bytes: u64, index_interval: u32) -> io::Result<Self> {
-        let log_path = dir.join(Self::filename(base_offset, "log"));
-        let index_path = dir.join(Self::filename(base_offset, "index"));
-
-        // Create the empty log file.
-        std::fs::File::create(&log_path)?;
-
-        let index = SegmentIndex::new(index_path, index_interval);
-
-        Ok(Self {
-            base_offset,
-            log_path,
-            next_offset: base_offset,
-            file_size: 0,
-            index,
-            max_bytes,
+    /// Create a new, empty segment file starting at `base_index`.
+    pub fn create(dir: &Path, base_index: u64) -> io::Result<Self> {
+        let path = dir.join(format!("segment-{:020}.log", base_index));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(Segment {
+            base_index,
+            entry_count: 0,
+            path,
+            writer: BufWriter::new(file),
         })
     }
 
-    /// Open an existing segment, scanning for valid records.
-    /// Returns the segment with `next_offset` and `file_size` set
-    /// from the scan. Truncates at first corruption.
-    pub fn open(
-        dir: &Path,
-        base_offset: u64,
-        max_bytes: u64,
-        index_interval: u32,
-    ) -> io::Result<Self> {
-        let log_path = dir.join(Self::filename(base_offset, "log"));
-        let index_path = dir.join(Self::filename(base_offset, "index"));
+    /// Open an existing segment file and rebuild in-memory state.
+    /// Truncates any trailing partial record to recover from crashes.
+    pub fn open(path: PathBuf) -> io::Result<Self> {
+        let base_index = parse_base_index(&path)?;
 
-        let mut seg = Self {
-            base_offset,
-            log_path: log_path.clone(),
-            next_offset: base_offset,
-            file_size: 0,
-            index: SegmentIndex::new(index_path, index_interval),
-            max_bytes,
-        };
+        // Scan all valid entries to find count and last valid offset.
+        let (entry_count, valid_len) = scan_entries(&path)?;
 
-        // Recovery scan: read all records, validate CRC, rebuild index.
-        seg.recovery_scan()?;
-
-        Ok(seg)
-    }
-
-    /// Recovery scan: walk forward through the segment, validate CRCs,
-    /// truncate at first corruption, and rebuild the sparse index.
-    fn recovery_scan(&mut self) -> io::Result<()> {
-        let mut file = std::fs::File::open(&self.log_path)?;
-        let file_len = file.metadata()?.len();
-
-        let mut position: u64 = 0;
-        let mut offset = self.base_offset;
-        let mut index_entries: Vec<(u64, u64)> = Vec::new();
-
-        loop {
-            if position + RECORD_HEADER_SIZE as u64 > file_len {
-                // Not enough bytes for even a header — partial write, truncate here.
-                if position < file_len {
-                    warn!(
-                        segment = %self.log_path.display(),
-                        position,
-                        "truncating partial record header at end of segment"
-                    );
-                }
-                break;
-            }
-
-            file.seek(SeekFrom::Start(position))?;
-
-            // Read header.
-            let mut header_buf = [0u8; RECORD_HEADER_SIZE];
-            if file.read_exact(&mut header_buf).is_err() {
-                break;
-            }
-            let stored_crc = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
-            let entry_len = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
-
-            // Sanity check entry_len (guard against corrupt length causing huge alloc).
-            if entry_len == 0 || entry_len > 128 * 1024 * 1024 {
-                warn!(
-                    segment = %self.log_path.display(),
-                    position,
-                    entry_len,
-                    "invalid entry length, truncating"
-                );
-                break;
-            }
-
-            if position + RECORD_HEADER_SIZE as u64 + entry_len as u64 > file_len {
-                warn!(
-                    segment = %self.log_path.display(),
-                    position,
-                    entry_len,
-                    "incomplete record, truncating"
-                );
-                break;
-            }
-
-            // Read entry data.
-            let mut entry_data = vec![0u8; entry_len as usize];
-            if file.read_exact(&mut entry_data).is_err() {
-                break;
-            }
-
-            // Validate CRC: CRC covers (entry_len bytes ++ entry_data).
-            let mut crc_payload = Vec::with_capacity(4 + entry_data.len());
-            crc_payload.extend_from_slice(&entry_len.to_le_bytes());
-            crc_payload.extend_from_slice(&entry_data);
-            let computed_crc = crc32c::crc32c(&crc_payload);
-
-            if computed_crc != stored_crc {
-                warn!(
-                    segment = %self.log_path.display(),
-                    position,
-                    stored_crc,
-                    computed_crc,
-                    "CRC mismatch, truncating at this record"
-                );
-                break;
-            }
-
-            // Deserialize to verify the entry is well-formed.
-            match bincode::deserialize::<LogEntry>(&entry_data) {
-                Ok(entry) => {
-                    if entry.offset != offset {
-                        warn!(
-                            segment = %self.log_path.display(),
-                            position,
-                            expected_offset = offset,
-                            actual_offset = entry.offset,
-                            "offset mismatch in recovered entry, truncating"
-                        );
-                        break;
-                    }
-                    index_entries.push((offset, position));
-                    let record_size = RECORD_HEADER_SIZE as u64 + entry_len as u64;
-                    position += record_size;
-                    offset += 1;
-                }
-                Err(e) => {
-                    warn!(
-                        segment = %self.log_path.display(),
-                        position,
-                        error = %e,
-                        "failed to deserialize entry, truncating"
-                    );
-                    break;
-                }
-            }
-        }
-
-        // Truncate file at the last valid position.
-        if position < file_len {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&self.log_path)?;
-            file.set_len(position)?;
-            file.sync_all()?;
-        }
-
-        self.next_offset = offset;
-        self.file_size = position;
-
-        // Rebuild sparse index.
-        self.index.rebuild_from_entries(&index_entries)?;
-
-        Ok(())
-    }
-
-    /// Append a single entry to this segment. Returns the byte position where
-    /// the record starts.
-    pub fn append_entry(&mut self, entry: &LogEntry) -> io::Result<u64> {
-        let entry_data = bincode::serialize(entry)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let entry_len = entry_data.len() as u32;
-
-        // CRC covers (entry_len ++ entry_data).
-        let mut crc_payload = Vec::with_capacity(4 + entry_data.len());
-        crc_payload.extend_from_slice(&entry_len.to_le_bytes());
-        crc_payload.extend_from_slice(&entry_data);
-        let crc = crc32c::crc32c(&crc_payload);
-
-        let record_start = self.file_size;
-
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)?;
-
-        file.write_all(&crc.to_le_bytes())?;
-        file.write_all(&entry_len.to_le_bytes())?;
-        file.write_all(&entry_data)?;
-
-        let record_size = RECORD_HEADER_SIZE as u64 + entry_len as u64;
-
-        // Update sparse index.
-        self.index.maybe_add(entry.offset, record_start)?;
-
-        self.file_size += record_size;
-        self.next_offset = entry.offset + 1;
-
-        Ok(record_start)
-    }
-
-    /// Fsync the log file.
-    pub fn flush(&self) -> io::Result<()> {
-        let file = std::fs::OpenOptions::new()
+        // Truncate trailing garbage (partial write from a crash).
+        let file_len = fs::metadata(&path)?.len();
+        let mut file = OpenOptions::new()
+            .read(true)
             .write(true)
-            .open(&self.log_path)?;
-        file.sync_all()
+            .open(&path)?;
+        if valid_len < file_len {
+            file.set_len(valid_len)?;
+            file.sync_data()?;
+        }
+
+        // Seek to end so subsequent writes append.
+        file.seek(SeekFrom::End(0))?;
+
+        Ok(Segment {
+            base_index,
+            entry_count,
+            path,
+            writer: BufWriter::new(file),
+        })
     }
 
-    /// Read all entries in the offset range `[start, end)` from this segment.
-    /// Only returns entries whose offsets fall within this segment's range.
-    pub fn read_range(&self, start_offset: u64, end_offset: u64) -> io::Result<Vec<LogEntry>> {
-        let effective_start = start_offset.max(self.base_offset);
-        let effective_end = end_offset.min(self.next_offset);
-
-        if effective_start >= effective_end {
-            return Ok(Vec::new());
-        }
-
-        let mut file = std::fs::File::open(&self.log_path)?;
-
-        // Use the sparse index to find a starting position close to effective_start.
-        let start_pos = match self.index.lookup(effective_start) {
-            Some((indexed_offset, position)) => {
-                // Scan forward from the indexed position.
-                file.seek(SeekFrom::Start(position))?;
-                // Skip records until we reach effective_start.
-                let mut pos = position;
-                let mut current_offset = indexed_offset;
-                while current_offset < effective_start {
-                    let record = Self::read_record_at(&mut file, pos)?;
-                    match record {
-                        Some((_, record_size)) => {
-                            pos += record_size;
-                            current_offset += 1;
-                            file.seek(SeekFrom::Start(pos))?;
-                        }
-                        None => return Ok(Vec::new()),
-                    }
-                }
-                pos
-            }
-            None => {
-                // No index entry; scan from the beginning.
-                let mut pos = 0u64;
-                let mut current_offset = self.base_offset;
-                file.seek(SeekFrom::Start(0))?;
-                while current_offset < effective_start {
-                    let record = Self::read_record_at(&mut file, pos)?;
-                    match record {
-                        Some((_, record_size)) => {
-                            pos += record_size;
-                            current_offset += 1;
-                            file.seek(SeekFrom::Start(pos))?;
-                        }
-                        None => return Ok(Vec::new()),
-                    }
-                }
-                pos
-            }
-        };
-
-        // Now read entries from effective_start to effective_end.
-        let mut entries = Vec::new();
-        let mut pos = start_pos;
-        file.seek(SeekFrom::Start(pos))?;
-
-        for _ in effective_start..effective_end {
-            let record = Self::read_record_at(&mut file, pos)?;
-            match record {
-                Some((entry, record_size)) => {
-                    entries.push(entry);
-                    pos += record_size;
-                    file.seek(SeekFrom::Start(pos))?;
-                }
-                None => break,
-            }
-        }
-
-        Ok(entries)
-    }
-
-    /// Read a single record at the given file position.
-    /// Returns `(LogEntry, record_total_size)` or `None` if at EOF / corrupt.
-    fn read_record_at(file: &mut std::fs::File, _position: u64) -> io::Result<Option<(LogEntry, u64)>> {
-        let mut header_buf = [0u8; RECORD_HEADER_SIZE];
-        match file.read_exact(&mut header_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
-        }
-
-        let stored_crc = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
-        let entry_len = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
-
-        if entry_len == 0 || entry_len > 128 * 1024 * 1024 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid entry length: {entry_len}"),
-            ));
-        }
-
-        let mut entry_data = vec![0u8; entry_len as usize];
-        file.read_exact(&mut entry_data)?;
-
-        // Validate CRC.
-        let mut crc_payload = Vec::with_capacity(4 + entry_data.len());
-        crc_payload.extend_from_slice(&entry_len.to_le_bytes());
-        crc_payload.extend_from_slice(&entry_data);
-        let computed_crc = crc32c::crc32c(&crc_payload);
-
-        if computed_crc != stored_crc {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "CRC mismatch: stored={stored_crc:#x}, computed={computed_crc:#x}"
-                ),
-            ));
-        }
-
-        let entry: LogEntry = bincode::deserialize(&entry_data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        let record_size = RECORD_HEADER_SIZE as u64 + entry_len as u64;
-        Ok(Some((entry, record_size)))
-    }
-
-    /// Find the byte position where the record for `target_offset` begins.
-    /// Scans from the nearest index entry.
-    pub fn find_position(&self, target_offset: u64) -> io::Result<Option<u64>> {
-        if target_offset < self.base_offset || target_offset >= self.next_offset {
-            return Ok(None);
-        }
-
-        let mut file = std::fs::File::open(&self.log_path)?;
-
-        let (start_scan_offset, start_pos) = match self.index.lookup(target_offset) {
-            Some((indexed_offset, position)) => (indexed_offset, position),
-            None => (self.base_offset, 0),
-        };
-
-        let mut pos = start_pos;
-        let mut current_offset = start_scan_offset;
-        file.seek(SeekFrom::Start(pos))?;
-
-        while current_offset < target_offset {
-            let record = Self::read_record_at(&mut file, pos)?;
-            match record {
-                Some((_, record_size)) => {
-                    pos += record_size;
-                    current_offset += 1;
-                    file.seek(SeekFrom::Start(pos))?;
-                }
-                None => return Ok(None),
-            }
-        }
-
-        Ok(Some(pos))
-    }
-
-    /// Truncate all records at and after `from_offset`.
-    pub fn truncate_at(&mut self, from_offset: u64) -> io::Result<()> {
-        if from_offset >= self.next_offset {
-            return Ok(());
-        }
-
-        if from_offset <= self.base_offset {
-            // Truncate entire segment content.
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&self.log_path)?;
-            file.set_len(0)?;
-            file.sync_all()?;
-            self.next_offset = self.base_offset;
-            self.file_size = 0;
-            self.index.truncate_from(self.base_offset)?;
-            return Ok(());
-        }
-
-        // Find byte position of from_offset.
-        let pos = self.find_position(from_offset)?;
-        match pos {
-            Some(truncate_pos) => {
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&self.log_path)?;
-                file.set_len(truncate_pos)?;
-                file.sync_all()?;
-                self.file_size = truncate_pos;
-                self.next_offset = from_offset;
-                self.index.truncate_from(from_offset)?;
-            }
-            None => {
-                // This shouldn't happen for valid from_offset in range.
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("could not find position for offset {from_offset}"),
-                ));
-            }
-        }
-
+    /// Append a single entry. The caller is responsible for ensuring indices
+    /// are contiguous.
+    pub fn append_entry(&mut self, entry: &LogEntry) -> io::Result<()> {
+        let payload_len = ENTRY_META_LEN + entry.data.len();
+        self.writer
+            .write_all(&(payload_len as u32).to_be_bytes())?;
+        self.writer.write_all(&entry.term.to_be_bytes())?;
+        self.writer.write_all(&entry.index.to_be_bytes())?;
+        self.writer.write_all(&entry.data)?;
+        self.entry_count += 1;
         Ok(())
     }
 
-    /// Remove this segment's log and index files from disk.
-    pub fn remove(self) -> io::Result<()> {
-        if self.log_path.exists() {
-            remove_file_with_retry(&self.log_path)?;
-        }
-        self.index.remove()?;
-        Ok(())
+    /// Flush user-space buffers and fsync to disk.
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.writer.flush()?;
+        self.writer.get_mut().sync_data()
     }
 
-    /// Zero-padded filename for a segment file.
-    pub fn filename(base_offset: u64, ext: &str) -> String {
-        format!("{:020}.{ext}", base_offset)
+    /// The next index that would be appended to this segment.
+    pub fn next_index(&self) -> u64 {
+        self.base_index + self.entry_count
     }
 
-    // Accessors
-
-    pub fn base_offset(&self) -> u64 {
-        self.base_offset
-    }
-
-    pub fn next_offset(&self) -> u64 {
-        self.next_offset
-    }
-
-    pub fn file_size(&self) -> u64 {
-        self.file_size
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.file_size >= self.max_bytes
+    /// Number of entries in this segment.
+    pub fn len(&self) -> u64 {
+        self.entry_count
     }
 
     pub fn is_empty(&self) -> bool {
-        self.next_offset == self.base_offset
+        self.entry_count == 0
     }
 
-    pub fn log_path(&self) -> &Path {
-        &self.log_path
+    /// Read all entries from this segment.
+    pub fn read_entries(&mut self) -> io::Result<Vec<LogEntry>> {
+        // Flush so any buffered appends are visible to the reader.
+        self.writer.flush()?;
+
+        let file = File::open(&self.path)?;
+        let mut reader = BufReader::new(file);
+        let mut entries = Vec::new();
+        loop {
+            match read_one_entry(&mut reader) {
+                Ok(entry) => entries.push(entry),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Read a single entry by its absolute log index.
+    pub fn read_entry(&mut self, index: u64) -> io::Result<Option<LogEntry>> {
+        if index < self.base_index || index >= self.next_index() {
+            return Ok(None);
+        }
+        // Flush buffered writes so the reader can see them.
+        self.writer.flush()?;
+
+        let target_offset = index - self.base_index;
+        let file = File::open(&self.path)?;
+        let mut reader = BufReader::new(file);
+        for _ in 0..target_offset {
+            skip_one_entry(&mut reader)?;
+        }
+        read_one_entry(&mut reader).map(Some)
+    }
+
+    /// Truncate this segment so that it retains only entries with index < `from_index`.
+    /// Returns the number of entries removed.
+    pub fn truncate_from(&mut self, from_index: u64) -> io::Result<u64> {
+        if from_index >= self.next_index() {
+            return Ok(0);
+        }
+        let keep = if from_index <= self.base_index {
+            0
+        } else {
+            from_index - self.base_index
+        };
+
+        // Flush before truncating so buffered data lands on disk first.
+        self.writer.flush()?;
+
+        // Find the byte offset after the last kept entry.
+        let new_len = if keep == 0 {
+            0
+        } else {
+            let file = File::open(&self.path)?;
+            let mut reader = BufReader::new(file);
+            let mut offset: u64 = 0;
+            for _ in 0..keep {
+                let payload_len = read_u32_be(&mut reader)? as u64;
+                let entry_len = HEADER_LEN as u64 + payload_len;
+                reader.seek(SeekFrom::Current(payload_len as i64))?;
+                offset += entry_len;
+            }
+            offset
+        };
+
+        let removed = self.entry_count - keep;
+        let file = self.writer.get_mut();
+        file.set_len(new_len)?;
+        file.seek(SeekFrom::Start(new_len))?;
+        file.sync_data()?;
+        self.entry_count = keep;
+        Ok(removed)
+    }
+
+    /// Path to the underlying segment file.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 
-/// Remove a file with retries on Windows to handle delayed handle release
-/// (antivirus scanners, search indexer, lazy close, etc.).
-fn remove_file_with_retry(path: &Path) -> io::Result<()> {
-    let max_attempts = 20;
-    let mut last_err = None;
-    for attempt in 0..max_attempts {
-        match std::fs::remove_file(path) {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied && attempt < max_attempts - 1 => {
-                last_err = Some(e);
-                std::thread::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)));
+impl Drop for Segment {
+    fn drop(&mut self) {
+        // Best-effort flush; callers should use `sync()` for durability.
+        let _ = self.writer.flush();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SegmentLog — manages an ordered collection of Segments
+// ---------------------------------------------------------------------------
+
+/// A segmented append-only log composed of multiple `Segment` files.
+pub struct SegmentLog {
+    dir: PathBuf,
+    segments: Vec<Segment>,
+    /// Maximum entries per segment before rolling to a new one.
+    max_segment_entries: u64,
+}
+
+impl SegmentLog {
+    /// Open or create a segment log in `dir`.
+    pub fn open(dir: &Path, max_segment_entries: u64) -> io::Result<Self> {
+        fs::create_dir_all(dir)?;
+
+        let mut seg_paths: Vec<PathBuf> = fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().map_or(false, |ext| ext == "log")
+                    && p.file_name()
+                        .map_or(false, |n| n.to_string_lossy().starts_with("segment-"))
+            })
+            .collect();
+        seg_paths.sort();
+
+        let mut segments = Vec::new();
+        for p in seg_paths {
+            segments.push(Segment::open(p)?);
+        }
+
+        Ok(SegmentLog {
+            dir: dir.to_path_buf(),
+            segments,
+            max_segment_entries,
+        })
+    }
+
+    /// Append a batch of entries to the log.
+    pub fn append(&mut self, entries: &[LogEntry]) -> io::Result<()> {
+        for entry in entries {
+            // Roll to a new segment if the active one is full.
+            if self.needs_roll() {
+                let base = self.next_index();
+                let seg = Segment::create(&self.dir, base)?;
+                self.segments.push(seg);
             }
-            Err(e) => return Err(e),
+            let seg = self
+                .segments
+                .last_mut()
+                .expect("segment must exist after roll check");
+            seg.append_entry(entry)?;
+        }
+        // Flush the active segment after the batch.
+        if let Some(seg) = self.segments.last_mut() {
+            seg.sync()?;
+        }
+        Ok(())
+    }
+
+    /// Read a single entry by absolute log index.
+    pub fn read_entry(&mut self, index: u64) -> io::Result<Option<LogEntry>> {
+        let seg = match self.segment_for_index_mut(index) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        seg.read_entry(index)
+    }
+
+    /// Read entries in the range `[from, to)`.
+    pub fn read_entries(&mut self, from: u64, to: u64) -> io::Result<Vec<LogEntry>> {
+        let mut result = Vec::new();
+        for idx in from..to {
+            match self.read_entry(idx)? {
+                Some(e) => result.push(e),
+                None => break,
+            }
+        }
+        Ok(result)
+    }
+
+    /// Truncate all entries with index >= `from_index`.
+    pub fn truncate_from(&mut self, from_index: u64) -> io::Result<()> {
+        // Remove segments that are entirely past from_index.
+        while let Some(seg) = self.segments.last() {
+            if seg.base_index >= from_index {
+                let path = seg.path().to_path_buf();
+                self.segments.pop();
+                // Drop the segment (closes handle) before removing file.
+                fs::remove_file(&path)?;
+            } else {
+                break;
+            }
+        }
+        // Truncate the remaining active segment if it partially overlaps.
+        if let Some(seg) = self.segments.last_mut() {
+            seg.truncate_from(from_index)?;
+        }
+        Ok(())
+    }
+
+    /// The next log index that would be appended.
+    pub fn next_index(&self) -> u64 {
+        self.segments
+            .last()
+            .map_or(0, |s| s.next_index())
+    }
+
+    /// The first log index in the log, or `None` if empty.
+    pub fn first_index(&self) -> Option<u64> {
+        self.segments.first().map(|s| s.base_index)
+    }
+
+    /// Sync all segments to disk.
+    pub fn sync(&mut self) -> io::Result<()> {
+        for seg in &mut self.segments {
+            seg.sync()?;
+        }
+        Ok(())
+    }
+
+    // -- private helpers --
+
+    fn needs_roll(&self) -> bool {
+        match self.segments.last() {
+            None => true,
+            Some(seg) => seg.len() >= self.max_segment_entries,
         }
     }
-    Err(last_err.unwrap())
+
+    fn segment_for_index_mut(&mut self, index: u64) -> Option<&mut Segment> {
+        self.segments.iter_mut().rev().find(|s| index >= s.base_index && index < s.next_index())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire-format helpers
+// ---------------------------------------------------------------------------
+
+fn read_u32_be(r: &mut impl Read) -> io::Result<u32> {
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    Ok(u32::from_be_bytes(buf))
+}
+
+fn read_u64_be(r: &mut impl Read) -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    Ok(u64::from_be_bytes(buf))
+}
+
+fn read_one_entry(r: &mut (impl Read + Seek)) -> io::Result<LogEntry> {
+    let payload_len = read_u32_be(r)? as usize;
+    if payload_len < ENTRY_META_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "entry payload too short",
+        ));
+    }
+    let term = read_u64_be(r)?;
+    let index = read_u64_be(r)?;
+    let data_len = payload_len - ENTRY_META_LEN;
+    let mut data = vec![0u8; data_len];
+    r.read_exact(&mut data)?;
+    Ok(LogEntry { term, index, data })
+}
+
+fn skip_one_entry(r: &mut (impl Read + Seek)) -> io::Result<()> {
+    let payload_len = read_u32_be(r)? as u64;
+    r.seek(SeekFrom::Current(payload_len as i64))?;
+    Ok(())
+}
+
+/// Scan a segment file, returning (valid_entry_count, valid_byte_length).
+/// Used on open to detect and recover from partial trailing writes.
+fn scan_entries(path: &Path) -> io::Result<(u64, u64)> {
+    let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    let mut count: u64 = 0;
+    let mut valid_end: u64 = 0;
+
+    loop {
+        if valid_end >= file_len {
+            break;
+        }
+        let start = valid_end;
+        match read_u32_be(&mut reader) {
+            Ok(payload_len) => {
+                let entry_end = start + HEADER_LEN as u64 + payload_len as u64;
+                if entry_end > file_len {
+                    // Partial record — stop here.
+                    break;
+                }
+                if (payload_len as usize) < ENTRY_META_LEN {
+                    break;
+                }
+                if let Err(_) = reader.seek(SeekFrom::Current(payload_len as i64)) {
+                    break;
+                }
+                count += 1;
+                valid_end = entry_end;
+            }
+            Err(_) => break,
+        }
+    }
+    Ok((count, valid_end))
+}
+
+fn parse_base_index(path: &Path) -> io::Result<u64> {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad segment filename"))?;
+    let idx_str = stem
+        .strip_prefix("segment-")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing segment- prefix"))?;
+    idx_str
+        .parse::<u64>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xraft-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn make_entry(term: u64, index: u64, data: &[u8]) -> LogEntry {
+        LogEntry {
+            term,
+            index,
+            data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn test_segment_append_and_read() {
+        let dir = tmp_dir();
+        let mut seg = Segment::create(&dir, 1).unwrap();
+        let e1 = make_entry(1, 1, b"hello");
+        let e2 = make_entry(1, 2, b"world");
+        seg.append_entry(&e1).unwrap();
+        seg.append_entry(&e2).unwrap();
+        seg.sync().unwrap();
+
+        assert_eq!(seg.len(), 2);
+        assert_eq!(seg.next_index(), 3);
+
+        let entries = seg.read_entries().unwrap();
+        assert_eq!(entries, vec![e1.clone(), e2.clone()]);
+
+        assert_eq!(seg.read_entry(1).unwrap(), Some(e1));
+        assert_eq!(seg.read_entry(2).unwrap(), Some(e2));
+        assert_eq!(seg.read_entry(3).unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_segment_truncate() {
+        let dir = tmp_dir();
+        let mut seg = Segment::create(&dir, 1).unwrap();
+        for i in 1..=5 {
+            seg.append_entry(&make_entry(1, i, b"x")).unwrap();
+        }
+        seg.sync().unwrap();
+
+        seg.truncate_from(3).unwrap();
+        assert_eq!(seg.len(), 2);
+        assert_eq!(seg.next_index(), 3);
+        let entries = seg.read_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].index, 1);
+        assert_eq!(entries[1].index, 2);
+
+        // Can append after truncation.
+        seg.append_entry(&make_entry(2, 3, b"new")).unwrap();
+        seg.sync().unwrap();
+        assert_eq!(seg.len(), 3);
+        let e = seg.read_entry(3).unwrap().unwrap();
+        assert_eq!(e.term, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_segment_log_batch_append() {
+        let dir = tmp_dir();
+        let mut log = SegmentLog::open(&dir, 3).unwrap();
+        let entries: Vec<LogEntry> = (0..7)
+            .map(|i| make_entry(1, i, format!("data-{}", i).as_bytes()))
+            .collect();
+        log.append(&entries).unwrap();
+
+        assert_eq!(log.segments.len(), 3); // 3 + 3 + 1
+        for i in 0..7u64 {
+            let e = log.read_entry(i).unwrap().unwrap();
+            assert_eq!(e.index, i);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_segment_log_truncate() {
+        let dir = tmp_dir();
+        let mut log = SegmentLog::open(&dir, 3).unwrap();
+        let entries: Vec<LogEntry> = (0..7)
+            .map(|i| make_entry(1, i, b"d"))
+            .collect();
+        log.append(&entries).unwrap();
+
+        log.truncate_from(4).unwrap();
+        assert_eq!(log.next_index(), 4);
+        assert!(log.read_entry(4).unwrap().is_none());
+        assert!(log.read_entry(3).unwrap().is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_segment_reopen_recovers() {
+        let dir = tmp_dir();
+        let path;
+        {
+            let mut seg = Segment::create(&dir, 10).unwrap();
+            seg.append_entry(&make_entry(1, 10, b"a")).unwrap();
+            seg.append_entry(&make_entry(1, 11, b"b")).unwrap();
+            seg.sync().unwrap();
+            path = seg.path().to_path_buf();
+        }
+        // Append some garbage bytes to simulate a partial write.
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[0xFF, 0x00, 0x01]).unwrap();
+        }
+
+        let mut seg = Segment::open(path).unwrap();
+        assert_eq!(seg.len(), 2);
+        let entries = seg.read_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].index, 10);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
