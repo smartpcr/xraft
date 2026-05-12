@@ -1,17 +1,20 @@
 use std::io;
 
-use crate::membership::NodeId;
+use crate::types::NodeId;
 
-/// Unified error type for all xraft public APIs.
-#[derive(Debug)]
+/// Public error type for all xraft operations.
+#[derive(Debug, thiserror::Error)]
 pub enum XraftError {
     /// Log, snapshot, or quorum-state I/O failure.
     #[error("storage error: {0}")]
     StorageError(#[from] io::Error),
 
     /// Network send/recv failure.
-    TransportError(io::Error),
-    /// `propose()` called on a non-leader node.
+    #[error("transport error: {reason}")]
+    TransportError { reason: String },
+
+    /// propose() called on a non-leader node.
+    #[error("not leader, current leader: {leader_id:?}")]
     NotLeader { leader_id: Option<NodeId> },
 
     /// BatchAccumulator back-pressure limit reached.
@@ -26,27 +29,23 @@ pub enum XraftError {
     #[error("node is shutting down")]
     Shutdown,
 
-impl fmt::Display for XraftError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            XraftError::StorageError(e) => write!(f, "storage error: {e}"),
-            XraftError::TransportError(e) => write!(f, "transport error: {e}"),
-            XraftError::NotLeader { leader_id: Some(id) } => {
-                write!(f, "not leader; current leader is node {id}")
-            }
-            XraftError::NotLeader { leader_id: None } => {
-                write!(f, "not leader; leader unknown")
-            }
-            XraftError::ProposalQueueFull => write!(f, "proposal queue full"),
-            XraftError::InvalidClusterId => write!(f, "invalid cluster id"),
-            XraftError::Shutdown => write!(f, "node is shutting down"),
-        }
-    }
-}
+    /// Bootstrap rejected: node already initialised.
+    #[error("already bootstrapped: {reason}")]
+    AlreadyBootstrapped { reason: String },
 
     /// Bootstrap input validation failure.
     #[error("invalid bootstrap configuration: {reason}")]
     InvalidBootstrapConfig { reason: String },
 
-/// Convenience alias used throughout xraft.
-pub type Result<T> = std::result::Result<T, XraftError>;
+    /// Configuration validation failure.
+    #[error("invalid configuration: {reason}")]
+    InvalidConfig { reason: String },
+
+    /// Recovery not yet implemented (placeholder for Stage 6.1).
+    #[error("crash recovery required but not yet implemented")]
+    RecoveryRequired,
+
+    /// Election attempted from an invalid role.
+    #[error("invalid election state: {reason}")]
+    InvalidElectionState { reason: String },
+}

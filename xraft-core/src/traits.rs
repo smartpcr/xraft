@@ -3,27 +3,31 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::error::Result;
-use crate::rpc::RpcEnvelope;
-use crate::types::NodeId;
+use crate::log_entry::LogEntry;
+use crate::quorum_state::QuorumState;
+use crate::rpc::{RpcEnvelope, SnapshotId};
+use crate::snapshot::{Snapshot, SnapshotWriter};
+use crate::app_record::{AppRecord, AppSnapshot};
 
-/// Outbound RPC transport — sends messages to peers.
-///
-/// Takes `&self` (shared reference) because the `IoStage` may send to
-/// multiple peers concurrently via `tokio::join!`.
+/// Append-only replicated log storage.
+/// All methods take `&self` with interior mutability and require `Sync`.
 #[async_trait]
-pub trait TransportSender: Send + Sync + 'static {
-    async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<()>;
+pub trait LogStore: Send + Sync + 'static {
+    async fn append(&self, entries: &[LogEntry]) -> std::io::Result<()>;
+    async fn read(&self, start_offset: u64, end_offset: u64) -> std::io::Result<Vec<LogEntry>>;
+    async fn truncate_suffix(&self, from_offset: u64) -> std::io::Result<()>;
+    async fn truncate_prefix(&self, up_to_offset: u64) -> std::io::Result<()>;
+    fn log_start_offset(&self) -> u64;
+    fn log_end_offset(&self) -> u64;
+    async fn entry_at(&self, offset: u64) -> std::io::Result<Option<LogEntry>>;
 }
 
-/// Inbound RPC transport — receives messages from the network.
-///
-/// Takes `&mut self` (exclusive access) because only the `ReceiverTask`
-/// reads from the network. Does NOT require `Sync`.
+/// Persists voting state separately from the log.
 #[async_trait]
 pub trait QuorumStateStore: Send + Sync + 'static {
-    async fn load(&self) -> Result<Option<crate::quorum_state::QuorumState>>;
-    async fn save(&self, state: &crate::quorum_state::QuorumState) -> Result<()>;
+    /// Returns `None` when no quorum-state file exists (fresh node).
+    async fn load(&self) -> std::io::Result<Option<QuorumState>>;
+    async fn save(&self, state: &QuorumState) -> std::io::Result<()>;
 }
 
 /// Manages snapshot files on disk.

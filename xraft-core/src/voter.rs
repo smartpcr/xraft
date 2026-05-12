@@ -3,14 +3,14 @@ use std::net::SocketAddr;
 
 use crate::types::NodeId;
 
-/// Network-addressable voter identity.
+/// Information about a single voter in the cluster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoterInfo {
     pub node_id: NodeId,
     pub endpoint: SocketAddr,
 }
 
-/// Complete voter set — committed via the log as a control record.
+/// Complete voter set record, committed via the log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VotersRecord {
     pub version: u32,
