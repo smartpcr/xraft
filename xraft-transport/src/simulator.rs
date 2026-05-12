@@ -9,7 +9,6 @@ use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-use xraft_core::error::XraftError;
 use xraft_core::rpc::RpcEnvelope;
 use xraft_core::traits::{TransportReceiver, TransportSender};
 use xraft_core::types::NodeId;
@@ -276,7 +275,7 @@ async fn apply_faults_and_deliver(
     from: NodeId,
     to: NodeId,
     message: RpcEnvelope,
-) -> Result<(), XraftError> {
+) -> io::Result<()> {
     let (is_partitioned, drop_prob, delay_range) = {
         let s = state.read().await;
         let link = (from, to);
@@ -309,22 +308,22 @@ async fn apply_faults_and_deliver(
                 let mut s = state.write().await;
                 s.rng.gen_range(min_d.as_nanos()..=max_d.as_nanos())
             };
-            Duration::from_nanos(nanos as u64)
+            Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
         };
         tokio::time::sleep(delay).await;
     }
 
     let tx = inboxes.get(&to).ok_or_else(|| {
-        XraftError::TransportError(io::Error::new(
+        io::Error::new(
             io::ErrorKind::NotFound,
             format!("no channel for target node {to}"),
-        ))
+        )
     })?;
     tx.send(message).await.map_err(|_| {
-        XraftError::TransportError(io::Error::new(
+        io::Error::new(
             io::ErrorKind::ConnectionReset,
             format!("channel closed for target node {to}"),
-        ))
+        )
     })
 }
 
@@ -338,7 +337,7 @@ pub struct SimulatorSender {
 
 #[async_trait]
 impl TransportSender for SimulatorSender {
-    async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<(), XraftError> {
+    async fn send(&self, target: NodeId, message: RpcEnvelope) -> io::Result<()> {
         // Snapshot fault rules under lock, then release before any async work.
         let (is_partitioned, drop_prob, delay_range, reorder) = {
             let state = self.state.read().await;
@@ -389,23 +388,23 @@ impl TransportSender for SimulatorSender {
                     let mut state = self.state.write().await;
                     state.rng.gen_range(min_d.as_nanos()..=max_d.as_nanos())
                 };
-                Duration::from_nanos(nanos as u64)
+                Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
             };
             tokio::time::sleep(delay).await;
         }
 
         // 5. Deliver to target's inbox
         let tx = self.inboxes.get(&target).ok_or_else(|| {
-            XraftError::TransportError(io::Error::new(
+            io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("no channel for target node {target}"),
-            ))
+            )
         })?;
         tx.send(message).await.map_err(|_| {
-            XraftError::TransportError(io::Error::new(
+            io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 format!("channel closed for target node {target}"),
-            ))
+            )
         })
     }
 }
@@ -418,13 +417,10 @@ pub struct SimulatorReceiver {
 
 #[async_trait]
 impl TransportReceiver for SimulatorReceiver {
-    async fn recv(&mut self) -> Result<RpcEnvelope, XraftError> {
+    async fn recv(&mut self) -> io::Result<RpcEnvelope> {
         let mut rx = self.rx.lock().await;
         rx.recv().await.ok_or_else(|| {
-            XraftError::TransportError(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "all senders dropped",
-            ))
+            io::Error::new(io::ErrorKind::ConnectionReset, "all senders dropped")
         })
     }
 }

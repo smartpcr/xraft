@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::net::SocketAddr;
 
-/// Unique numeric identifier for a node within a cluster.
+/// Unique numeric identifier for a node within the cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
 
@@ -29,16 +29,6 @@ impl fmt::Display for Term {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClusterId(pub uuid::Uuid);
 
-impl fmt::Display for ClusterId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ClusterId({})", self.0)
-    }
-}
-
-/// Cluster identity for RPC fencing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ClusterId(pub uuid::Uuid);
-
 impl ClusterId {
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4())
@@ -51,16 +41,18 @@ impl Default for ClusterId {
     }
 }
 
-/// Log position (0-indexed).
+impl fmt::Display for ClusterId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Position in the log (0-indexed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Offset(pub u64);
 
-/// Cluster identity for RPC fencing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ClusterId(pub u64);
-
-impl fmt::Display for NodeId {
+impl fmt::Display for Offset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "@{}", self.0)
     }
 }

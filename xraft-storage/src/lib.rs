@@ -1,1 +1,1 @@
-// xraft-storage: stub — implemented in a separate workstream.
+//! xraft-storage: durable log and snapshot storage.

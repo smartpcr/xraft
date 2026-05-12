@@ -2,21 +2,7 @@
 name = "xraft-storage"
 edition.workspace = true
 version.workspace = true
-
-[lints]
-workspace = true
-
-[lints]
-workspace = true
-
-[dependencies]
-xraft-core = { path = "../xraft-core" }
-
-[lints]
-workspace = true
-
-[dependencies]
-xraft-core = { path = "../xraft-core" }
+license.workspace = true
 
 [lints]
 workspace = true
