@@ -1,553 +1,546 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// A single log entry in the Raft log.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LogEntry {
-    pub term: u64,
-    pub index: u64,
+use xraft_core::log_entry::LogEntry;
+
+use crate::segment_index::SparseIndex;
+
+/// On-disk batch layout:
+///   batch_len:    u32 — byte count after this field (crc + payload)
+///   crc32c:       u32 — checksum over payload (num_entries + entry frames)
+///   num_entries:  u32 — number of entries in this batch
+///   entry frames: [entry_len: u32, entry_data: [u8]] × num_entries
+///
+/// CRC covers the entire payload (num_entries field + all entry frames),
+/// providing per-batch integrity validation.
+const BATCH_HEADER_LEN: u64 = 4 + 4 + 4; // batch_len + crc + num_entries
+const MAX_BATCH_DATA: u32 = 64 * 1024 * 1024; // 64 MiB sanity cap
+
+/// Formats a base offset into the canonical zero-padded 20-digit filename.
+pub fn segment_filename(base_offset: u64) -> String {
+    format!("{:020}", base_offset)
+}
+
+/// A pre-serialized log entry ready for batch writing.
+pub struct SerializedEntry {
+    /// bincode-serialized bytes of the LogEntry.
     pub data: Vec<u8>,
 }
 
-/// On-disk format helpers.
-/// Entry wire format: [4-byte big-endian payload length][payload]
-/// Payload: [8-byte term][8-byte index][remaining data bytes]
-const HEADER_LEN: usize = 4;
-const TERM_LEN: usize = 8;
-const INDEX_LEN: usize = 8;
-const ENTRY_META_LEN: usize = TERM_LEN + INDEX_LEN;
+impl SerializedEntry {
+    /// Serialize a LogEntry to its on-disk representation.
+    pub fn from_entry(entry: &LogEntry) -> io::Result<Self> {
+        let data = bincode::serialize(entry).map_err(io::Error::other)?;
+        Ok(Self { data })
+    }
 
-/// A single segment file that stores a contiguous range of log entries.
-///
-/// The file handle is kept open for the lifetime of the `Segment` to avoid
-/// reopening the file on every append (see review feedback on I/O overhead).
+    /// Size of one entry frame on disk: entry_len (u32) + data bytes.
+    pub fn frame_size(&self) -> u64 {
+        4 + self.data.len() as u64
+    }
+}
+
+/// Total on-disk bytes for a batch of serialized entries.
+pub fn batch_disk_size(entries: &[SerializedEntry]) -> u64 {
+    // batch_len(4) + crc(4) + num_entries(4) + Σ(entry_len(4) + data)
+    let frames: u64 = entries.iter().map(|e| e.frame_size()).sum();
+    12 + frames
+}
+
+/// A single append-only log segment backed by a `.log` file on disk.
 pub struct Segment {
-    /// The first log index stored in this segment.
-    pub base_index: u64,
-    /// Number of entries currently in this segment.
-    entry_count: u64,
-    /// On-disk path.
+    base_offset: u64,
+    next_offset: u64,
+    file_size: u64,
+    file: File,
+    #[allow(dead_code)]
     path: PathBuf,
-    /// Cached writer — avoids reopening the file on every `append_entry` call.
-    writer: BufWriter<File>,
+    index: SparseIndex,
 }
 
 impl Segment {
-    /// Create a new, empty segment file starting at `base_index`.
-    pub fn create(dir: &Path, base_index: u64) -> io::Result<Self> {
-        let path = dir.join(format!("segment-{:020}.log", base_index));
+    /// Create a brand-new, empty segment.
+    pub fn create(dir: &Path, base_offset: u64, index_interval: u32) -> io::Result<Self> {
+        let stem = segment_filename(base_offset);
+        let log_path = dir.join(format!("{stem}.log"));
+        let idx_path = dir.join(format!("{stem}.index"));
+
         let file = OpenOptions::new()
+            .create_new(true)
             .read(true)
             .write(true)
-            .create_new(true)
-            .open(&path)?;
-        Ok(Segment {
-            base_index,
-            entry_count: 0,
-            path,
-            writer: BufWriter::new(file),
+            .open(&log_path)?;
+
+        let index = SparseIndex::create(&idx_path, index_interval)?;
+
+        Ok(Self {
+            base_offset,
+            next_offset: base_offset,
+            file_size: 0,
+            file,
+            path: log_path,
+            index,
         })
     }
 
-    /// Open an existing segment file and rebuild in-memory state.
-    /// Truncates any trailing partial record to recover from crashes.
-    pub fn open(path: PathBuf) -> io::Result<Self> {
-        let base_index = parse_base_index(&path)?;
+    /// Open an existing segment, scanning the log to rebuild in-memory state.
+    pub fn open(dir: &Path, base_offset: u64, index_interval: u32) -> io::Result<Self> {
+        let stem = segment_filename(base_offset);
+        let log_path = dir.join(format!("{stem}.log"));
+        let idx_path = dir.join(format!("{stem}.index"));
 
-        // Scan all valid entries to find count and last valid offset.
-        let (entry_count, valid_len) = scan_entries(&path)?;
-
-        // Truncate trailing garbage (partial write from a crash).
-        let file_len = fs::metadata(&path)?.len();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&path)?;
-        if valid_len < file_len {
-            file.set_len(valid_len)?;
-            file.sync_data()?;
-        }
+            .open(&log_path)?;
 
-        // Seek to end so subsequent writes append.
-        file.seek(SeekFrom::End(0))?;
+        let (next_offset, file_size, index) =
+            Self::recover_scan(&mut file, base_offset, &idx_path, index_interval)?;
 
-        Ok(Segment {
-            base_index,
-            entry_count,
-            path,
-            writer: BufWriter::new(file),
+        Ok(Self {
+            base_offset,
+            next_offset,
+            file_size,
+            file,
+            path: log_path,
+            index,
         })
     }
 
-    /// Append a single entry. The caller is responsible for ensuring indices
-    /// are contiguous.
-    pub fn append_entry(&mut self, entry: &LogEntry) -> io::Result<()> {
-        let payload_len = ENTRY_META_LEN + entry.data.len();
-        self.writer
-            .write_all(&(payload_len as u32).to_be_bytes())?;
-        self.writer.write_all(&entry.term.to_be_bytes())?;
-        self.writer.write_all(&entry.index.to_be_bytes())?;
-        self.writer.write_all(&entry.data)?;
-        self.entry_count += 1;
-        Ok(())
-    }
+    /// Scan forward batch-by-batch, validating CRCs.
+    /// Truncates any trailing partial/corrupt batches (recovery).
+    fn recover_scan(
+        file: &mut File,
+        base_offset: u64,
+        idx_path: &Path,
+        index_interval: u32,
+    ) -> io::Result<(u64, u64, SparseIndex)> {
+        let total_len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(0))?;
 
-    /// Flush user-space buffers and fsync to disk.
-    pub fn sync(&mut self) -> io::Result<()> {
-        self.writer.flush()?;
-        self.writer.get_mut().sync_data()
-    }
+        let mut index = SparseIndex::create_or_truncate(idx_path, index_interval)?;
+        let mut pos: u64 = 0;
+        let mut next_offset = base_offset;
 
-    /// The next index that would be appended to this segment.
-    pub fn next_index(&self) -> u64 {
-        self.base_index + self.entry_count
-    }
-
-    /// Number of entries in this segment.
-    pub fn len(&self) -> u64 {
-        self.entry_count
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entry_count == 0
-    }
-
-    /// Read all entries from this segment.
-    pub fn read_entries(&mut self) -> io::Result<Vec<LogEntry>> {
-        // Flush so any buffered appends are visible to the reader.
-        self.writer.flush()?;
-
-        let file = File::open(&self.path)?;
-        let mut reader = BufReader::new(file);
-        let mut entries = Vec::new();
         loop {
-            match read_one_entry(&mut reader) {
-                Ok(entry) => entries.push(entry),
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
+            if total_len.saturating_sub(pos) < BATCH_HEADER_LEN {
+                break;
+            }
+
+            let mut len_buf = [0u8; 4];
+            if file.read_exact(&mut len_buf).is_err() {
+                break;
+            }
+            let batch_len = u32::from_le_bytes(len_buf);
+
+            // batch_len must cover at least crc(4) + num_entries(4) = 8
+            if !(8..=MAX_BATCH_DATA).contains(&batch_len) {
+                break;
+            }
+            if total_len.saturating_sub(pos + 4) < u64::from(batch_len) {
+                break;
+            }
+
+            let mut batch_data = vec![0u8; batch_len as usize];
+            if file.read_exact(&mut batch_data).is_err() {
+                break;
+            }
+
+            // Validate CRC over payload (everything after the crc field)
+            let stored_crc = u32::from_le_bytes([
+                batch_data[0], batch_data[1], batch_data[2], batch_data[3],
+            ]);
+            let payload = &batch_data[4..];
+            let computed_crc = crc32c::crc32c(payload);
+            if stored_crc != computed_crc {
+                break;
+            }
+
+            // Parse num_entries
+            if payload.len() < 4 {
+                break;
+            }
+            let num_entries = u32::from_le_bytes([
+                payload[0], payload[1], payload[2], payload[3],
+            ]);
+
+            // Walk entry frames to validate deserialization
+            let mut entry_pos = 4usize;
+            let mut batch_valid = true;
+            for _ in 0..num_entries {
+                if entry_pos + 4 > payload.len() {
+                    batch_valid = false;
+                    break;
+                }
+                let entry_len = u32::from_le_bytes([
+                    payload[entry_pos],
+                    payload[entry_pos + 1],
+                    payload[entry_pos + 2],
+                    payload[entry_pos + 3],
+                ]) as usize;
+                entry_pos += 4;
+                if entry_pos + entry_len > payload.len() {
+                    batch_valid = false;
+                    break;
+                }
+                let _: LogEntry = match bincode::deserialize(
+                    &payload[entry_pos..entry_pos + entry_len],
+                ) {
+                    Ok(e) => e,
+                    Err(_) => {
+                        batch_valid = false;
+                        break;
+                    }
+                };
+                entry_pos += entry_len;
+            }
+            if !batch_valid {
+                break;
+            }
+
+            // Record sparse index entries for this batch
+            let batch_byte_pos = pos;
+            let interval = u64::from(index_interval);
+            for i in 0..u64::from(num_entries) {
+                let global_idx = (next_offset + i) - base_offset;
+                if global_idx.is_multiple_of(interval) {
+                    index.append(next_offset + i, batch_byte_pos)?;
+                }
+            }
+
+            next_offset += u64::from(num_entries);
+            pos += 4 + u64::from(batch_len);
+        }
+
+        if pos < total_len {
+            file.set_len(pos)?;
+        }
+
+        index.flush()?;
+        Ok((next_offset, pos, index))
+    }
+
+    /// Write pre-serialized entries as a single CRC-protected batch.
+    pub fn append_batch(
+        &mut self,
+        entries: &[LogEntry],
+        serialized: &[SerializedEntry],
+    ) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        assert_eq!(entries.len(), serialized.len());
+
+        self.file.seek(SeekFrom::Start(self.file_size))?;
+
+        // Build payload: num_entries + entry frames
+        let num_entries = entries.len() as u32;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&num_entries.to_le_bytes());
+        for se in serialized {
+            let entry_len = se.data.len() as u32;
+            payload.extend_from_slice(&entry_len.to_le_bytes());
+            payload.extend_from_slice(&se.data);
+        }
+
+        let crc = crc32c::crc32c(&payload);
+        let batch_len = (4 + payload.len()) as u32; // crc + payload
+
+        // Record sparse index entries
+        let batch_byte_pos = self.file_size;
+        let interval = u64::from(self.index.interval());
+        for i in 0..entries.len() {
+            let global_idx = (self.next_offset + i as u64) - self.base_offset;
+            if global_idx.is_multiple_of(interval) {
+                self.index
+                    .append(self.next_offset + i as u64, batch_byte_pos)?;
             }
         }
-        Ok(entries)
-    }
 
-    /// Read a single entry by its absolute log index.
-    pub fn read_entry(&mut self, index: u64) -> io::Result<Option<LogEntry>> {
-        if index < self.base_index || index >= self.next_index() {
-            return Ok(None);
-        }
-        // Flush buffered writes so the reader can see them.
-        self.writer.flush()?;
+        // Write batch: batch_len + crc + payload
+        self.file.write_all(&batch_len.to_le_bytes())?;
+        self.file.write_all(&crc.to_le_bytes())?;
+        self.file.write_all(&payload)?;
 
-        let target_offset = index - self.base_index;
-        let file = File::open(&self.path)?;
-        let mut reader = BufReader::new(file);
-        for _ in 0..target_offset {
-            skip_one_entry(&mut reader)?;
-        }
-        read_one_entry(&mut reader).map(Some)
-    }
+        let written = 4 + u64::from(batch_len);
+        self.file_size += written;
+        self.next_offset += entries.len() as u64;
 
-    /// Truncate this segment so that it retains only entries with index < `from_index`.
-    /// Returns the number of entries removed.
-    pub fn truncate_from(&mut self, from_index: u64) -> io::Result<u64> {
-        if from_index >= self.next_index() {
-            return Ok(0);
-        }
-        let keep = if from_index <= self.base_index {
-            0
-        } else {
-            from_index - self.base_index
-        };
+        self.file.sync_all()?;
+        self.index.flush()?;
 
-        // Flush before truncating so buffered data lands on disk first.
-        self.writer.flush()?;
-
-        // Find the byte offset after the last kept entry.
-        let new_len = if keep == 0 {
-            0
-        } else {
-            let file = File::open(&self.path)?;
-            let mut reader = BufReader::new(file);
-            let mut offset: u64 = 0;
-            for _ in 0..keep {
-                let payload_len = read_u32_be(&mut reader)? as u64;
-                let entry_len = HEADER_LEN as u64 + payload_len;
-                reader.seek(SeekFrom::Current(payload_len as i64))?;
-                offset += entry_len;
-            }
-            offset
-        };
-
-        let removed = self.entry_count - keep;
-        let file = self.writer.get_mut();
-        file.set_len(new_len)?;
-        file.seek(SeekFrom::Start(new_len))?;
-        file.sync_data()?;
-        self.entry_count = keep;
-        Ok(removed)
-    }
-
-    /// Path to the underlying segment file.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for Segment {
-    fn drop(&mut self) {
-        // Best-effort flush; callers should use `sync()` for durability.
-        let _ = self.writer.flush();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SegmentLog — manages an ordered collection of Segments
-// ---------------------------------------------------------------------------
-
-/// A segmented append-only log composed of multiple `Segment` files.
-pub struct SegmentLog {
-    dir: PathBuf,
-    segments: Vec<Segment>,
-    /// Maximum entries per segment before rolling to a new one.
-    max_segment_entries: u64,
-}
-
-impl SegmentLog {
-    /// Open or create a segment log in `dir`.
-    pub fn open(dir: &Path, max_segment_entries: u64) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
-
-        let mut seg_paths: Vec<PathBuf> = fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension().map_or(false, |ext| ext == "log")
-                    && p.file_name()
-                        .map_or(false, |n| n.to_string_lossy().starts_with("segment-"))
-            })
-            .collect();
-        seg_paths.sort();
-
-        let mut segments = Vec::new();
-        for p in seg_paths {
-            segments.push(Segment::open(p)?);
-        }
-
-        Ok(SegmentLog {
-            dir: dir.to_path_buf(),
-            segments,
-            max_segment_entries,
-        })
-    }
-
-    /// Append a batch of entries to the log.
-    pub fn append(&mut self, entries: &[LogEntry]) -> io::Result<()> {
-        for entry in entries {
-            // Roll to a new segment if the active one is full.
-            if self.needs_roll() {
-                let base = self.next_index();
-                let seg = Segment::create(&self.dir, base)?;
-                self.segments.push(seg);
-            }
-            let seg = self
-                .segments
-                .last_mut()
-                .expect("segment must exist after roll check");
-            seg.append_entry(entry)?;
-        }
-        // Flush the active segment after the batch.
-        if let Some(seg) = self.segments.last_mut() {
-            seg.sync()?;
-        }
         Ok(())
     }
 
-    /// Read a single entry by absolute log index.
-    pub fn read_entry(&mut self, index: u64) -> io::Result<Option<LogEntry>> {
-        let seg = match self.segment_for_index_mut(index) {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-        seg.read_entry(index)
+    /// Convenience: serialize entries internally and write as a single batch.
+    pub fn append(&mut self, entries: &[LogEntry]) -> io::Result<()> {
+        let serialized: Vec<SerializedEntry> = entries
+            .iter()
+            .map(SerializedEntry::from_entry)
+            .collect::<io::Result<_>>()?;
+        self.append_batch(entries, &serialized)
     }
 
-    /// Read entries in the range `[from, to)`.
-    pub fn read_entries(&mut self, from: u64, to: u64) -> io::Result<Vec<LogEntry>> {
-        let mut result = Vec::new();
-        for idx in from..to {
-            match self.read_entry(idx)? {
-                Some(e) => result.push(e),
-                None => break,
-            }
+    /// Read entries in `[start_offset, end_offset)` from this segment.
+    /// Returns `Err` with `InvalidData` if a CRC mismatch is encountered
+    /// in any batch that must be read.
+    pub fn read(&mut self, start_offset: u64, end_offset: u64) -> io::Result<Vec<LogEntry>> {
+        if start_offset >= end_offset || start_offset >= self.next_offset {
+            return Ok(Vec::new());
         }
+
+        let effective_end = end_offset.min(self.next_offset);
+
+        let scan_pos = self.index.lookup(start_offset).unwrap_or(0);
+        self.file.seek(SeekFrom::Start(scan_pos))?;
+
+        let mut result = Vec::new();
+        let mut pos = scan_pos;
+
+        while pos < self.file_size {
+            let batch_start = pos;
+
+            // Read batch_len
+            let mut len_buf = [0u8; 4];
+            if let Err(e) = self.file.read_exact(&mut len_buf) {
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(e);
+            }
+            let batch_len = u32::from_le_bytes(len_buf);
+
+            if !(8..=MAX_BATCH_DATA).contains(&batch_len) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "corrupt batch at byte {batch_start}: invalid batch_len {batch_len}"
+                    ),
+                ));
+            }
+
+            let mut batch_data = vec![0u8; batch_len as usize];
+            self.file.read_exact(&mut batch_data)?;
+
+            // Validate batch CRC
+            let stored_crc = u32::from_le_bytes([
+                batch_data[0], batch_data[1], batch_data[2], batch_data[3],
+            ]);
+            let payload = &batch_data[4..];
+            let computed_crc = crc32c::crc32c(payload);
+            if stored_crc != computed_crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "CRC mismatch at batch byte {batch_start}: \
+                         stored={stored_crc:#010x} computed={computed_crc:#010x}"
+                    ),
+                ));
+            }
+
+            // Parse entries from payload
+            if payload.len() < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("truncated batch at byte {batch_start}"),
+                ));
+            }
+            let num_entries = u32::from_le_bytes([
+                payload[0], payload[1], payload[2], payload[3],
+            ]);
+
+            let mut entry_pos = 4usize;
+            let mut found_past_end = false;
+            for _ in 0..num_entries {
+                if entry_pos + 4 > payload.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("truncated entry frame at byte {batch_start}"),
+                    ));
+                }
+                let entry_len = u32::from_le_bytes([
+                    payload[entry_pos],
+                    payload[entry_pos + 1],
+                    payload[entry_pos + 2],
+                    payload[entry_pos + 3],
+                ]) as usize;
+                entry_pos += 4;
+                if entry_pos + entry_len > payload.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("truncated entry data at byte {batch_start}"),
+                    ));
+                }
+                let entry: LogEntry =
+                    bincode::deserialize(&payload[entry_pos..entry_pos + entry_len])
+                        .map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "deserialization failed at byte {batch_start}: {e}"
+                                ),
+                            )
+                        })?;
+                entry_pos += entry_len;
+
+                if entry.offset >= effective_end {
+                    found_past_end = true;
+                    break;
+                }
+                if entry.offset >= start_offset {
+                    result.push(entry);
+                }
+            }
+
+            if found_past_end {
+                break;
+            }
+
+            pos += 4 + u64::from(batch_len);
+        }
+
         Ok(result)
     }
 
-    /// Truncate all entries with index >= `from_index`.
-    pub fn truncate_from(&mut self, from_index: u64) -> io::Result<()> {
-        // Remove segments that are entirely past from_index.
-        while let Some(seg) = self.segments.last() {
-            if seg.base_index >= from_index {
-                let path = seg.path().to_path_buf();
-                self.segments.pop();
-                // Drop the segment (closes handle) before removing file.
-                fs::remove_file(&path)?;
-            } else {
-                break;
-            }
-        }
-        // Truncate the remaining active segment if it partially overlaps.
-        if let Some(seg) = self.segments.last_mut() {
-            seg.truncate_from(from_index)?;
-        }
-        Ok(())
+    pub fn base_offset(&self) -> u64 {
+        self.base_offset
     }
 
-    /// The next log index that would be appended.
-    pub fn next_index(&self) -> u64 {
-        self.segments
-            .last()
-            .map_or(0, |s| s.next_index())
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
     }
 
-    /// The first log index in the log, or `None` if empty.
-    pub fn first_index(&self) -> Option<u64> {
-        self.segments.first().map(|s| s.base_index)
+    pub fn file_size(&self) -> u64 {
+        self.file_size
     }
-
-    /// Sync all segments to disk.
-    pub fn sync(&mut self) -> io::Result<()> {
-        for seg in &mut self.segments {
-            seg.sync()?;
-        }
-        Ok(())
-    }
-
-    // -- private helpers --
-
-    fn needs_roll(&self) -> bool {
-        match self.segments.last() {
-            None => true,
-            Some(seg) => seg.len() >= self.max_segment_entries,
-        }
-    }
-
-    fn segment_for_index_mut(&mut self, index: u64) -> Option<&mut Segment> {
-        self.segments.iter_mut().rev().find(|s| index >= s.base_index && index < s.next_index())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Wire-format helpers
-// ---------------------------------------------------------------------------
-
-fn read_u32_be(r: &mut impl Read) -> io::Result<u32> {
-    let mut buf = [0u8; 4];
-    r.read_exact(&mut buf)?;
-    Ok(u32::from_be_bytes(buf))
-}
-
-fn read_u64_be(r: &mut impl Read) -> io::Result<u64> {
-    let mut buf = [0u8; 8];
-    r.read_exact(&mut buf)?;
-    Ok(u64::from_be_bytes(buf))
-}
-
-fn read_one_entry(r: &mut (impl Read + Seek)) -> io::Result<LogEntry> {
-    let payload_len = read_u32_be(r)? as usize;
-    if payload_len < ENTRY_META_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "entry payload too short",
-        ));
-    }
-    let term = read_u64_be(r)?;
-    let index = read_u64_be(r)?;
-    let data_len = payload_len - ENTRY_META_LEN;
-    let mut data = vec![0u8; data_len];
-    r.read_exact(&mut data)?;
-    Ok(LogEntry { term, index, data })
-}
-
-fn skip_one_entry(r: &mut (impl Read + Seek)) -> io::Result<()> {
-    let payload_len = read_u32_be(r)? as u64;
-    r.seek(SeekFrom::Current(payload_len as i64))?;
-    Ok(())
-}
-
-/// Scan a segment file, returning (valid_entry_count, valid_byte_length).
-/// Used on open to detect and recover from partial trailing writes.
-fn scan_entries(path: &Path) -> io::Result<(u64, u64)> {
-    let file = File::open(path)?;
-    let file_len = file.metadata()?.len();
-    let mut reader = BufReader::new(file);
-    let mut count: u64 = 0;
-    let mut valid_end: u64 = 0;
-
-    loop {
-        if valid_end >= file_len {
-            break;
-        }
-        let start = valid_end;
-        match read_u32_be(&mut reader) {
-            Ok(payload_len) => {
-                let entry_end = start + HEADER_LEN as u64 + payload_len as u64;
-                if entry_end > file_len {
-                    // Partial record — stop here.
-                    break;
-                }
-                if (payload_len as usize) < ENTRY_META_LEN {
-                    break;
-                }
-                if let Err(_) = reader.seek(SeekFrom::Current(payload_len as i64)) {
-                    break;
-                }
-                count += 1;
-                valid_end = entry_end;
-            }
-            Err(_) => break,
-        }
-    }
-    Ok((count, valid_end))
-}
-
-fn parse_base_index(path: &Path) -> io::Result<u64> {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad segment filename"))?;
-    let idx_str = stem
-        .strip_prefix("segment-")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing segment- prefix"))?;
-    idx_str
-        .parse::<u64>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use tempfile::TempDir;
+    use xraft_core::log_entry::EntryType;
+    use xraft_core::types::Term;
 
-    fn tmp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("xraft-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn make_entry(term: u64, index: u64, data: &[u8]) -> LogEntry {
+    fn make_entry(offset: u64, term: u64, payload: &[u8]) -> LogEntry {
         LogEntry {
-            term,
-            index,
-            data: data.to_vec(),
+            offset,
+            term: Term(term),
+            entry_type: EntryType::Command,
+            payload: payload.to_vec(),
         }
     }
 
     #[test]
-    fn test_segment_append_and_read() {
-        let dir = tmp_dir();
-        let mut seg = Segment::create(&dir, 1).unwrap();
-        let e1 = make_entry(1, 1, b"hello");
-        let e2 = make_entry(1, 2, b"world");
-        seg.append_entry(&e1).unwrap();
-        seg.append_entry(&e2).unwrap();
-        seg.sync().unwrap();
+    fn append_and_read_back() {
+        let dir = TempDir::new().unwrap();
+        let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
 
-        assert_eq!(seg.len(), 2);
-        assert_eq!(seg.next_index(), 3);
-
-        let entries = seg.read_entries().unwrap();
-        assert_eq!(entries, vec![e1.clone(), e2.clone()]);
-
-        assert_eq!(seg.read_entry(1).unwrap(), Some(e1));
-        assert_eq!(seg.read_entry(2).unwrap(), Some(e2));
-        assert_eq!(seg.read_entry(3).unwrap(), None);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_segment_truncate() {
-        let dir = tmp_dir();
-        let mut seg = Segment::create(&dir, 1).unwrap();
-        for i in 1..=5 {
-            seg.append_entry(&make_entry(1, i, b"x")).unwrap();
-        }
-        seg.sync().unwrap();
-
-        seg.truncate_from(3).unwrap();
-        assert_eq!(seg.len(), 2);
-        assert_eq!(seg.next_index(), 3);
-        let entries = seg.read_entries().unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].index, 1);
-        assert_eq!(entries[1].index, 2);
-
-        // Can append after truncation.
-        seg.append_entry(&make_entry(2, 3, b"new")).unwrap();
-        seg.sync().unwrap();
-        assert_eq!(seg.len(), 3);
-        let e = seg.read_entry(3).unwrap().unwrap();
-        assert_eq!(e.term, 2);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_segment_log_batch_append() {
-        let dir = tmp_dir();
-        let mut log = SegmentLog::open(&dir, 3).unwrap();
-        let entries: Vec<LogEntry> = (0..7)
-            .map(|i| make_entry(1, i, format!("data-{}", i).as_bytes()))
+        let entries: Vec<LogEntry> = (0..10)
+            .map(|i| make_entry(i, 1, &[i as u8; 8]))
             .collect();
-        log.append(&entries).unwrap();
+        seg.append(&entries).unwrap();
 
-        assert_eq!(log.segments.len(), 3); // 3 + 3 + 1
-        for i in 0..7u64 {
-            let e = log.read_entry(i).unwrap().unwrap();
-            assert_eq!(e.index, i);
+        assert_eq!(seg.next_offset(), 10);
+        assert!(seg.file_size() > 0);
+
+        let read_back = seg.read(0, 10).unwrap();
+        assert_eq!(read_back.len(), 10);
+        for (i, entry) in read_back.iter().enumerate() {
+            assert_eq!(entry.offset, i as u64);
+            assert_eq!(entry.term, Term(1));
+            assert_eq!(entry.payload, vec![i as u8; 8]);
         }
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn test_segment_log_truncate() {
-        let dir = tmp_dir();
-        let mut log = SegmentLog::open(&dir, 3).unwrap();
-        let entries: Vec<LogEntry> = (0..7)
-            .map(|i| make_entry(1, i, b"d"))
-            .collect();
-        log.append(&entries).unwrap();
+    fn read_past_corruption_returns_storage_error() {
+        let dir = TempDir::new().unwrap();
+        let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
+        // Write 10 entries as individual batches
+        for i in 0..10u64 {
+            seg.append(&[make_entry(i, 1, &[i as u8; 16])]).unwrap();
+        }
 
-        log.truncate_from(4).unwrap();
-        assert_eq!(log.next_index(), 4);
-        assert!(log.read_entry(4).unwrap().is_none());
-        assert!(log.read_entry(3).unwrap().is_some());
-        let _ = fs::remove_dir_all(&dir);
+        // Corrupt a batch mid-file on disk (without reopening)
+        let log_path = dir.path().join("00000000000000000000.log");
+        let mut raw = std::fs::read(&log_path).unwrap();
+        // Each batch has the same size; corrupt batch 5's payload area
+        let batch_size = raw.len() / 10;
+        let corrupt_byte = batch_size * 5 + 14; // inside entry data
+        raw[corrupt_byte] ^= 0xFF;
+        std::fs::write(&log_path, &raw).unwrap();
+
+        // Read spanning the corruption → must return InvalidData error
+        let err = seg.read(0, 10).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("CRC mismatch"),
+            "expected CRC mismatch error, got: {err}"
+        );
     }
 
     #[test]
-    fn test_segment_reopen_recovers() {
-        let dir = tmp_dir();
-        let path;
+    fn open_recovers_valid_segment() {
+        let dir = TempDir::new().unwrap();
+
         {
-            let mut seg = Segment::create(&dir, 10).unwrap();
-            seg.append_entry(&make_entry(1, 10, b"a")).unwrap();
-            seg.append_entry(&make_entry(1, 11, b"b")).unwrap();
-            seg.sync().unwrap();
-            path = seg.path().to_path_buf();
-        }
-        // Append some garbage bytes to simulate a partial write.
-        {
-            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-            f.write_all(&[0xFF, 0x00, 0x01]).unwrap();
+            let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
+            let entries: Vec<LogEntry> = (0..20)
+                .map(|i| make_entry(i, 1, &[i as u8; 8]))
+                .collect();
+            seg.append(&entries).unwrap();
         }
 
-        let mut seg = Segment::open(path).unwrap();
-        assert_eq!(seg.len(), 2);
-        let entries = seg.read_entries().unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].index, 10);
-        let _ = fs::remove_dir_all(&dir);
+        let mut seg = Segment::open(dir.path(), 0, 4).unwrap();
+        assert_eq!(seg.next_offset(), 20);
+
+        let read_back = seg.read(0, 20).unwrap();
+        assert_eq!(read_back.len(), 20);
+    }
+
+    #[test]
+    fn recovery_truncates_corrupt_trailing_batch() {
+        let dir = TempDir::new().unwrap();
+
+        {
+            let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
+            for i in 0..10u64 {
+                seg.append(&[make_entry(i, 1, &[i as u8; 16])]).unwrap();
+            }
+        }
+
+        // Corrupt the last batch
+        let log_path = dir.path().join("00000000000000000000.log");
+        let mut raw = std::fs::read(&log_path).unwrap();
+        let batch_size = raw.len() / 10;
+        let corrupt_byte = batch_size * 9 + 14;
+        raw[corrupt_byte] ^= 0xFF;
+        std::fs::write(&log_path, &raw).unwrap();
+
+        // Recovery truncates from the corrupt batch onward
+        let mut seg = Segment::open(dir.path(), 0, 4).unwrap();
+        assert_eq!(seg.next_offset(), 9);
+        let entries = seg.read(0, 9).unwrap();
+        assert_eq!(entries.len(), 9);
+    }
+
+    #[test]
+    fn sparse_index_read_at_interval_boundary() {
+        let dir = TempDir::new().unwrap();
+        let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
+
+        for i in 0..16u64 {
+            seg.append(&[make_entry(i, 1, &[i as u8; 8])]).unwrap();
+        }
+
+        let read_at_4 = seg.read(4, 5).unwrap();
+        assert_eq!(read_at_4.len(), 1);
+        assert_eq!(read_at_4[0].offset, 4);
+
+        let read_at_12 = seg.read(12, 13).unwrap();
+        assert_eq!(read_at_12.len(), 1);
+        assert_eq!(read_at_12[0].offset, 12);
     }
 }

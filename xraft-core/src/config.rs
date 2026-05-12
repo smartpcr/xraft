@@ -19,11 +19,8 @@ pub struct RaftConfig {
     pub max_fetch_bytes: u32,
     /// Committed entries between automatic snapshots.
     pub snapshot_interval: u64,
+    /// Root directory for log segments, snapshots, quorum-state.
     pub data_dir: PathBuf,
-    /// Maximum segment file size in bytes before rolling to a new segment.
-    pub segment_max_bytes: u64,
-    /// Sparse index interval: write an index entry every N records.
-    pub index_interval: u32,
 }
 
 impl RaftConfig {
@@ -42,11 +39,9 @@ impl RaftConfig {
             election_timeout_max_ms: 300,
             fetch_interval_ms: 50,
             max_batch_size: 256,
-            max_fetch_bytes: 1024 * 1024,
+            max_fetch_bytes: 1_048_576, // 1 MiB
             snapshot_interval: 10_000,
             data_dir: PathBuf::from("data"),
-            segment_max_bytes: 64 * 1024 * 1024, // 64 MiB
-            index_interval: 256,
         }
     }
 }

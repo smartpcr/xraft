@@ -1,152 +1,137 @@
-use std::io::{self, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Sparse index for a single segment file.
-///
-/// Maps `offset → byte_position` in the `.log` file for every Nth entry.
-/// The index file is disposable — it can be rebuilt from the log.
-///
-/// Format: repeated fixed-size entries of `[u64 offset][u64 position]` (16 bytes each).
-pub struct SegmentIndex {
-    path: PathBuf,
-    /// Sorted (offset, file_position) pairs loaded in memory.
+/// Entry size in the index file: offset (u64) + byte position (u64) = 16 bytes.
+const INDEX_ENTRY_SIZE: usize = 16;
+
+/// Sparse index mapping log offsets to byte positions in the corresponding
+/// `.log` file. Every Nth entry is recorded, enabling O(log n) lookups via
+/// binary search.
+pub struct SparseIndex {
+    /// In-memory copy of index entries: (log_offset, byte_position).
     entries: Vec<(u64, u64)>,
-    /// Write an index entry every `interval` records.
+    file: File,
+    #[allow(dead_code)]
+    path: PathBuf,
+    /// Record an index entry every `interval` log entries.
     interval: u32,
-    /// Counter: how many records since the last index entry.
-    records_since_last: u32,
 }
 
-const _INDEX_ENTRY_SIZE: usize = 16; // 8 bytes offset + 8 bytes position
+impl SparseIndex {
+    /// Create a brand-new, empty index file.
+    pub fn create(path: &Path, interval: u32) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
 
-impl SegmentIndex {
-    /// Create a new (empty) index.
-    pub fn new(path: PathBuf, interval: u32) -> Self {
-        Self {
-            path,
+        Ok(Self {
             entries: Vec::new(),
+            file,
+            path: path.to_path_buf(),
             interval,
-            records_since_last: 0,
-        }
+        })
     }
 
-    /// Open an existing index file. If it's corrupt or missing, return an empty index.
-    pub fn open(path: PathBuf, interval: u32) -> Self {
-        let entries = match std::fs::read(&path) {
-            Ok(data) => Self::parse_entries(&data),
-            Err(_) => Vec::new(),
-        };
-        // records_since_last is unknown after open; will be recalibrated on rebuild.
-        Self {
-            path,
-            entries,
+    /// Create or truncate an index file (used during recovery rebuild).
+    pub fn create_or_truncate(path: &Path, interval: u32) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+
+        Ok(Self {
+            entries: Vec::new(),
+            file,
+            path: path.to_path_buf(),
             interval,
-            records_since_last: 0,
-        }
+        })
     }
 
-    fn parse_entries(data: &[u8]) -> Vec<(u64, u64)> {
-        let mut entries = Vec::new();
-        let mut cursor = std::io::Cursor::new(data);
-        loop {
-            let mut buf = [0u8; 8];
-            if cursor.read_exact(&mut buf).is_err() {
-                break;
-            }
-            let offset = u64::from_le_bytes(buf);
-            if cursor.read_exact(&mut buf).is_err() {
-                break;
-            }
-            let position = u64::from_le_bytes(buf);
+    /// Load an existing index file into memory.
+    #[allow(dead_code)]
+    pub fn open(path: &Path, interval: u32) -> io::Result<Self> {
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+
+        let file_len = file.metadata()?.len();
+        // Truncate any partial trailing entry
+        let valid_len = file_len - (file_len % INDEX_ENTRY_SIZE as u64);
+        if valid_len < file_len {
+            file.set_len(valid_len)?;
+        }
+
+        file.seek(SeekFrom::Start(0))?;
+
+        let entry_count = (valid_len / INDEX_ENTRY_SIZE as u64) as usize;
+        let mut entries = Vec::with_capacity(entry_count);
+        let mut buf = [0u8; INDEX_ENTRY_SIZE];
+
+        for _ in 0..entry_count {
+            file.read_exact(&mut buf)?;
+            let offset = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let position = u64::from_le_bytes(buf[8..16].try_into().unwrap());
             entries.push((offset, position));
         }
-        entries
+
+        Ok(Self {
+            entries,
+            file,
+            path: path.to_path_buf(),
+            interval,
+        })
     }
 
-    /// Look up the byte position nearest to (but not after) `target_offset`.
-    /// Returns `(indexed_offset, file_position)` or `None` if index is empty.
-    pub fn lookup(&self, target_offset: u64) -> Option<(u64, u64)> {
+    /// Append an index entry. Caller decides when to call this (every Nth entry).
+    pub fn append(&mut self, offset: u64, byte_position: u64) -> io::Result<()> {
+        self.entries.push((offset, byte_position));
+
+        // Write to file
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&offset.to_le_bytes())?;
+        self.file.write_all(&byte_position.to_le_bytes())?;
+
+        Ok(())
+    }
+
+    /// Flush the index file to disk.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+
+    /// Binary search for the largest indexed offset ≤ `target_offset`.
+    /// Returns the byte position to start scanning from, or `None` if
+    /// the index is empty or all entries are after `target_offset`.
+    pub fn lookup(&self, target_offset: u64) -> Option<u64> {
         if self.entries.is_empty() {
             return None;
         }
-        // Binary search for the largest offset <= target_offset.
-        let idx = self
-            .entries
-            .partition_point(|(off, _)| *off <= target_offset);
-        if idx == 0 {
-            None
-        } else {
-            Some(self.entries[idx - 1])
-        }
-    }
 
-    /// Record that an entry was written at `offset` at byte `position`.
-    /// Only actually writes to the index file every `interval` records.
-    pub fn maybe_add(&mut self, offset: u64, position: u64) -> io::Result<()> {
-        if self.records_since_last == 0 || self.records_since_last >= self.interval {
-            self.entries.push((offset, position));
-            self.append_to_file(offset, position)?;
-            self.records_since_last = 1;
-        } else {
-            self.records_since_last += 1;
-        }
-        Ok(())
-    }
-
-    fn append_to_file(&self, offset: u64, position: u64) -> io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        file.write_all(&offset.to_le_bytes())?;
-        file.write_all(&position.to_le_bytes())?;
-        file.flush()?;
-        Ok(())
-    }
-
-    /// Truncate all index entries at or after `from_offset` and rewrite the file.
-    pub fn truncate_from(&mut self, from_offset: u64) -> io::Result<()> {
-        let keep = self
-            .entries
-            .partition_point(|(off, _)| *off < from_offset);
-        self.entries.truncate(keep);
-        self.rewrite_file()?;
-        self.records_since_last = 0;
-        Ok(())
-    }
-
-    /// Rebuild the index from the log data. Called during recovery.
-    pub fn rebuild_from_entries(&mut self, entries: &[(u64, u64)]) -> io::Result<()> {
-        self.entries.clear();
-        self.records_since_last = 0;
-        for &(offset, position) in entries {
-            if self.records_since_last == 0 || self.records_since_last >= self.interval {
-                self.entries.push((offset, position));
-                self.records_since_last = 1;
+        // Binary search: find rightmost entry where offset <= target_offset
+        let mut lo = 0usize;
+        let mut hi = self.entries.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.entries[mid].0 <= target_offset {
+                lo = mid + 1;
             } else {
-                self.records_since_last += 1;
+                hi = mid;
             }
         }
-        self.rewrite_file()
-    }
 
-    fn rewrite_file(&self) -> io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        for &(offset, position) in &self.entries {
-            file.write_all(&offset.to_le_bytes())?;
-            file.write_all(&position.to_le_bytes())?;
+        if lo == 0 {
+            None
+        } else {
+            Some(self.entries[lo - 1].1)
         }
-        file.flush()?;
-        Ok(())
     }
 
-    /// The path to the index file.
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// The index recording interval.
+    pub fn interval(&self) -> u32 {
+        self.interval
     }
 
     /// Number of entries in the index.
@@ -155,23 +140,61 @@ impl SegmentIndex {
         self.entries.len()
     }
 
-    /// Remove the index file from disk.
-    pub fn remove(self) -> io::Result<()> {
-        if self.path.exists() {
-            let max_attempts: u64 = 20;
-            let mut last_err = None;
-            for attempt in 0..max_attempts {
-                match std::fs::remove_file(&self.path) {
-                    Ok(()) => return Ok(()),
-                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied && attempt < max_attempts - 1 => {
-                        last_err = Some(e);
-                        std::thread::sleep(std::time::Duration::from_millis(100 * (attempt + 1)));
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            return Err(last_err.unwrap());
+    /// Whether the index is empty.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn lookup_empty_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let idx = SparseIndex::create(&dir.path().join("test.index"), 16).unwrap();
+        assert_eq!(idx.lookup(0), None);
+        assert_eq!(idx.lookup(100), None);
+    }
+
+    #[test]
+    fn lookup_finds_floor_entry() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SparseIndex::create(&dir.path().join("test.index"), 16).unwrap();
+
+        // Offsets: 0, 16, 32, 48
+        idx.append(0, 0).unwrap();
+        idx.append(16, 1000).unwrap();
+        idx.append(32, 2500).unwrap();
+        idx.append(48, 4000).unwrap();
+        idx.flush().unwrap();
+
+        assert_eq!(idx.lookup(0), Some(0));
+        assert_eq!(idx.lookup(5), Some(0));
+        assert_eq!(idx.lookup(16), Some(1000));
+        assert_eq!(idx.lookup(31), Some(1000));
+        assert_eq!(idx.lookup(32), Some(2500));
+        assert_eq!(idx.lookup(100), Some(4000));
+    }
+
+    #[test]
+    fn persistence_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.index");
+
+        {
+            let mut idx = SparseIndex::create(&path, 16).unwrap();
+            idx.append(0, 0).unwrap();
+            idx.append(16, 500).unwrap();
+            idx.append(32, 1200).unwrap();
+            idx.flush().unwrap();
         }
-        Ok(())
+
+        let idx = SparseIndex::open(&path, 16).unwrap();
+        assert_eq!(idx.len(), 3);
+        assert_eq!(idx.lookup(20), Some(500));
     }
 }
