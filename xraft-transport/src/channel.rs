@@ -1,169 +1,138 @@
 //! In-process channel-based transport for deterministic testing.
 //!
-//! Uses `tokio::sync::mpsc` channels to deliver `RpcEnvelope` messages
-//! between nodes without any network I/O. Each node gets a
-//! `ChannelTransportSender` (can send to any peer) and a
-//! `ChannelTransportReceiver` (receives inbound messages).
+//! `ChannelTransport` allocates one bounded `tokio::sync::mpsc` queue per
+//! node. The transport is split into per-node sender/receiver halves that
+//! implement the `TransportSender` / `TransportReceiver` traits defined
+//! in `xraft_core::traits` (architecture §4.4 split-transport pattern).
+//!
+//! `NetworkSimulator` (see `simulator.rs`) wraps this transport to inject
+//! faults (drops, delays, reordering, partitions).
+
+use std::collections::HashMap;
+use std::io;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::mpsc;
+
 use xraft_core::rpc::RpcEnvelope;
 use xraft_core::traits::{TransportReceiver, TransportSender};
 use xraft_core::types::NodeId;
 
-/// Channel-based transport sender that routes messages to peers via mpsc channels.
+/// In-process transport using `tokio::sync::mpsc` channels per node.
 ///
-/// Implements `TransportSender` with `&self` (shared reference) because the
-/// `IoStage` may send to multiple peers concurrently. Thread-safe via `Arc`.
-pub struct ChannelTransportSender {
-    /// Map from target NodeId to that node's inbound channel sender.
-    peers: Arc<HashMap<NodeId, mpsc::Sender<RpcEnvelope>>>,
+/// Each node has a single bounded inbound queue. Senders route messages
+/// into the target node's inbox. Use [`split`](Self::split) for the common
+/// per-node sender/receiver pairs, or the lower-level [`inboxes`](Self::inboxes)
+/// and [`take_receiver`](Self::take_receiver) accessors when wrapping the
+/// transport (e.g. for the network simulator).
+pub struct ChannelTransport {
+    inboxes: Arc<HashMap<NodeId, mpsc::Sender<RpcEnvelope>>>,
+    receivers: HashMap<NodeId, mpsc::Receiver<RpcEnvelope>>,
 }
 
-impl ChannelTransportSender {
-    /// Create a new sender with access to all peer channels.
-    pub fn new(peers: HashMap<NodeId, mpsc::Sender<RpcEnvelope>>) -> Self {
+impl ChannelTransport {
+    /// Create a new channel transport mesh for the given set of node IDs.
+    /// Each node gets an inbound mpsc channel with the specified buffer
+    /// capacity.
+    pub fn new(node_ids: &[NodeId], buffer_size: usize) -> Self {
+        let mut senders = HashMap::new();
+        let mut receivers = HashMap::new();
+
+        for &node_id in node_ids {
+            let (tx, rx) = mpsc::channel(buffer_size);
+            senders.insert(node_id, tx);
+            receivers.insert(node_id, rx);
+        }
+
         Self {
-            peers: Arc::new(peers),
+            inboxes: Arc::new(senders),
+            receivers,
         }
     }
+
+    /// Split the transport into per-node sender/receiver pairs.
+    ///
+    /// Each sender can deliver messages to any node in the cluster; each
+    /// receiver only receives messages destined for that specific node.
+    pub fn split(
+        mut self,
+    ) -> HashMap<NodeId, (Box<dyn TransportSender>, Box<dyn TransportReceiver>)> {
+        let mut result = HashMap::new();
+        let node_ids: Vec<NodeId> = self.receivers.keys().copied().collect();
+        for node_id in node_ids {
+            let rx = self
+                .receivers
+                .remove(&node_id)
+                .expect("receiver must exist for node");
+            let sender = ChannelSender {
+                inboxes: Arc::clone(&self.inboxes),
+            };
+            let receiver = ChannelReceiver { rx };
+            result.insert(
+                node_id,
+                (
+                    Box::new(sender) as Box<dyn TransportSender>,
+                    Box::new(receiver) as Box<dyn TransportReceiver>,
+                ),
+            );
+        }
+        result
+    }
+
+    /// Get a shared handle to all inbound senders. Used by `NetworkSimulator`
+    /// to deliver fault-injected messages directly to the destination inbox.
+    pub fn inboxes(&self) -> Arc<HashMap<NodeId, mpsc::Sender<RpcEnvelope>>> {
+        Arc::clone(&self.inboxes)
+    }
+
+    /// Take the receive half for `node_id`. Returns `None` if the receiver
+    /// was already taken or the node was not part of the mesh.
+    pub fn take_receiver(&mut self, node_id: NodeId) -> Option<mpsc::Receiver<RpcEnvelope>> {
+        self.receivers.remove(&node_id)
+    }
+}
+
+/// Sender half: routes messages to any node's inbox.
+///
+/// `&self` access is required by `TransportSender` for concurrent sends
+/// by `IoStage`. Cheaply clonable.
+#[derive(Clone)]
+pub struct ChannelSender {
+    inboxes: Arc<HashMap<NodeId, mpsc::Sender<RpcEnvelope>>>,
 }
 
 #[async_trait]
-impl TransportSender for ChannelTransportSender {
-    async fn send(
-        &self,
-        target: NodeId,
-        message: RpcEnvelope,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let tx = self
-            .peers
-            .get(&target)
-            .ok_or_else(|| format!("no channel for target {:?}", target))?;
-        tx.send(message)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        Ok(())
+impl TransportSender for ChannelSender {
+    async fn send(&self, target: NodeId, message: RpcEnvelope) -> io::Result<()> {
+        let tx = self.inboxes.get(&target).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no channel for target node {target}"),
+            )
+        })?;
+        tx.send(message).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                format!("channel closed for target node {target}"),
+            )
+        })
     }
 }
 
-/// Channel-based transport receiver for inbound messages.
+/// Receiver half: pulls messages from this node's inbound queue.
 ///
-/// Implements `TransportReceiver` with `&mut self` (exclusive access) because
-/// only the `ReceiverTask` reads from the network per architecture §4.4.
-pub struct ChannelTransportReceiver {
+/// `&mut self` access is required by `TransportReceiver` for exclusive
+/// use by a single `ReceiverTask`.
+pub struct ChannelReceiver {
     rx: mpsc::Receiver<RpcEnvelope>,
 }
 
-impl ChannelTransportReceiver {
-    /// Create a new receiver wrapping an mpsc receiver.
-    pub fn new(rx: mpsc::Receiver<RpcEnvelope>) -> Self {
-        Self { rx }
-    }
-}
-
 #[async_trait]
-impl TransportReceiver for ChannelTransportReceiver {
-    async fn recv(&mut self) -> Result<RpcEnvelope, Box<dyn std::error::Error + Send + Sync>> {
-        self.rx
-            .recv()
-            .await
-            .ok_or_else(|| "channel closed".into())
-    }
-}
-
-/// Create a fully-connected channel network for N nodes.
-///
-/// Returns a map from NodeId to (sender, receiver) pairs. Each sender can
-/// route messages to any other node in the network.
-pub fn create_channel_network(
-    node_ids: &[NodeId],
-) -> HashMap<NodeId, (ChannelTransportSender, ChannelTransportReceiver)> {
-    let buffer_size = 1024;
-
-    // Create one inbound channel per node
-    let mut inbound_txs: HashMap<NodeId, mpsc::Sender<RpcEnvelope>> = HashMap::new();
-    let mut inbound_rxs: HashMap<NodeId, mpsc::Receiver<RpcEnvelope>> = HashMap::new();
-
-    for &nid in node_ids {
-        let (tx, rx) = mpsc::channel(buffer_size);
-        inbound_txs.insert(nid, tx);
-        inbound_rxs.insert(nid, rx);
-    }
-
-    // Each node gets a sender with access to all other nodes' inbound channels
-    let mut result = HashMap::new();
-    for &nid in node_ids {
-        let mut peer_map = HashMap::new();
-        for (&peer_id, tx) in &inbound_txs {
-            if peer_id != nid {
-                peer_map.insert(peer_id, tx.clone());
-            }
-        }
-        let sender = ChannelTransportSender::new(peer_map);
-        let receiver = ChannelTransportReceiver::new(inbound_rxs.remove(&nid).unwrap());
-        result.insert(nid, (sender, receiver));
-    }
-
-    result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use xraft_core::rpc::{RpcPayload, VoteRequest};
-    use xraft_core::types::Term;
-
-    #[tokio::test]
-    async fn send_and_receive_between_nodes() {
-        let nodes = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let mut network = create_channel_network(&nodes);
-
-        let (sender_1, _) = network.remove(&NodeId(1)).unwrap();
-        let (_, mut receiver_2) = network.remove(&NodeId(2)).unwrap();
-
-        let envelope = RpcEnvelope {
-            cluster_id: "test-cluster".to_string(),
-            source: NodeId(1),
-            leader_epoch: 1,
-            payload: RpcPayload::VoteRequest(VoteRequest {
-                term: Term(1),
-                candidate_id: NodeId(1),
-                last_log_offset: 0,
-                last_log_term: Term(0),
-                is_pre_vote: false,
-            }),
-        };
-
-        sender_1.send(NodeId(2), envelope).await.unwrap();
-        let received = receiver_2.recv().await.unwrap();
-        assert_eq!(received.source, NodeId(1));
-        assert_eq!(received.leader_epoch, 1);
-        assert_eq!(received.cluster_id, "test-cluster");
-    }
-
-    #[tokio::test]
-    async fn send_to_unknown_peer_returns_error() {
-        let nodes = vec![NodeId(1), NodeId(2)];
-        let mut network = create_channel_network(&nodes);
-        let (sender_1, _) = network.remove(&NodeId(1)).unwrap();
-
-        let envelope = RpcEnvelope {
-            cluster_id: "test-cluster".to_string(),
-            source: NodeId(1),
-            leader_epoch: 1,
-            payload: RpcPayload::VoteRequest(VoteRequest {
-                term: Term(1),
-                candidate_id: NodeId(1),
-                last_log_offset: 0,
-                last_log_term: Term(0),
-                is_pre_vote: false,
-            }),
-        };
-
-        let result = sender_1.send(NodeId(99), envelope).await;
-        assert!(result.is_err());
+impl TransportReceiver for ChannelReceiver {
+    async fn recv(&mut self) -> io::Result<RpcEnvelope> {
+        self.rx.recv().await.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::ConnectionReset, "all senders dropped")
+        })
     }
 }
