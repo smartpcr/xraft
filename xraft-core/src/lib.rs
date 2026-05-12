@@ -16,8 +16,6 @@ pub use app_record::{AppRecord, AppSnapshot};
 pub use consensus_state::{ConsensusState, Role};
 pub use follower_progress::FollowerProgress;
 pub use log_entry::{EntryType, LogEntry};
-pub use membership::MembershipManager;
-pub use node_state::{NodeState, PendingMembershipChange};
 pub use quorum_state::QuorumState;
 pub use snapshot::{Snapshot, SnapshotMetadata, SnapshotReader, SnapshotWriter};
 pub use types::{ClusterId, NodeId, Offset, Term};

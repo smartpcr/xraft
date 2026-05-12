@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::app_record::AppRecord;
 use crate::types::{Offset, Term};
 
 /// Discriminant for log entry types.
@@ -26,10 +27,10 @@ pub enum EntryType {
 }
 
 /// A single entry in the replicated log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
     /// Position in the log (0-indexed).
-    pub offset: u64,
+    pub offset: Offset,
     /// Term when the entry was created.
     pub term: Term,
     /// Type discriminator.
@@ -39,23 +40,24 @@ pub struct LogEntry {
 }
 
 impl LogEntry {
-    /// Create a command log entry.
-    pub fn command(offset: u64, term: Term, record: &AppRecord) -> Self {
+    /// Create a command log entry from an `AppRecord`.
+    pub fn command(offset: Offset, term: Term, record: &AppRecord) -> Self {
         Self {
             offset,
             term,
             entry_type: EntryType::Command,
-            data: record.data.clone(),
+            payload: record.data.clone(),
         }
     }
 
     /// Create a leader change message (no-op) log entry.
-    pub fn leader_change(offset: u64, term: Term) -> Self {
+    pub fn leader_change(offset: Offset, term: Term) -> Self {
         Self {
             offset,
             term,
             entry_type: EntryType::LeaderChangeMessage,
-            data: Vec::new(),
+            payload: Bytes::new(),
         }
     }
 }
+

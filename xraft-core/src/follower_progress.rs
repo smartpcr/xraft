@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::types::NodeId;
 
 /// Leader-side per-follower replication progress tracker.
