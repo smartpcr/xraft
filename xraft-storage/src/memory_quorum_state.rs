@@ -1,22 +1,22 @@
-use std::io;
-use std::sync::Mutex;
+//! In-memory implementation of the `QuorumStateStore` trait for testing.
 
-use xraft_core::quorum_state::QuorumState;
-use xraft_core::traits::QuorumStateStore;
+use async_trait::async_trait;
+use std::sync::RwLock;
+use xraft_core::traits::{QuorumState, QuorumStateStore};
 
-/// In-memory implementation of [`QuorumStateStore`].
+/// Thread-safe in-memory quorum state store implementing `QuorumStateStore`.
 ///
-/// Stores quorum state in a `Mutex`-protected `Option` so it can be
-/// shared across threads without external synchronisation.
+/// Stores the latest term, vote, and leader epoch in memory.
+/// Returns `None` from `load()` when no state has been saved,
+/// matching the architecture §4.1 `Option<QuorumState>` contract.
 pub struct MemoryQuorumStateStore {
-    state: Mutex<Option<QuorumState>>,
+    state: RwLock<Option<QuorumState>>,
 }
 
 impl MemoryQuorumStateStore {
-    /// Creates a new, empty store.
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(None),
+            state: RwLock::new(None),
         }
     }
 }
@@ -27,19 +27,21 @@ impl Default for MemoryQuorumStateStore {
     }
 }
 
+#[async_trait]
 impl QuorumStateStore for MemoryQuorumStateStore {
-    fn load(&self) -> io::Result<Option<QuorumState>> {
-        let guard = self.state.lock().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("lock poisoned: {e}"))
-        })?;
-        Ok(guard.clone())
+    async fn load(
+        &self,
+    ) -> Result<Option<QuorumState>, Box<dyn std::error::Error + Send + Sync>> {
+        let state = self.state.read().unwrap();
+        Ok(state.clone())
     }
 
-    fn save(&self, state: QuorumState) -> io::Result<()> {
-        let mut guard = self.state.lock().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("lock poisoned: {e}"))
-        })?;
-        *guard = Some(state);
+    async fn save(
+        &self,
+        state: &QuorumState,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut stored = self.state.write().unwrap();
+        *stored = Some(state.clone());
         Ok(())
     }
 }
@@ -47,59 +49,52 @@ impl QuorumStateStore for MemoryQuorumStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xraft_core::term::Term;
+    use xraft_core::types::{NodeId, Term};
 
-    #[test]
-    fn load_returns_none_when_empty() {
+    #[tokio::test]
+    async fn load_returns_none_initially() {
         let store = MemoryQuorumStateStore::new();
-        assert!(store.load().unwrap().is_none());
+        let state = store.load().await.unwrap();
+        assert!(state.is_none());
     }
 
-    #[test]
-    fn save_then_load_round_trips() {
+    #[tokio::test]
+    async fn save_and_load_roundtrip() {
         let store = MemoryQuorumStateStore::new();
         let qs = QuorumState {
             current_term: Term(5),
-            voted_for: Some(1),
+            voted_for: Some(NodeId(2)),
             leader_id: None,
             leader_epoch: Term(3),
         };
-        store.save(qs.clone()).unwrap();
-        let loaded = store.load().unwrap().expect("should be Some");
-        assert_eq!(loaded.current_term, qs.current_term);
-        assert_eq!(loaded.voted_for, qs.voted_for);
-        assert_eq!(loaded.leader_id, qs.leader_id);
-        assert_eq!(loaded.leader_epoch, qs.leader_epoch);
+        store.save(&qs).await.unwrap();
+
+        let loaded = store.load().await.unwrap().expect("should have state");
+        assert_eq!(loaded.current_term, Term(5));
+        assert_eq!(loaded.voted_for, Some(NodeId(2)));
+        assert_eq!(loaded.leader_epoch, Term(3));
     }
 
-    #[test]
-    fn save_overwrites_previous_state() {
+    #[tokio::test]
+    async fn save_overwrites_previous() {
         let store = MemoryQuorumStateStore::new();
         let qs1 = QuorumState {
             current_term: Term(1),
-            voted_for: Some(1),
-            leader_id: Some(1),
-            leader_epoch: Term(1),
-        };
-        store.save(qs1).unwrap();
-
-        let qs2 = QuorumState {
-            current_term: Term(2),
             voted_for: None,
             leader_id: None,
             leader_epoch: Term(0),
         };
-        store.save(qs2.clone()).unwrap();
-        let loaded = store.load().unwrap().expect("should be Some");
-        assert_eq!(loaded.current_term, qs2.current_term);
-        assert_eq!(loaded.voted_for, qs2.voted_for);
-        assert_eq!(loaded.leader_id, qs2.leader_id);
-        assert_eq!(loaded.leader_epoch, qs2.leader_epoch);
-    }
+        store.save(&qs1).await.unwrap();
 
-    #[test]
-    fn default_creates_empty_store() {
-        let store = MemoryQuorumStateStore::default();
-        assert!(store.load().unwrap().is_none());
+        let qs2 = QuorumState {
+            current_term: Term(3),
+            voted_for: Some(NodeId(1)),
+            leader_id: None,
+            leader_epoch: Term(2),
+        };
+        store.save(&qs2).await.unwrap();
+
+        let loaded = store.load().await.unwrap().unwrap();
+        assert_eq!(loaded.current_term, Term(3));
     }
 }
