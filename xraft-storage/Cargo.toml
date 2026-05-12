@@ -11,3 +11,12 @@ workspace = true
 xraft-core = { path = "../xraft-core" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+crc32c = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -33,6 +33,12 @@ impl ClusterId {
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4())
     }
+
+    /// Returns the cluster id formatted as a string suitable for use as a
+    /// filesystem path component.
+    pub fn as_str(&self) -> String {
+        self.0.to_string()
+    }
 }
 
 impl Default for ClusterId {
