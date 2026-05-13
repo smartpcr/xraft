@@ -2,7 +2,9 @@
 
 use async_trait::async_trait;
 use std::sync::RwLock;
-use xraft_core::traits::{QuorumState, QuorumStateStore};
+use xraft_core::error::Result;
+use xraft_core::quorum_state::QuorumState;
+use xraft_core::traits::QuorumStateStore;
 
 /// Thread-safe in-memory quorum state store implementing `QuorumStateStore`.
 ///
@@ -29,17 +31,12 @@ impl Default for MemoryQuorumStateStore {
 
 #[async_trait]
 impl QuorumStateStore for MemoryQuorumStateStore {
-    async fn load(
-        &self,
-    ) -> Result<Option<QuorumState>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn load(&self) -> Result<Option<QuorumState>> {
         let state = self.state.read().unwrap();
         Ok(state.clone())
     }
 
-    async fn save(
-        &self,
-        state: &QuorumState,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn save(&self, state: &QuorumState) -> Result<()> {
         let mut stored = self.state.write().unwrap();
         *stored = Some(state.clone());
         Ok(())
@@ -49,7 +46,17 @@ impl QuorumStateStore for MemoryQuorumStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xraft_core::types::{NodeId, Term};
+    use xraft_core::types::{ClusterId, NodeId, Term};
+
+    fn make_state(current_term: u64, voted_for: Option<u64>, leader_epoch: u64) -> QuorumState {
+        QuorumState {
+            current_term: Term(current_term),
+            voted_for: voted_for.map(NodeId),
+            leader_id: None,
+            leader_epoch: Term(leader_epoch),
+            cluster_id: ClusterId(uuid::Uuid::nil()),
+        }
+    }
 
     #[tokio::test]
     async fn load_returns_none_initially() {
@@ -61,34 +68,22 @@ mod tests {
     #[tokio::test]
     async fn save_and_load_roundtrip() {
         let store = MemoryQuorumStateStore::new();
-        let qs = QuorumState {
-            current_term: Term(5),
-            voted_for: Some(NodeId(2)),
-            leader_epoch: 3,
-        };
+        let qs = make_state(5, Some(2), 3);
         store.save(&qs).await.unwrap();
 
         let loaded = store.load().await.unwrap().expect("should have state");
         assert_eq!(loaded.current_term, Term(5));
         assert_eq!(loaded.voted_for, Some(NodeId(2)));
-        assert_eq!(loaded.leader_epoch, 3);
+        assert_eq!(loaded.leader_epoch, Term(3));
     }
 
     #[tokio::test]
     async fn save_overwrites_previous() {
         let store = MemoryQuorumStateStore::new();
-        let qs1 = QuorumState {
-            current_term: Term(1),
-            voted_for: None,
-            leader_epoch: 0,
-        };
+        let qs1 = make_state(1, None, 0);
         store.save(&qs1).await.unwrap();
 
-        let qs2 = QuorumState {
-            current_term: Term(3),
-            voted_for: Some(NodeId(1)),
-            leader_epoch: 2,
-        };
+        let qs2 = make_state(3, Some(1), 2);
         store.save(&qs2).await.unwrap();
 
         let loaded = store.load().await.unwrap().unwrap();

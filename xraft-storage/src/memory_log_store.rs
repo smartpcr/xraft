@@ -3,6 +3,7 @@
 //! Fast, deterministic, and suitable for testing. Supports optional fault
 //! injection (configurable `fsync` failure probability, write corruption).
 
+use std::io;
 use std::sync::RwLock;
 
 use async_trait::async_trait;
@@ -56,9 +57,10 @@ impl MemoryLogStore {
     pub fn append_sync(&self, entries: &[LogEntry]) -> Result<()> {
         let mut inner = self.inner.write().unwrap();
         if inner.fsync_failure_probability >= 1.0 {
-            return Err(XraftError::StorageError(
-                "simulated fsync failure".into(),
-            ));
+            return Err(XraftError::StorageError(io::Error::new(
+                io::ErrorKind::Other,
+                "simulated fsync failure",
+            )));
         }
         for entry in entries {
             inner.entries.push(entry.clone());
@@ -190,7 +192,7 @@ mod tests {
         let readback = store.read_sync(0, 100).unwrap();
         assert_eq!(readback.len(), 100);
         for (i, e) in readback.iter().enumerate() {
-            assert_eq!(e.offset.0, i as u64);
+            assert_eq!(e.offset, i as u64);
             assert_eq!(e.term.0, 1);
         }
     }
@@ -202,7 +204,7 @@ mod tests {
             .append_sync(&[cmd(0, 1, b"a"), cmd(1, 1, b"b")])
             .unwrap();
         let e = store.entry_at_sync(1).unwrap().unwrap();
-        assert_eq!(e.payload, b"b");
+        assert_eq!(e.payload.as_ref(), b"b");
         assert!(store.entry_at_sync(5).unwrap().is_none());
     }
 

@@ -9,7 +9,8 @@ use crate::error::Result;
 use crate::log_entry::LogEntry;
 use crate::quorum_state::QuorumState;
 use crate::rpc::RpcEnvelope;
-use crate::snapshot::{Snapshot, SnapshotId, SnapshotWriter};
+use crate::snapshot::{Snapshot, SnapshotId, SnapshotMetadata, SnapshotWriter};
+use crate::types::NodeId;
 
 // ---------------------------------------------------------------------------
 // Storage traits
@@ -34,6 +35,8 @@ pub trait LogStore: Send + Sync + 'static {
 
     /// The first offset still in the log.
     fn log_start_offset(&self) -> u64;
+
+    /// The next offset to be assigned (exclusive upper bound).
     fn log_end_offset(&self) -> u64;
 
     /// Read the entry at the given offset.
@@ -75,7 +78,7 @@ pub trait SnapshotIO: Send + Sync + 'static {
     async fn complete_receive(
         &self,
         writer: SnapshotWriter,
-        metadata: crate::snapshot::SnapshotMetadata,
+        metadata: SnapshotMetadata,
     ) -> Result<()>;
 }
 
@@ -85,20 +88,25 @@ pub trait SnapshotIO: Send + Sync + 'static {
 
 /// Trait for sending RPC messages to peers.
 ///
-/// Each `TransportSender` instance is typically bound to a single peer
-/// connection, so no target address is needed at send time.
+/// A single `TransportSender` is shared across the `IoStage` and routes
+/// envelopes to different peers based on the `target` argument.
 #[async_trait]
 pub trait TransportSender: Send + Sync + 'static {
-    /// Send an RPC envelope to the peer. Returns once the message has been
-    /// handed off to the transport layer (not necessarily acknowledged).
-    async fn send(&self, envelope: RpcEnvelope) -> Result<()>;
+    /// Send an RPC envelope to the given peer. Returns once the message
+    /// has been handed off to the transport layer (not necessarily
+    /// acknowledged by the remote end).
+    async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<()>;
 }
 
 /// Trait for receiving inbound RPC messages.
+///
+/// `recv` takes `&mut self` because only the single `ReceiverTask` reads
+/// from the network and the underlying `tokio::sync::mpsc::Receiver::recv`
+/// requires exclusive access.
 #[async_trait]
 pub trait TransportReceiver: Send + 'static {
     /// Block until the next inbound RPC envelope arrives.
-    async fn recv(&self) -> Result<RpcEnvelope>;
+    async fn recv(&mut self) -> Result<RpcEnvelope>;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,14 +128,16 @@ pub trait Clock: Send + 'static {
 }
 
 /// Trait for the application state machine driven by committed log entries.
-#[async_trait]
-pub trait StateMachine: Send + Sync + 'static {
-    /// Apply a committed record to the state machine.
-    async fn apply(&self, record: AppRecord) -> Result<()>;
+///
+/// Synchronous (not `#[async_trait]`) per architecture §4.1: application
+/// callbacks are invoked synchronously by the `EventLoop`.
+pub trait StateMachine: Send + 'static {
+    /// Apply a committed record to the state machine at the given offset.
+    fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>;
 
     /// Produce a point-in-time snapshot of the current state.
-    async fn snapshot(&self) -> Result<AppSnapshot>;
+    fn snapshot(&self) -> Result<AppSnapshot>;
 
     /// Restore state from a previously captured snapshot.
-    async fn restore(&self, snapshot: AppSnapshot) -> Result<()>;
+    fn restore(&mut self, snapshot: AppSnapshot) -> Result<()>;
 }

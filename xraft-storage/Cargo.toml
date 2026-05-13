@@ -11,3 +11,6 @@ workspace = true
 xraft-core = { path = "../xraft-core" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
