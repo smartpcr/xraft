@@ -299,7 +299,7 @@ impl<S: StateMachine, L: Listener> RaftNode<S, L> {
                 let response = self.handle_vote_request(req).await?;
                 let reply = RpcEnvelope {
                     cluster_id: self.state.cluster_id,
-                    leader_epoch: Term::ZERO,
+                    leader_epoch: 0,
                     source: self.state.node_id,
                     payload: RpcPayload::VoteResponse(response),
                 };
@@ -471,7 +471,7 @@ impl<S: StateMachine, L: Listener> RaftNode<S, L> {
 
         let envelope = RpcEnvelope {
             cluster_id: self.state.cluster_id,
-            leader_epoch: Term::ZERO,
+            leader_epoch: 0,
             source: self.state.node_id,
             payload: RpcPayload::VoteRequest(vote_request),
         };
