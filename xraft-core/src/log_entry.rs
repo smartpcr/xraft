@@ -1,47 +1,42 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::app_record::AppRecord;
 use crate::types::{Offset, Term};
 
-/// Type of log entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EntryType {
-    /// Application command wrapping an AppRecord.
+/// Distinguishes ordinary command entries from leader-change marker entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogEntryKind {
     Command,
-    /// Leader change message (control record, never exposed to StateMachine).
-    LeaderChangeMessage,
-    /// Voters record (control record, never exposed to StateMachine).
-    VotersRecord,
+    LeaderChange,
 }
 
-/// A single entry in the replicated log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A single entry of the replicated log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
-    /// Position in the log (0-indexed).
-    pub offset: u64,
-    pub term: u64,
-    pub entry_type: EntryType,
-    /// Serialised command or control record.
+    pub offset: Offset,
+    pub term: Term,
+    pub kind: LogEntryKind,
     pub payload: Bytes,
 }
 
 impl LogEntry {
-    /// Create a command log entry.
-    pub fn command(offset: Offset, term: Term, data: Vec<u8>) -> Self {
+    /// Build a `Command` entry from an `AppRecord`.
+    pub fn command(offset: Offset, term: Term, record: &AppRecord) -> Self {
         Self {
-            offset: offset.0,
-            term: term.0,
-            entry_type: EntryType::Command,
-            payload: Bytes::from(data),
+            offset,
+            term,
+            kind: LogEntryKind::Command,
+            payload: record.data.clone(),
         }
     }
 
-    /// Create a leader change message (no-op) log entry.
-    pub fn leader_change(offset: u64, term: Term) -> Self {
+    /// Build a `LeaderChange` marker entry. Carries no payload.
+    pub fn leader_change(offset: Offset, term: Term) -> Self {
         Self {
             offset,
-            term: term.0,
-            entry_type: EntryType::LeaderChangeMessage,
+            term,
+            kind: LogEntryKind::LeaderChange,
             payload: Bytes::new(),
         }
     }
