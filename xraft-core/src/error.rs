@@ -1,26 +1,34 @@
 use std::io;
 
-/// Top-level error type for xraft.
-#[derive(Error, Debug)]
+/// Errors produced by xraft operations.
+#[derive(Debug)]
 pub enum XraftError {
-    #[error("storage error: {0}")]
-    StorageError(#[from] std::io::Error),
-
-    #[error("transport error: {0}")]
-    TransportError(String),
-
-    #[error("not leader")]
-    NotLeader,
     StorageError(String),
     TransportError(String),
+    NotLeader,
+    ProposalQueueFull,
+
+    /// RPC cluster_id mismatch.
+    #[error("invalid cluster id")]
+    InvalidClusterId,
+
+    /// Node is shutting down; no new operations accepted.
+    #[error("node is shutting down")]
     Shutdown,
 
-    #[error("serialization error: {0}")]
-    SerializationError(String),
-
-    #[error("corruption: {0}")]
-    Corruption(String),
+impl fmt::Display for XraftError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            XraftError::StorageError(msg) => write!(f, "storage error: {msg}"),
+            XraftError::TransportError(msg) => write!(f, "transport error: {msg}"),
+            XraftError::NotLeader => write!(f, "not leader"),
+            XraftError::ProposalQueueFull => write!(f, "proposal queue full"),
+            XraftError::InvalidClusterId => write!(f, "invalid cluster id"),
+            XraftError::Shutdown => write!(f, "node shut down"),
+        }
+    }
 }
 
-/// Convenience Result type.
+impl std::error::Error for XraftError {}
+
 pub type Result<T> = std::result::Result<T, XraftError>;
