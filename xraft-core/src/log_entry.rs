@@ -1,8 +1,18 @@
 use serde::{Deserialize, Serialize};
 
-use crate::app_record::AppRecord;
-use crate::types::{Offset, Term};
+use crate::types::Term;
 use crate::voter::VotersRecord;
+
+/// Discriminator for log entry types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntryType {
+    /// Application-level state machine command.
+    Command,
+    /// Leader no-op appended at the start of a new term.
+    LeaderChangeMessage,
+    /// Membership change — contains a complete `VotersRecord`.
+    VotersRecord,
+}
 
 /// A single entry in the replicated log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,15 +20,29 @@ pub struct LogEntry {
     pub offset: Offset,
     pub term: Term,
     pub entry_type: EntryType,
+    /// Serialised payload (command bytes or control record).
+    pub payload: Vec<u8>,
 }
 
-/// Discriminates application records from consensus control records.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum EntryType {
-    /// Client-submitted command forwarded to the StateMachine.
-    Command(AppRecord),
-    /// Appended by a new leader to establish commit state for its term.
-    LeaderChangeMessage,
-    /// Records a membership change (voter set update).
-    VotersRecord(VotersRecord),
+impl LogEntry {
+    /// Create a VotersRecord log entry at the given offset and term.
+    pub fn voters_record(offset: u64, term: Term, record: &VotersRecord) -> Self {
+        let payload = bincode::serialize(record).expect("VotersRecord serialisation");
+        LogEntry {
+            offset,
+            term,
+            entry_type: EntryType::VotersRecord,
+            payload,
+        }
+    }
+
+    /// Create a Command log entry.
+    pub fn command(offset: u64, term: Term, data: Vec<u8>) -> Self {
+        LogEntry {
+            offset,
+            term,
+            entry_type: EntryType::Command,
+            payload: data,
+        }
+    }
 }
