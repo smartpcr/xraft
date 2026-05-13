@@ -1,1 +1,4 @@
-// Stub: test utilities crate to be implemented in Stage 1.8.
+//! xraft-test: Deterministic testing harness for xraft.
+
+pub mod invariant_checker;
+pub mod simulated_cluster;
