@@ -1,41 +1,25 @@
-//! Stage 1.4 — pluggable trait contracts.
+//! Stage 1.4: trait definitions for Storage, Transport, Runtime, and
+//! the application `StateMachine`.
 //!
-//! Three categories, distinguished by their caller and bounds (per
-//! architecture §4.1):
+//! Grouping (per architecture §4.1 / §4.4):
 //!
-//! 1. **Storage / Network-Send I/O** — async, `Send + Sync + 'static`,
-//!    every method takes `&self`. Implementations are injected as
-//!    `Box<dyn …>` trait objects into the `IoStage`, which fans out
-//!    `IoAction`s concurrently across multiple peers. The `Sync` bound
-//!    is required because the stage may borrow `&self` simultaneously
-//!    from several spawned tasks within one batch; implementations use
-//!    interior mutability (e.g., `tokio::sync::Mutex<File>`) for the
-//!    write paths.
-//!
-//!    These traits are: [`LogStore`], [`QuorumStateStore`],
-//!    [`SnapshotIO`], [`TransportSender`].
-//!
-//! 2. **Runtime** — async, `Send + 'static` (no `Sync`), used by the
-//!    single-threaded callers (`EventLoop`, `ReceiverTask`). Injected
-//!    as `Box<dyn …>` trait objects but never shared across tasks.
-//!
-//!    These traits are: [`TransportReceiver`] (`recv` takes
-//!    `&mut self` — only the `ReceiverTask` reads from the network)
-//!    and [`Clock`] (used by the `EventLoop` for timer management; not
-//!    mediated by `IoAction`).
-//!
-//! 3. **Application** — synchronous (no `#[async_trait]`), invoked by
-//!    the `EventLoop` during commit processing *before* any
-//!    `IoAction` is dispatched. Monomorphised as a generic parameter
-//!    on `RaftNode<S, L>` rather than `Box<dyn …>`.
-//!
-//!    This category is [`StateMachine`].
+//! * **Storage / I/O** — `LogStore`, `QuorumStateStore`, `SnapshotIO`,
+//!   `TransportSender`. Mediated by the `IoStage`, may be called
+//!   concurrently from multiple tasks, therefore `Send + Sync +
+//!   'static` and take `&self` with interior mutability.
+//! * **Transport receive** — `TransportReceiver`. Single consumer
+//!   (the `ReceiverTask`); `Send + 'static`, takes `&mut self`.
+//! * **Runtime** — `Clock`. Used directly by the `EventLoop` for timer
+//!   management; `Send + 'static` (single-threaded event loop, no
+//!   `Sync` required), `#[async_trait]` for `Box<dyn Clock>` object
+//!   safety.
+//! * **Application** — `StateMachine`. Synchronous callback driven by
+//!   the `EventLoop`; `Send + 'static`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::time::Instant;
 
 use crate::app_record::{AppRecord, AppSnapshot};
 use crate::error::Result;
@@ -45,66 +29,66 @@ use crate::rpc::RpcEnvelope;
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotWriter};
 use crate::types::NodeId;
 
-// =========================================================================
-// Storage / Network-Send I/O traits
-// =========================================================================
+// ---------------------------------------------------------------------
+// Storage / I/O group
+// ---------------------------------------------------------------------
 
-/// Durable, append-only replicated log.
+/// Durable replicated-log storage.
 ///
-/// Every method takes `&self` — implementations use interior
-/// mutability (e.g., `tokio::sync::Mutex<File>`) so the `IoStage` can
-/// hold shared borrows of the trait object while concurrent
-/// `AppendLog` / `TruncateSuffix` / read operations are in flight.
+/// All methods take `&self`; concrete implementations use interior
+/// mutability (e.g. `tokio::sync::Mutex<File>`) so that the `IoStage`
+/// can dispatch multiple log operations concurrently
+/// (architecture §4.1).
 #[async_trait]
 pub trait LogStore: Send + Sync + 'static {
-    /// Append `entries` to the tail of the log.
-    ///
-    /// Must be durable (`fsync` or equivalent) before returning `Ok`.
-    /// Implementations must reject non-contiguous appends.
+    /// Append `entries` and fsync before returning `Ok`.
     async fn append(&self, entries: &[LogEntry]) -> Result<()>;
 
     /// Read entries in the half-open range `[start_offset, end_offset)`.
     async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>>;
 
-    /// Truncate the log *suffix* starting at `from_offset` (inclusive),
-    /// used when the leader's log diverges from this node's.
+    /// Truncate the log suffix starting at `from_offset`
+    /// (used on divergence with the leader's log).
     async fn truncate_suffix(&self, from_offset: u64) -> Result<()>;
 
-    /// Truncate the log *prefix* up to `up_to_offset` (exclusive),
-    /// used after a snapshot has covered earlier entries.
+    /// Truncate the log prefix up to (but not including) `up_to_offset`
+    /// (used after a snapshot is durable).
     async fn truncate_prefix(&self, up_to_offset: u64) -> Result<()>;
 
-    /// First offset still present in the log (inclusive).
+    /// Offset of the first entry still present in the log
+    /// (`log_end_offset` if the log is empty).
     fn log_start_offset(&self) -> u64;
 
-    /// Next offset to be assigned by `append` (exclusive upper bound).
+    /// Exclusive upper bound — one past the last appended offset.
     fn log_end_offset(&self) -> u64;
 
-    /// Read the entry at `offset`, or `None` if outside `[start, end)`.
+    /// Read a single entry by offset. Returns `Ok(None)` if the offset
+    /// is outside `[log_start_offset, log_end_offset)`.
     async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>>;
 }
 
-/// Durable storage for the per-node quorum state record.
+/// Persisted voting / quorum state required for crash recovery.
 #[async_trait]
 pub trait QuorumStateStore: Send + Sync + 'static {
-    /// Load the persisted state, or `None` if no state has been written.
+    /// Load persisted state. Returns `Ok(None)` when no state file
+    /// exists (fresh node).
     async fn load(&self) -> Result<Option<QuorumState>>;
 
-    /// Persist `state` durably (`fsync` or equivalent) before returning.
+    /// Persist `state` and fsync before returning `Ok`.
     async fn save(&self, state: &QuorumState) -> Result<()>;
 }
 
-/// Durable storage and chunked transfer for state-machine snapshots.
+/// Snapshot read / write I/O.
 #[async_trait]
 pub trait SnapshotIO: Send + Sync + 'static {
-    /// Write a complete snapshot atomically.
+    /// Persist a complete snapshot atomically.
     async fn save(&self, snapshot: &Snapshot) -> Result<()>;
 
     /// Load the most recent snapshot, if any.
     async fn load_latest(&self) -> Result<Option<Snapshot>>;
 
-    /// Read a chunk of the snapshot identified by `id` starting at
-    /// byte `position`, up to `max_bytes`. Returns `(bytes, is_last)`.
+    /// Read up to `max_bytes` of snapshot `id` starting at `position`.
+    /// Returns `(chunk, is_last_chunk)`.
     async fn read_chunk(
         &self,
         id: &SnapshotId,
@@ -112,117 +96,103 @@ pub trait SnapshotIO: Send + Sync + 'static {
         max_bytes: u32,
     ) -> Result<(Bytes, bool)>;
 
-    /// Begin receiving a snapshot from the leader. Returns a writer
-    /// session that subsequent `FetchSnapshotResponse` chunks are
-    /// appended to.
+    /// Begin a chunked receive session for a snapshot streamed from
+    /// the leader.
     async fn begin_receive(&self, id: &SnapshotId) -> Result<SnapshotWriter>;
 }
 
 /// Outbound side of the network transport.
 ///
-/// `send` takes `&self` so the `IoStage` can dispatch RPCs to many
-/// peers concurrently from a single owned trait object.
+/// `&self` because the `IoStage` may dispatch sends to multiple peers
+/// concurrently from a shared sender handle (architecture §4.4).
 #[async_trait]
 pub trait TransportSender: Send + Sync + 'static {
-    /// Send `message` to `target`. Returns once the message has been
-    /// handed to the transport — the call does **not** wait for an
-    /// application-level ack.
     async fn send(&self, target: NodeId, message: RpcEnvelope) -> Result<()>;
 }
 
-// =========================================================================
-// Runtime traits
-// =========================================================================
+// ---------------------------------------------------------------------
+// Transport receive (single consumer)
+// ---------------------------------------------------------------------
 
 /// Inbound side of the network transport.
 ///
-/// `recv` takes `&mut self` because only the single `ReceiverTask`
-/// reads from the network. Splitting the transport into a
-/// `Send + Sync` sender and a `Send`-only receiver (rather than a
-/// single `Send + Sync` trait) mirrors `tokio::sync::mpsc::Receiver`
-/// and avoids forcing implementations to wrap their receive half in a
-/// `Mutex`.
+/// `&mut self` because the `ReceiverTask` is the single owner of the
+/// receive side (architecture §4.4); no `Sync` required.
 #[async_trait]
 pub trait TransportReceiver: Send + 'static {
-    /// Block until the next inbound RPC arrives.
+    /// Await the next inbound envelope.
     async fn recv(&mut self) -> Result<RpcEnvelope>;
 }
 
-/// Time source used by the `EventLoop` for timer management.
+// ---------------------------------------------------------------------
+// Runtime group
+// ---------------------------------------------------------------------
+
+/// Pluggable time source used by the `EventLoop` for timer management
+/// (election timeouts, fetch intervals, check-quorum deadlines).
 ///
-/// `Clock` is a *Runtime* trait — it is consumed directly by the
-/// single-threaded event loop and is **not** mediated by `IoAction` /
-/// `IoStage` (architecture §4.1). It is injected as
-/// `Box<dyn Clock>`; the `#[async_trait]` attribute is required for
-/// `async fn sleep_until` to be object-safe under `dyn Clock`.
+/// `#[async_trait]` is required so that `sleep_until` (an async method)
+/// remains object-safe behind `Box<dyn Clock>`. The trait is
+/// `Send + 'static` (not `Sync`) because only the single-threaded
+/// event loop calls it.
 #[async_trait]
 pub trait Clock: Send + 'static {
-    /// The current instant according to this clock.
+    /// Current monotonic instant.
     fn now(&self) -> Instant;
 
-    /// Suspend until `deadline` has been reached.
+    /// Sleep until `deadline`. Returns immediately if `deadline` is in
+    /// the past.
     async fn sleep_until(&self, deadline: Instant);
 
-    /// Generate a new randomised election-timeout duration.
+    /// Draw a uniformly-random election timeout from the configured
+    /// `[election_timeout_min, election_timeout_max]` range.
     fn random_election_timeout(&self) -> Duration;
 }
 
-// =========================================================================
-// Application trait
-// =========================================================================
+// ---------------------------------------------------------------------
+// Application group
+// ---------------------------------------------------------------------
 
-/// The user-supplied state machine driven by committed log entries.
+/// Application-supplied state machine driven by the `EventLoop`.
 ///
-/// Synchronous (intentionally **not** `#[async_trait]`): the
-/// `EventLoop` invokes these methods in-process during commit
-/// processing, before any `IoAction` is dispatched. They must be
-/// non-blocking and inexpensive.
-///
-/// Only `AppRecord` payloads (i.e., `LogEntry`s with
-/// `entry_type == EntryType::Command`) are surfaced here — control
-/// records (`LeaderChangeMessage`, `VotersRecord`) are filtered out by
-/// the protocol layer.
+/// Synchronous on purpose (architecture §4.1): `apply` / `snapshot` /
+/// `restore` are called inline by the event loop and must not block
+/// the consensus tasks. Long-running work belongs in a separate
+/// application task driven via channels.
 pub trait StateMachine: Send + 'static {
-    /// Apply the record at `offset` to the state machine. Returning
-    /// `Err` is treated as irrecoverable by the event loop (it logs,
-    /// calls `Listener::begin_shutdown`, and halts the node).
+    /// Apply a committed command at `offset`.
     fn apply(&mut self, offset: u64, record: &AppRecord) -> Result<()>;
 
-    /// Produce a point-in-time snapshot of the current state.
+    /// Produce a snapshot of the current application state.
     fn snapshot(&self) -> Result<AppSnapshot>;
 
-    /// Replace current state with the contents of `snapshot`.
+    /// Restore application state from a snapshot.
     fn restore(&mut self, snapshot: AppSnapshot) -> Result<()>;
 }
 
-// =========================================================================
-// Object-safety pinning tests
-// =========================================================================
+// ---------------------------------------------------------------------
+// Static object-safety assertions
+// ---------------------------------------------------------------------
 //
-// The trait *contracts* described above are part of xraft's public
-// API. Object-safety is a load-bearing property — the protocol layer
-// stores `Box<dyn LogStore>`, `Box<dyn TransportSender>`, etc. If a
-// future change accidentally adds a generic method, a `Self: Sized`
-// bound, or a `where Self: …` clause that breaks dyn-compatibility,
-// these compile-time assertions fail rather than silently shipping a
-// regression.
+// These force a compile error if any Stage 1.4 trait stops being
+// object-safe (which would break trait-object injection into
+// `RaftNode` per architecture §4.1).
 
-#[cfg(test)]
+#[doc(hidden)]
 mod object_safety {
     use super::*;
 
     #[allow(dead_code)]
-    fn assert_log_store_dyn(_: Box<dyn LogStore>) {}
+    fn assert_object_safe<T: ?Sized>() {}
+
     #[allow(dead_code)]
-    fn assert_quorum_state_store_dyn(_: Box<dyn QuorumStateStore>) {}
-    #[allow(dead_code)]
-    fn assert_snapshot_io_dyn(_: Box<dyn SnapshotIO>) {}
-    #[allow(dead_code)]
-    fn assert_transport_sender_dyn(_: Box<dyn TransportSender>) {}
-    #[allow(dead_code)]
-    fn assert_transport_receiver_dyn(_: Box<dyn TransportReceiver>) {}
-    #[allow(dead_code)]
-    fn assert_clock_dyn(_: Box<dyn Clock>) {}
-    #[allow(dead_code)]
-    fn assert_state_machine_dyn(_: Box<dyn StateMachine>) {}
+    fn _checks() {
+        assert_object_safe::<dyn LogStore>();
+        assert_object_safe::<dyn QuorumStateStore>();
+        assert_object_safe::<dyn SnapshotIO>();
+        assert_object_safe::<dyn TransportSender>();
+        assert_object_safe::<dyn TransportReceiver>();
+        assert_object_safe::<dyn Clock>();
+        assert_object_safe::<dyn StateMachine>();
+    }
 }
