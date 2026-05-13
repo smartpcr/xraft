@@ -3,13 +3,13 @@ use std::net::SocketAddr;
 /// Information about a voter in the cluster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoterInfo {
-    pub node_id: u64,
-    pub endpoint: String,
+    pub node_id: NodeId,
+    pub endpoint: SocketAddr,
 }
 
 /// A record of the current voter set, appended to the log on membership changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VotersRecord {
-    pub version: u64,
+    pub version: u32,
     pub voters: Vec<VoterInfo>,
 }
