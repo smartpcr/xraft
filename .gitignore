@@ -1,7 +1,4 @@
-/target/
-**/*.rs.bk
-*.pdb
-Cargo.lock
+target/
 *.swp
 *.swo
 *~
