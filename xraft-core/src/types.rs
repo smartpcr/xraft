@@ -94,3 +94,31 @@ impl fmt::Display for Offset {
         write!(f, "@{}", self.0)
     }
 }
+
+/// Opaque application snapshot payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AppSnapshot {
+    pub data: Vec<u8>,
+}
+
+/// Node role in the Raft state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Role {
+    Unattached,
+    Follower,
+    Candidate,
+    Leader,
+}
+
+impl Default for Role {
+    fn default() -> Self {
+        Role::Unattached
+    }
+}
+
+/// Information about a voter in the cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoterInfo {
+    pub node_id: NodeId,
+    pub endpoint: String,
+}
