@@ -4,9 +4,6 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
-[lints]
-workspace = true
-
 [dependencies]
 bytes = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

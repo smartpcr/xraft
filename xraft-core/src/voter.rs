@@ -7,8 +7,8 @@ use crate::types::NodeId;
 /// Information about a single voter in the cluster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoterInfo {
-    pub node_id: NodeId,
-    pub endpoint: SocketAddr,
+    pub node_id: u64,
+    pub endpoint: String,
 }
 
 /// A snapshot of the current voter set, committed as a control record.
