@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::types::Term;
@@ -15,10 +16,13 @@ pub enum EntryType {
 }
 
 /// A single entry in the replicated log.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
-    pub offset: Offset,
+    /// Position in the log (0-indexed).
+    pub offset: u64,
+    /// Term when the entry was created.
     pub term: Term,
+    /// Type discriminator.
     pub entry_type: EntryType,
     /// Serialised payload (command bytes or control record).
     pub payload: Vec<u8>,
