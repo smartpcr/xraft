@@ -792,12 +792,10 @@ dependencies = [
  "async-trait",
  "bytes",
  "rand",
- "serde",
- "serde_json",
  "tokio",
- "tracing",
  "xraft-core",
  "xraft-storage",
+ "xraft-transport",
 ]
 
 [[package]]

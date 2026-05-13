@@ -106,17 +106,13 @@ mod tests {
     use xraft_core::app_record::AppSnapshot;
     use xraft_core::snapshot::SnapshotMetadata;
     use xraft_core::voter::VoterInfo;
-    use xraft_core::types::NodeId;
 
     fn make_test_snapshot() -> Snapshot {
         Snapshot {
             metadata: SnapshotMetadata {
                 last_included_offset: 100,
                 last_included_term: 5,
-                voters: vec![VoterInfo {
-                    node_id: NodeId(1),
-                    endpoint: "127.0.0.1:8080".parse().unwrap(),
-                }],
+                voters: vec![VoterInfo::new(1, "127.0.0.1:8080")],
                 leader_epoch: 3,
             },
             app_snapshot: AppSnapshot {
@@ -196,10 +192,7 @@ mod tests {
         let metadata = SnapshotMetadata {
             last_included_offset: 200,
             last_included_term: 10,
-            voters: vec![VoterInfo {
-                node_id: NodeId(1),
-                endpoint: "127.0.0.1:9090".parse().unwrap(),
-            }],
+            voters: vec![VoterInfo::new(1, "127.0.0.1:9090")],
             leader_epoch: 4,
         };
         store.complete_receive(writer, metadata.clone()).await.unwrap();

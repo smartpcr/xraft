@@ -17,4 +17,4 @@ pub use quorum_state::QuorumState;
 pub use snapshot::{Snapshot, SnapshotId, SnapshotMetadata, SnapshotReader, SnapshotWriter};
 pub use traits::{Clock, LogStore, QuorumStateStore, SnapshotIO};
 pub use types::{ClusterId, NodeId, Offset, Term};
-pub use voter::{VoterInfo, VotersRecord};
+pub use voter::VoterInfo;

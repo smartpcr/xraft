@@ -13,7 +13,7 @@ impl fmt::Display for NodeId {
 }
 
 /// Raft term (monotonically increasing logical clock).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Term(pub u64);
 
 impl Term {

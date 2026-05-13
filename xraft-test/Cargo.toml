@@ -11,3 +11,6 @@ xraft-core = { path = "../xraft-core" }
 xraft-storage = { path = "../xraft-storage" }
 xraft-transport = { path = "../xraft-transport" }
 bytes = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+rand = { workspace = true }
