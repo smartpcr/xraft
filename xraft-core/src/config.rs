@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-/// Configuration for the Raft node.
+use crate::types::NodeId;
+
+/// Construction-time configuration for a RaftNode.
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
     /// This node's unique identifier within the cluster.
@@ -51,15 +53,20 @@ impl Default for RaftConfig {
 }
 
 impl RaftConfig {
-    /// Validate the configuration.
+    /// Validates configuration invariants.
+    /// `fetch_interval_ms < election_timeout_min_ms < election_timeout_max_ms`
     pub fn validate(&self) -> Result<(), String> {
-        if self.election_timeout_min_ms >= self.election_timeout_max_ms {
-            return Err(
-                "election_timeout_min_ms must be < election_timeout_max_ms".to_string(),
-            );
-        }
         if self.fetch_interval_ms >= self.election_timeout_min_ms {
-            return Err("fetch_interval_ms must be < election_timeout_min_ms".to_string());
+            return Err(format!(
+                "fetch_interval_ms ({}) must be < election_timeout_min_ms ({})",
+                self.fetch_interval_ms, self.election_timeout_min_ms
+            ));
+        }
+        if self.election_timeout_min_ms >= self.election_timeout_max_ms {
+            return Err(format!(
+                "election_timeout_min_ms ({}) must be < election_timeout_max_ms ({})",
+                self.election_timeout_min_ms, self.election_timeout_max_ms
+            ));
         }
         Ok(())
     }
