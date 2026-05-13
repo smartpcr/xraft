@@ -1,4 +1,3 @@
-//! xraft-test: Deterministic testing harness for xraft.
+//! xraft-test: test utilities and mock implementations for xraft.
 
-pub mod invariant_checker;
-pub mod simulated_cluster;
+pub mod mocks;
