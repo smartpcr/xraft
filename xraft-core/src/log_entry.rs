@@ -1,34 +1,43 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::types::Term;
+use crate::app_record::AppRecord;
+use crate::types::{Offset, Term};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum EntryType {
-    NoOp,
+/// Distinguishes ordinary command entries from leader-change marker entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogEntryKind {
     Command,
-    Configuration,
+    LeaderChange,
 }
 
+/// A single entry of the replicated log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
-    pub offset: u64,
+    pub offset: Offset,
     pub term: Term,
-    pub entry_type: EntryType,
+    pub kind: LogEntryKind,
     pub payload: Bytes,
 }
 
 impl LogEntry {
-    pub fn new(offset: u64, term: Term, entry_type: EntryType, payload: Bytes) -> Self {
+    /// Build a `Command` entry from an `AppRecord`.
+    pub fn command(offset: Offset, term: Term, record: &AppRecord) -> Self {
         Self {
             offset,
             term,
-            entry_type,
-            payload,
+            kind: LogEntryKind::Command,
+            payload: record.data.clone(),
         }
     }
 
-    pub fn no_op(offset: u64, term: Term) -> Self {
-        Self::new(offset, term, EntryType::NoOp, Bytes::new())
+    /// Build a `LeaderChange` marker entry. Carries no payload.
+    pub fn leader_change(offset: Offset, term: Term) -> Self {
+        Self {
+            offset,
+            term,
+            kind: LogEntryKind::LeaderChange,
+            payload: Bytes::new(),
+        }
     }
 }
