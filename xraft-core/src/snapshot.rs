@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::app_record::AppSnapshot;
 use crate::voter::VoterInfo;
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use std::io;
+use std::path::PathBuf;
+use tokio::sync::Mutex;
 
 /// Identifier for a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -52,4 +57,11 @@ impl SnapshotWriter {
 /// Reader for delivering a snapshot to a follower for restore.
 pub struct SnapshotReader {
     pub data: Vec<u8>,
+}
+
+/// A reader for snapshot chunks (used during follower restore).
+#[derive(Debug)]
+pub struct SnapshotReader {
+    pub data: Bytes,
+    pub metadata: SnapshotMetadata,
 }

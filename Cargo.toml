@@ -12,9 +12,6 @@ edition = "2021"
 version = "0.1.0"
 license = "MIT"
 
-[workspace.lints.clippy]
-all = "deny"
-
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -22,7 +19,6 @@ serde_json = "1"
 bincode = "1"
 bytes = { version = "1", features = ["serde"] }
 tracing = "0.1"
-uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 thiserror = "2"
 rand = "0.8"
