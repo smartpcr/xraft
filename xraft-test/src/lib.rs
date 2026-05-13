@@ -1,3 +1,1 @@
-//! xraft-test: test utilities and mock implementations for xraft.
-
-pub mod mocks;
+// Stub: test utilities crate to be implemented in Stage 1.8.
