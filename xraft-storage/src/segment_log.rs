@@ -148,6 +148,13 @@ impl SegmentLog {
 
 #[async_trait]
 impl LogStore for SegmentLog {
+    /// Append entries.
+    ///
+    /// Rollover semantics: a new segment is started before the batch when the
+    /// current segment already meets or exceeds the configured segment size
+    /// limit. The entire batch is then written to a single segment; we never
+    /// split a batch across segments. As a result, an individual segment may
+    /// exceed the size limit by up to one batch's serialized size.
     async fn append(&self, entries: &[LogEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
