@@ -1,3 +1,6 @@
+use std::net::SocketAddr;
+
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::log_entry::LogEntry;
@@ -206,15 +209,97 @@ impl MembershipChangeResponse {
 /// Errors that can occur during membership changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MembershipError {
+    /// The receiving node is not the current leader.
     NotLeader { leader_id: Option<NodeId> },
+    /// An uncommitted VotersRecord already exists in the log.
     ChangeInProgress,
+    /// The node is already a voter in the current configuration.
     NodeAlreadyVoter,
+    /// The node was not found in the current configuration.
     NodeNotFound,
+    /// The observer's fetch_offset is behind the leader's current HW.
     NodeNotCaughtUp,
 }
 
-/// Consensus control record for voter set changes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VotersRecordPayload {
-    pub record: VotersRecord,
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn rpc_envelope_vote_request_roundtrip() {
+        let envelope = RpcEnvelope {
+            cluster_id: ClusterId(Uuid::from_u128(0xdead_beef_cafe_babe_1234_5678_9abc_def0)),
+            leader_epoch: Term(5),
+            source: NodeId(42),
+            payload: RpcPayload::VoteRequest(VoteRequest {
+                term: Term(6),
+                candidate_id: NodeId(42),
+                last_log_offset: Offset(100),
+                last_log_term: Term(4),
+                is_pre_vote: true,
+            }),
+        };
+
+        let encoded = bincode::serialize(&envelope).expect("serialize");
+        let decoded: RpcEnvelope = bincode::deserialize(&encoded).expect("deserialize");
+
+        assert_eq!(envelope, decoded);
+    }
+
+    #[test]
+    fn rpc_envelope_fetch_snapshot_response_roundtrip() {
+        let envelope = RpcEnvelope {
+            cluster_id: ClusterId(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888)),
+            leader_epoch: Term(10),
+            source: NodeId(1),
+            payload: RpcPayload::FetchSnapshotResponse(FetchSnapshotResponse {
+                snapshot_id: SnapshotId {
+                    end_offset: Offset(500),
+                    epoch: Term(9),
+                },
+                position: 4096,
+                data: Bytes::from_static(b"snapshot-chunk-data"),
+                is_last_chunk: false,
+            }),
+        };
+
+        let encoded = bincode::serialize(&envelope).expect("serialize");
+        let decoded: RpcEnvelope = bincode::deserialize(&encoded).expect("deserialize");
+
+        assert_eq!(envelope, decoded);
+    }
+
+    #[test]
+    fn membership_error_exhaustive_match() {
+        let variants: Vec<MembershipError> = vec![
+            MembershipError::NotLeader {
+                leader_id: Some(NodeId(1)),
+            },
+            MembershipError::ChangeInProgress,
+            MembershipError::NodeAlreadyVoter,
+            MembershipError::NodeNotFound,
+            MembershipError::NodeNotCaughtUp,
+        ];
+
+        for error in &variants {
+            // Exhaustive match — if a variant is added without updating this
+            // test, compilation will fail.
+            match error {
+                MembershipError::NotLeader { leader_id } => {
+                    assert!(leader_id.is_some());
+                }
+                MembershipError::ChangeInProgress => {}
+                MembershipError::NodeAlreadyVoter => {}
+                MembershipError::NodeNotFound => {}
+                MembershipError::NodeNotCaughtUp => {}
+            }
+        }
+
+        assert_eq!(variants.len(), 5, "all five MembershipError variants must be covered");
+    }
 }
