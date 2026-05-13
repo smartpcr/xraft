@@ -1,10 +1,9 @@
 use xraft_core::app_record::{AppRecord, AppSnapshot};
 use xraft_core::listener::Listener;
 use xraft_core::listener_event::ListenerEvent;
-use xraft_core::snapshot::{
-    Snapshot, SnapshotMetadata, SnapshotReader, VoterInfo,
-};
+use xraft_core::snapshot::{Snapshot, SnapshotMetadata, SnapshotReader};
 use xraft_core::types::{NodeId, Term};
+use xraft_core::voter::VoterInfo;
 
 /// Mock listener that records all callbacks for test assertions.
 #[derive(Debug, Default)]
@@ -44,7 +43,7 @@ fn make_snapshot_reader(data: &[u8]) -> SnapshotReader {
             last_included_term: 2,
             voters: vec![VoterInfo {
                 node_id: NodeId(1),
-                endpoint: "127.0.0.1:9000".to_string(),
+                endpoint: "127.0.0.1:9000".parse().unwrap(),
             }],
             leader_epoch: 1,
         },

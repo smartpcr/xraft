@@ -1,21 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::app_record::AppSnapshot;
-use crate::types::NodeId;
+use crate::voter::VoterInfo;
 
-/// Voter identity and network endpoint.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VoterInfo {
-    pub node_id: NodeId,
-    pub endpoint: String,
-}
-
-/// A record describing the current voter set (membership configuration).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VotersRecord {
-    pub version: u64,
-    pub voters: Vec<VoterInfo>,
-}
+pub use crate::voter::VotersRecord;
 
 /// Metadata attached to a snapshot, capturing consensus state at the
 /// point the snapshot was taken.
