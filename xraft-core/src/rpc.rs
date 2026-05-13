@@ -1,8 +1,4 @@
-use std::net::SocketAddr;
-
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 use bytes::Bytes;
 
@@ -212,14 +208,9 @@ impl MembershipChangeResponse {
 /// Errors that can occur during membership changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MembershipError {
-    /// The receiving node is not the current leader.
     NotLeader { leader_id: Option<NodeId> },
-    /// An uncommitted VotersRecord already exists in the log.
     ChangeInProgress,
-    /// The node is already a voter in the current configuration.
     NodeAlreadyVoter,
-    /// The node was not found in the current configuration.
     NodeNotFound,
-    /// The observer's fetch_offset is behind the leader's current HW.
     NodeNotCaughtUp,
 }
