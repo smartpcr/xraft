@@ -17,8 +17,11 @@ pub enum EntryType {
 /// A single entry in the replicated log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
+    /// Position in the log (0-based).
     pub offset: Offset,
+    /// Term in which the entry was created.
     pub term: Term,
+    /// Type of this entry.
     pub entry_type: EntryType,
     /// Serialised payload (command bytes or control record).
     pub payload: Vec<u8>,
