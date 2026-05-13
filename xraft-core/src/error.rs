@@ -1,56 +1,23 @@
 use std::io;
 
-use thiserror::Error;
-
-use crate::types::NodeId;
-
-/// Unified error type for all xraft public APIs.
-#[derive(Debug, Error)]
+/// Top-level error type for xraft.
+#[derive(Error, Debug)]
 pub enum XraftError {
-    #[error("storage error: {0}")]
-    StorageError(#[from] std::io::Error),
-
-    #[error("transport error: {0}")]
+    StorageError(String),
     TransportError(String),
 
-    /// `propose()` called on a non-leader node.
-    #[error("not leader; current leader is {leader_id:?}")]
-    NotLeader { leader_id: Option<NodeId> },
-
-    /// BatchAccumulator back-pressure limit reached.
-    #[error("proposal queue full")]
-    ProposalQueueFull,
-
-    /// RPC cluster_id mismatch.
-    #[error("invalid cluster id")]
-    InvalidClusterId,
-
-    /// Node is shutting down; no new operations accepted.
-    #[error("node is shutting down")]
+    #[error("not leader")]
+    NotLeader,
+    StorageError(String),
+    TransportError(String),
     Shutdown,
 
-    /// Bootstrap input validation failure.
-    #[error("invalid bootstrap configuration: {reason}")]
-    InvalidBootstrapConfig { reason: String },
+    #[error("serialization error: {0}")]
+    SerializationError(String),
 
-    /// Generic configuration validation failure (non-bootstrap path).
-    #[error("invalid configuration: {reason}")]
-    InvalidConfig { reason: String },
-
-    /// Existing persisted data was found but is inconsistent and cannot be
-    /// recovered automatically. Operator intervention is required.
-    #[error("recovery required; persisted state is inconsistent")]
-    RecoveryRequired,
-
-    /// `bootstrap()` was called on a node that has already been bootstrapped
-    /// or recovered.
-    #[error("already bootstrapped: {reason}")]
-    AlreadyBootstrapped { reason: String },
-
-    /// Election-related operation invoked from an invalid role/state.
-    #[error("invalid election state: {reason}")]
-    InvalidElectionState { reason: String },
+    #[error("corruption: {0}")]
+    Corruption(String),
 }
 
-/// Convenience alias used throughout xraft.
+/// Convenience Result type.
 pub type Result<T> = std::result::Result<T, XraftError>;

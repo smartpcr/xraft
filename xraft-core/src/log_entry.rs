@@ -1,8 +1,17 @@
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::types::Term;
-use crate::voter::VotersRecord;
+use crate::types::{Offset, Term};
+
+/// Type of log entry — distinguishes application commands from control records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntryType {
+    /// Application command payload.
+    Command,
+    /// Leader change marker record.
+    LeaderChangeMessage,
+    /// Voters configuration change record.
+    VotersRecord,
+}
 
 /// Discriminator for log entry types.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,37 +25,36 @@ pub enum EntryType {
 }
 
 /// A single entry in the replicated log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
-    /// The offset of this entry in the log.
-    pub offset: u64,
-    /// The term when this entry was created.
-    pub term: u64,
-    /// The type of entry.
+    /// Position in the log (0-based).
+    pub offset: Offset,
+    /// Term in which the entry was created.
+    pub term: Term,
+    /// Type of this entry.
     pub entry_type: EntryType,
-    /// Serialised payload (command bytes or control record).
+    /// Opaque payload bytes.
     pub payload: Vec<u8>,
 }
 
 impl LogEntry {
-    /// Create a VotersRecord log entry at the given offset and term.
-    pub fn voters_record(offset: u64, term: Term, record: &VotersRecord) -> Self {
-        let payload = bincode::serialize(record).expect("VotersRecord serialisation");
-        LogEntry {
+    /// Create a command log entry.
+    pub fn command(offset: Offset, term: Term, payload: Vec<u8>) -> Self {
+        Self {
             offset,
             term,
-            entry_type: EntryType::VotersRecord,
+            entry_type: EntryType::Command,
             payload,
         }
     }
 
-    /// Create a Command log entry.
-    pub fn command(offset: u64, term: Term, data: Vec<u8>) -> Self {
-        LogEntry {
+    /// Create a leader change message entry.
+    pub fn leader_change(offset: Offset, term: Term) -> Self {
+        Self {
             offset,
             term,
-            entry_type: EntryType::Command,
-            payload: data,
+            entry_type: EntryType::LeaderChangeMessage,
+            payload: Vec::new(),
         }
     }
 }
