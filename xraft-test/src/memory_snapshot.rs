@@ -115,7 +115,7 @@ mod tests {
                 last_included_term: 5,
                 voters: vec![VoterInfo {
                     node_id: NodeId(1),
-                    endpoint: "localhost:8080".to_string(),
+                    endpoint: "127.0.0.1:8080".parse().unwrap(),
                 }],
                 leader_epoch: 3,
             },
@@ -198,7 +198,7 @@ mod tests {
             last_included_term: 10,
             voters: vec![VoterInfo {
                 node_id: NodeId(1),
-                endpoint: "localhost:9090".to_string(),
+                endpoint: "127.0.0.1:9090".parse().unwrap(),
             }],
             leader_epoch: 4,
         };

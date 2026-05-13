@@ -790,11 +790,14 @@ name = "xraft-test"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bincode",
  "bytes",
+ "rand",
+ "serde",
+ "serde_json",
  "tokio",
- "uuid",
+ "tracing",
  "xraft-core",
+ "xraft-storage",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 use std::fmt;
-use std::net::SocketAddr;
+
+use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a node in the Raft cluster.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::types::{Offset, Term};
+
 /// Type of log entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryType {
@@ -25,12 +27,12 @@ pub struct LogEntry {
 
 impl LogEntry {
     /// Create a command log entry.
-    pub fn command(offset: u64, term: Term, record: &AppRecord) -> Self {
+    pub fn command(offset: Offset, term: Term, data: Vec<u8>) -> Self {
         Self {
-            offset,
-            term,
+            offset: offset.0,
+            term: term.0,
             entry_type: EntryType::Command,
-            data: record.data.clone(),
+            payload: Bytes::from(data),
         }
     }
 
@@ -38,9 +40,9 @@ impl LogEntry {
     pub fn leader_change(offset: u64, term: Term) -> Self {
         Self {
             offset,
-            term,
+            term: term.0,
             entry_type: EntryType::LeaderChangeMessage,
-            data: Vec::new(),
+            payload: Bytes::new(),
         }
     }
 }
