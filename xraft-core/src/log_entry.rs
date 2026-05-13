@@ -21,7 +21,8 @@ pub struct LogEntry {
 }
 
 impl LogEntry {
-    /// Build a `Command` entry from an `AppRecord`.
+    /// Build a `Command` entry from an `AppRecord`. The record's bytes are
+    /// cloned into the entry's `payload`.
     pub fn command(offset: Offset, term: Term, record: &AppRecord) -> Self {
         Self {
             offset,
@@ -31,7 +32,7 @@ impl LogEntry {
         }
     }
 
-    /// Build a `LeaderChange` marker entry. Carries no payload.
+    /// Build a `LeaderChange` marker entry. Carries an empty `payload`.
     pub fn leader_change(offset: Offset, term: Term) -> Self {
         Self {
             offset,
