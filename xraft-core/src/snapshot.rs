@@ -1,8 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::app_record::AppSnapshot;
-use crate::types::Term;
 use crate::voter::VoterInfo;
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use std::io;
+use std::path::PathBuf;
+use tokio::sync::Mutex;
 
 /// Consensus metadata included in a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
