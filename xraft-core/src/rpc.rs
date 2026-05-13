@@ -2,6 +2,9 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+
+use bytes::Bytes;
 
 use crate::types::Term;
 
