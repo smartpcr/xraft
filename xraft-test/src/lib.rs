@@ -1,3 +1,1 @@
-//! `xraft-test` — Deterministic simulation harness and integration test utilities.
-
-pub mod test_listener;
+// Stub: test utilities crate to be implemented in Stage 1.8.

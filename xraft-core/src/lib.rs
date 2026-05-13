@@ -6,23 +6,22 @@ pub mod consensus_state;
 pub mod error;
 pub mod follower_progress;
 pub mod listener;
-pub mod listener_event;
 pub mod log_entry;
-pub mod node_state;
 pub mod quorum_state;
-pub mod raft_node;
-pub mod rpc;
 pub mod snapshot;
 pub mod traits;
 pub mod types;
 pub mod voter;
 
-// Re-export core domain types for convenience.
+// Re-exports for convenience
 pub use app_record::{AppRecord, AppSnapshot};
-pub use listener::Listener;
-pub use listener_event::ListenerEvent;
-pub use snapshot::{
-    Snapshot, SnapshotId, SnapshotMetadata, SnapshotReader, SnapshotWriter, VotersRecord,
-};
+pub use config::RaftConfig;
+pub use error::{Result, XraftError};
+pub use log_entry::{EntryType, LogEntry};
+pub use membership::MembershipManager;
+pub use node_state::{NodeState, PendingMembershipChange};
+pub use quorum_state::QuorumState;
+pub use snapshot::{Snapshot, SnapshotId, SnapshotMetadata, SnapshotReader, SnapshotWriter};
+pub use traits::{LogStore, QuorumStateStore, SnapshotIO};
 pub use types::{ClusterId, NodeId, Offset, Term};
-pub use voter::VoterInfo;
+pub use voter::{VoterInfo, VotersRecord};
