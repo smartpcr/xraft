@@ -1,5 +1,1 @@
-pub mod channel;
-pub mod simulator;
-
-pub use channel::{ChannelReceiver, ChannelSender, ChannelTransport};
-pub use simulator::NetworkSimulator;
+// Stub: transport crate to be implemented in Phase 3.
