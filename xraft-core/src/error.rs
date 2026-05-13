@@ -7,13 +7,11 @@ use crate::types::NodeId;
 /// Unified error type for all xraft public APIs.
 #[derive(Debug, Error)]
 pub enum XraftError {
-    /// Log, snapshot, or quorum-state I/O failure.
     #[error("storage error: {0}")]
-    StorageError(#[from] io::Error),
+    StorageError(#[from] std::io::Error),
 
-    /// Network send/recv failure.
-    #[error("transport error: {reason}")]
-    TransportError { reason: String },
+    #[error("transport error: {0}")]
+    TransportError(String),
 
     /// `propose()` called on a non-leader node.
     #[error("not leader; current leader is {leader_id:?}")]
