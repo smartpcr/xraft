@@ -1,60 +1,28 @@
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Offset, Term};
-
-/// Type of log entry — distinguishes application commands from control records.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EntryType {
-    /// Application command payload.
-    Command,
-    /// Leader change marker record.
-    LeaderChangeMessage,
-    /// Voters configuration change record.
-    VotersRecord,
-}
+use crate::types::Term;
 
 /// Discriminator for log entry types.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryType {
-    /// Application-level state machine command.
+    /// Application-level state machine command (wraps an AppRecord).
     Command,
-    /// Leader no-op appended at the start of a new term.
+    /// Appended by a new leader as the first entry of its term.
     LeaderChangeMessage,
-    /// Membership change — contains a complete `VotersRecord`.
+    /// Encodes the complete new voter set.
     VotersRecord,
 }
 
 /// A single entry in the replicated log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
-    /// Position in the log (0-based).
-    pub offset: Offset,
-    /// Term in which the entry was created.
+    /// Position in the log (0-indexed).
+    pub offset: u64,
+    /// Term when the entry was created.
     pub term: Term,
-    /// Type of this entry.
+    /// Type discriminator.
     pub entry_type: EntryType,
-    /// Opaque payload bytes.
-    pub payload: Vec<u8>,
-}
-
-impl LogEntry {
-    /// Create a command log entry.
-    pub fn command(offset: Offset, term: Term, payload: Vec<u8>) -> Self {
-        Self {
-            offset,
-            term,
-            entry_type: EntryType::Command,
-            payload,
-        }
-    }
-
-    /// Create a leader change message entry.
-    pub fn leader_change(offset: Offset, term: Term) -> Self {
-        Self {
-            offset,
-            term,
-            entry_type: EntryType::LeaderChangeMessage,
-            payload: Vec::new(),
-        }
-    }
+    /// Serialised command or control record.
+    pub payload: Bytes,
 }
