@@ -2,6 +2,8 @@
 members = [
     "xraft-core",
     "xraft-storage",
+    "xraft-transport",
+    "xraft-test",
 ]
 resolver = "2"
 
