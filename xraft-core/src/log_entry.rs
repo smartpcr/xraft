@@ -6,7 +6,7 @@ use crate::types::Term;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EntryType {
     NoOp,
-    Application,
+    Command,
     Configuration,
 }
 
@@ -15,7 +15,6 @@ pub struct LogEntry {
     pub offset: u64,
     pub term: Term,
     pub entry_type: EntryType,
-    #[serde(with = "crate::bytes_serde")]
     pub payload: Bytes,
 }
 

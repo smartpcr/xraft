@@ -195,11 +195,12 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use xraft_core::log_entry::EntryType;
+    use xraft_core::types::Term;
 
     fn make_entry(offset: u64, term: u64, data: &[u8]) -> LogEntry {
         LogEntry {
             offset,
-            term,
+            term: Term(term),
             entry_type: EntryType::Command,
             payload: Bytes::copy_from_slice(data),
         }
@@ -224,7 +225,7 @@ mod tests {
 
         for (i, entry) in read_back.iter().enumerate() {
             assert_eq!(entry.offset, i as u64);
-            assert_eq!(entry.term, 1);
+            assert_eq!(entry.term, Term(1));
             assert_eq!(entry.entry_type, EntryType::Command);
             let expected_payload = format!("data-{i}");
             assert_eq!(entry.payload, Bytes::from(expected_payload));
@@ -288,7 +289,7 @@ mod tests {
 
         let entry = store.entry_at(3).await.unwrap().unwrap();
         assert_eq!(entry.offset, 3);
-        assert_eq!(entry.term, 2);
+        assert_eq!(entry.term, Term(2));
 
         assert!(store.entry_at(10).await.unwrap().is_none());
     }

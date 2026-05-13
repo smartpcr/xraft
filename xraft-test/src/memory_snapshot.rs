@@ -91,7 +91,7 @@ impl SnapshotIO for MemorySnapshotStore {
         let snapshot = Snapshot {
             metadata,
             app_snapshot: AppSnapshot {
-                data: writer.data,
+                data: Bytes::from(writer.data),
             },
         };
         let mut inner = self.inner.lock().unwrap();
@@ -116,7 +116,7 @@ mod tests {
                 leader_epoch: 3,
             },
             app_snapshot: AppSnapshot {
-                data: b"test-snapshot-data".to_vec(),
+                data: Bytes::from_static(b"test-snapshot-data"),
             },
         }
     }
@@ -200,7 +200,7 @@ mod tests {
         // Verify the snapshot is now loadable
         let loaded = store.load_latest().await.unwrap().unwrap();
         assert_eq!(loaded.metadata, metadata);
-        assert_eq!(loaded.app_snapshot.data, b"chunk1chunk2");
+        assert_eq!(loaded.app_snapshot.data, Bytes::from_static(b"chunk1chunk2"));
     }
 
     #[tokio::test]
@@ -212,11 +212,11 @@ mod tests {
 
         let mut snap2 = make_test_snapshot();
         snap2.metadata.last_included_offset = 200;
-        snap2.app_snapshot.data = b"newer-data".to_vec();
+        snap2.app_snapshot.data = Bytes::from_static(b"newer-data");
         store.save(&snap2).await.unwrap();
 
         let loaded = store.load_latest().await.unwrap().unwrap();
         assert_eq!(loaded.metadata.last_included_offset, 200);
-        assert_eq!(loaded.app_snapshot.data, b"newer-data");
+        assert_eq!(loaded.app_snapshot.data, Bytes::from_static(b"newer-data"));
     }
 }
