@@ -5,7 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["sync", "time", "macros"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 bytes = "1"
