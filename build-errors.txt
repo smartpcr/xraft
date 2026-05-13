@@ -1,0 +1,511 @@
+
+> error[E0252]: the name `Deserialize` is defined multiple times
+   --> xraft-core\src\snapshot.rs:6:13
+    |
+  1 | use serde::{Deserialize, Serialize};
+> error[E0252]: the name `Serialize` is defined multiple times
+   --> xraft-core\src\snapshot.rs:6:26
+    |
+  1 | use serde::{Deserialize, Serialize};
+> error[E0428]: the name `StorageError` is defined multiple times
+    --> xraft-core\src\error.rs:14:5
+     |
+   7 |     StorageError(#[from] std::io::Error),
+> error[E0428]: the name `TransportError` is defined multiple times
+    --> xraft-core\src\error.rs:15:5
+     |
+  10 |     TransportError(String),
+> error[E0428]: the name `Term` is defined multiple times
+    --> xraft-core\src\types.rs:28:1
+     |
+  10 | pub struct Term(pub u64);
+> error[E0428]: the name `Term` is defined multiple times
+    --> xraft-core\src\types.rs:38:1
+     |
+  10 | pub struct Term(pub u64);
+> error[E0428]: the name `ClusterId` is defined multiple times
+    --> xraft-core\src\types.rs:54:1
+     |
+  14 | pub struct ClusterId(pub uuid::Uuid);
+> error[E0428]: the name `Offset` is defined multiple times
+    --> xraft-core\src\types.rs:76:1
+     |
+  18 | pub struct Offset(pub u64);
+> error[E0428]: the name `ClusterId` is defined multiple times
+    --> xraft-core\src\types.rs:80:1
+     |
+  14 | pub struct ClusterId(pub uuid::Uuid);
+> error[E0428]: the name `Offset` is defined multiple times
+    --> xraft-core\src\types.rs:90:1
+     |
+  18 | pub struct Offset(pub u64);
+> error[E0432]: unresolved import `membership`
+    --> xraft-core\src\lib.rs:21:9
+     |
+  21 | pub use membership::MembershipManager;
+> error[E0432]: unresolved import `node_state`
+    --> xraft-core\src\lib.rs:22:9
+     |
+  22 | pub use node_state::{NodeState, PendingMembershipChange};
+> error: cannot find derive macro `Error` in this scope
+   --> xraft-core\src\error.rs:4:10
+    |
+  4 | #[derive(Error, Debug)]
+> error: cannot find attribute `error` in this scope
+   --> xraft-core\src\error.rs:6:7
+    |
+  6 |     #[error("storage error: {0}")]
+> error: cannot find attribute `from` in this scope
+   --> xraft-core\src\error.rs:7:20
+    |
+  7 |     StorageError(#[from] std::io::Error),
+> error: cannot find attribute `error` in this scope
+   --> xraft-core\src\error.rs:9:7
+    |
+  9 |     #[error("transport error: {0}")]
+> error: cannot find attribute `error` in this scope
+    --> xraft-core\src\error.rs:12:7
+     |
+  12 |     #[error("not leader")]
+> error: cannot find attribute `error` in this scope
+    --> xraft-core\src\error.rs:18:7
+     |
+  18 |     #[error("serialization error: {0}")]
+> error: cannot find attribute `error` in this scope
+    --> xraft-core\src\error.rs:21:7
+     |
+  21 |     #[error("corruption: {0}")]
+> error: cannot find derive macro `Serialize` in this scope
+   --> xraft-core\src\types.rs:5:68
+    |
+  5 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error: cannot find derive macro `Deserialize` in this scope
+   --> xraft-core\src\types.rs:5:79
+    |
+  5 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error: cannot find derive macro `Serialize` in this scope
+   --> xraft-core\src\types.rs:9:68
+    |
+  9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error: cannot find derive macro `Deserialize` in this scope
+   --> xraft-core\src\types.rs:9:79
+    |
+  9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error: cannot find derive macro `Serialize` in this scope
+    --> xraft-core\src\types.rs:13:51
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error: cannot find derive macro `Deserialize` in this scope
+    --> xraft-core\src\types.rs:13:62
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error: cannot find derive macro `Serialize` in this scope
+    --> xraft-core\src\types.rs:17:68
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error: cannot find derive macro `Deserialize` in this scope
+    --> xraft-core\src\types.rs:17:79
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error: cannot find derive macro `Serialize` in this scope
+    --> xraft-core\src\types.rs:27:68
+     |
+  27 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error: cannot find derive macro `Deserialize` in this scope
+    --> xraft-core\src\types.rs:27:79
+     |
+  27 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error: cannot find derive macro `Serialize` in this scope
+    --> xraft-core\src\types.rs:37:68
+     |
+  37 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error: cannot find derive macro `Deserialize` in this scope
+    --> xraft-core\src\types.rs:37:79
+     |
+  37 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error: cannot find derive macro `Serialize` in this scope
+    --> xraft-core\src\types.rs:53:51
+     |
+  53 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error: cannot find derive macro `Deserialize` in this scope
+    --> xraft-core\src\types.rs:53:62
+     |
+  53 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error: cannot find derive macro `Serialize` in this scope
+    --> xraft-core\src\types.rs:75:68
+     |
+  75 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error: cannot find derive macro `Deserialize` in this scope
+    --> xraft-core\src\types.rs:75:79
+     |
+  75 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error: cannot find derive macro `Serialize` in this scope
+    --> xraft-core\src\types.rs:79:51
+     |
+  79 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error: cannot find derive macro `Deserialize` in this scope
+    --> xraft-core\src\types.rs:79:62
+     |
+  79 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error: cannot find derive macro `Serialize` in this scope
+    --> xraft-core\src\types.rs:89:68
+     |
+  89 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error: cannot find derive macro `Deserialize` in this scope
+    --> xraft-core\src\types.rs:89:79
+     |
+  89 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error: cannot find derive macro `Serialize` in this scope
+   --> xraft-core\src\voter.rs:4:39
+    |
+  4 | #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+> error: cannot find derive macro `Deserialize` in this scope
+   --> xraft-core\src\voter.rs:4:50
+    |
+  4 | #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+> error: cannot find derive macro `Serialize` in this scope
+    --> xraft-core\src\voter.rs:11:39
+     |
+  11 | #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+> error: cannot find derive macro `Deserialize` in this scope
+    --> xraft-core\src\voter.rs:11:50
+     |
+  11 | #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+> error[E0425]: cannot find type `NodeId` in this scope
+   --> xraft-core\src\config.rs:7:18
+    |
+  7 |     pub node_id: NodeId,
+> error[E0425]: cannot find type `NodeId` in this scope
+    --> xraft-core\src\config.rs:26:34
+     |
+  26 |     pub fn with_node_id(node_id: NodeId) -> Self {
+> error[E0425]: cannot find function, tuple struct or tuple variant `NodeId` in this scope
+    --> xraft-core\src\config.rs:35:22
+     |
+  35 |             node_id: NodeId(0),
+> error[E0425]: cannot find type `Term` in this scope
+    --> xraft-core\src\log_entry.rs:30:39
+     |
+  30 |     pub fn command(offset: u64, term: Term, record: &AppRecord) -> Self {
+> error[E0425]: cannot find type `AppRecord` in this scope
+    --> xraft-core\src\log_entry.rs:30:54
+     |
+  30 |     pub fn command(offset: u64, term: Term, record: &AppRecord) -> Self {
+> error[E0425]: cannot find type `Term` in this scope
+    --> xraft-core\src\log_entry.rs:40:45
+     |
+  40 |     pub fn leader_change(offset: u64, term: Term) -> Self {
+> error[E0119]: conflicting implementations of trait `Debug` for type `types::Term`
+    --> xraft-core\src\types.rs:27:10
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `Debug` for type `types::Term`
+    --> xraft-core\src\types.rs:37:10
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `Debug` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:53:10
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `Debug` for type `types::Offset`
+    --> xraft-core\src\types.rs:75:10
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `Debug` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:79:10
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `Debug` for type `types::Offset`
+    --> xraft-core\src\types.rs:89:10
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `Clone` for type `types::Term`
+    --> xraft-core\src\types.rs:27:17
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `Clone` for type `types::Term`
+    --> xraft-core\src\types.rs:37:17
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `Clone` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:53:17
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `Clone` for type `types::Offset`
+    --> xraft-core\src\types.rs:75:17
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `Clone` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:79:17
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `Clone` for type `types::Offset`
+    --> xraft-core\src\types.rs:89:17
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `Default` for type `types::Term`
+    --> xraft-core\src\types.rs:37:92
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `Default` for type `types::Offset`
+    --> xraft-core\src\types.rs:89:92
+     |
+  75 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `std::marker::Copy` for type `types::Term`
+    --> xraft-core\src\types.rs:27:24
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `std::marker::Copy` for type `types::Term`
+    --> xraft-core\src\types.rs:37:24
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `std::marker::Copy` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:53:24
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `std::marker::Copy` for type `types::Offset`
+    --> xraft-core\src\types.rs:75:24
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `std::marker::Copy` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:79:24
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `std::marker::Copy` for type `types::Offset`
+    --> xraft-core\src\types.rs:89:24
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `StructuralPartialEq` for type `types::Term`
+    --> xraft-core\src\types.rs:27:30
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `StructuralPartialEq` for type `types::Term`
+    --> xraft-core\src\types.rs:37:30
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `StructuralPartialEq` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:53:30
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `StructuralPartialEq` for type `types::Offset`
+    --> xraft-core\src\types.rs:75:30
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `StructuralPartialEq` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:79:30
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `StructuralPartialEq` for type `types::Offset`
+    --> xraft-core\src\types.rs:89:30
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `PartialEq` for type `types::Term`
+    --> xraft-core\src\types.rs:27:30
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `PartialEq` for type `types::Term`
+    --> xraft-core\src\types.rs:37:30
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `PartialEq` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:53:30
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `PartialEq` for type `types::Offset`
+    --> xraft-core\src\types.rs:75:30
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `PartialEq` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:79:30
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `PartialEq` for type `types::Offset`
+    --> xraft-core\src\types.rs:89:30
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `std::cmp::Eq` for type `types::Term`
+    --> xraft-core\src\types.rs:27:41
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `std::cmp::Eq` for type `types::Term`
+    --> xraft-core\src\types.rs:37:41
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `std::cmp::Eq` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:53:41
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `std::cmp::Eq` for type `types::Offset`
+    --> xraft-core\src\types.rs:75:41
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `std::cmp::Eq` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:79:41
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `std::cmp::Eq` for type `types::Offset`
+    --> xraft-core\src\types.rs:89:41
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `Hash` for type `types::Term`
+    --> xraft-core\src\types.rs:27:62
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `Hash` for type `types::Term`
+    --> xraft-core\src\types.rs:37:62
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `Hash` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:53:45
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `Hash` for type `types::Offset`
+    --> xraft-core\src\types.rs:75:62
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `Hash` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:79:45
+     |
+  13 | #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `Hash` for type `types::Offset`
+    --> xraft-core\src\types.rs:89:62
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `PartialOrd` for type `types::Term`
+    --> xraft-core\src\types.rs:27:45
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `PartialOrd` for type `types::Term`
+    --> xraft-core\src\types.rs:37:45
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `PartialOrd` for type `types::Offset`
+    --> xraft-core\src\types.rs:75:45
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `PartialOrd` for type `types::Offset`
+    --> xraft-core\src\types.rs:89:45
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `Ord` for type `types::Term`
+    --> xraft-core\src\types.rs:27:57
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `Ord` for type `types::Term`
+    --> xraft-core\src\types.rs:37:57
+     |
+   9 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+> error[E0119]: conflicting implementations of trait `Ord` for type `types::Offset`
+    --> xraft-core\src\types.rs:75:57
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `Ord` for type `types::Offset`
+    --> xraft-core\src\types.rs:89:57
+     |
+  17 | #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+> error[E0119]: conflicting implementations of trait `std::fmt::Display` for type `types::ClusterId`
+    --> xraft-core\src\types.rs:62:1
+     |
+  56 | impl fmt::Display for ClusterId {
+> error[E0119]: conflicting implementations of trait `std::fmt::Display` for type `types::Offset`
+    --> xraft-core\src\types.rs:92:1
+     |
+  68 | impl fmt::Display for Offset {
+> error[E0592]: duplicate definitions with name `next`
+    --> xraft-core\src\types.rs:31:5
+     |
+  31 |     pub fn next(self) -> Self {
+> error[E0277]: the trait bound `NodeId: serde::Serialize` is not satisfied
+      --> xraft-core\src\consensus_state.rs:24:24
+       |
+    24 | #[derive(Debug, Clone, Serialize, Deserialize)]
+> error[E0277]: the trait bound `types::Term: serde::Serialize` is not satisfied
+      --> xraft-core\src\consensus_state.rs:24:24
+       |
+    24 | #[derive(Debug, Clone, Serialize, Deserialize)]
+> error[E0277]: the trait bound `VoterInfo: serde::Serialize` is not satisfied
+      --> xraft-core\src\consensus_state.rs:24:24
+       |
+    24 | #[derive(Debug, Clone, Serialize, Deserialize)]
+> error[E0277]: the trait bound `NodeId: serde::Deserialize<'de>` is not satisfied
+      --> xraft-core\src\consensus_state.rs:26:18
+       |
+    26 |     pub node_id: NodeId,
+> error[E0277]: the trait bound `types::Term: serde::Deserialize<'de>` is not satisfied
+      --> xraft-core\src\consensus_state.rs:27:23
+       |
+    27 |     pub current_term: Term,
+> error[E0277]: the trait bound `NodeId: serde::Deserialize<'de>` is not satisfied
+      --> xraft-core\src\consensus_state.rs:29:20
+       |
+    29 |     pub leader_id: Option<NodeId>,
+> error[E0277]: the trait bound `VoterInfo: serde::Deserialize<'de>` is not satisfied
+      --> xraft-core\src\consensus_state.rs:32:20
+       |
+    32 |     pub voter_set: Vec<VoterInfo>,
+> error[E0277]: the trait bound `NodeId: serde::Deserialize<'de>` is not satisfied
+      --> xraft-core\src\consensus_state.rs:26:18
+       |
+    26 |     pub node_id: NodeId,
+> error[E0277]: the trait bound `types::Term: serde::Deserialize<'de>` is not satisfied
+      --> xraft-core\src\consensus_state.rs:27:23
+       |
+    27 |     pub current_term: Term,
+> error[E0277]: the trait bound `NodeId: serde::Deserialize<'de>` is not satisfied
+      --> xraft-core\src\consensus_state.rs:29:20
+       |
+    29 |     pub leader_id: Option<NodeId>,
+> error[E0277]: the trait bound `VoterInfo: serde::Deserialize<'de>` is not satisfied
+      --> xraft-core\src\consensus_state.rs:32:20
+       |
+    32 |     pub voter_set: Vec<VoterInfo>,
+> error[E0277]: the trait bound `NodeId: serde::Deserialize<'de>` is not satisfied
+    --> xraft-core\src\consensus_state.rs:24:35
+     |
+  24 | #[derive(Debug, Clone, Serialize, Deserialize)]
+> error[E0277]: the trait bound `types::Term: serde::Deserialize<'de>` is not satisfied
+    --> xraft-core\src\consensus_state.rs:24:35
+     |
+  24 | #[derive(Debug, Clone, Serialize, Deserialize)]
+> error[E0277]: the trait bound `VoterInfo: serde::Deserialize<'de>` is not satisfied
+    --> xraft-core\src\consensus_state.rs:24:35
+     |
+  24 | #[derive(Debug, Clone, Serialize, Deserialize)]
+> error[E0560]: struct `LogEntry` has no field named `data`
+    --> xraft-core\src\log_entry.rs:35:13
+     |
+  35 |             data: record.data.clone(),
+> error[E0560]: struct `LogEntry` has no field named `data`
+    --> xraft-core\src\log_entry.rs:45:13
+     |
+  45 |             data: Vec::new(),
+> error[E0277]: the trait bound `VoterInfo: serde::Serialize` is not satisfied
+      --> xraft-core\src\snapshot.rs:19:39
+       |
+    19 | #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+> error[E0277]: the trait bound `VoterInfo: serde::Deserialize<'de>` is not satisfied
+      --> xraft-core\src\snapshot.rs:23:17
+       |
+    23 |     pub voters: Vec<VoterInfo>,
+> error[E0277]: the trait bound `VoterInfo: serde::Deserialize<'de>` is not satisfied
+      --> xraft-core\src\snapshot.rs:23:17
+       |
+    23 |     pub voters: Vec<VoterInfo>,
+> error[E0277]: the trait bound `VoterInfo: serde::Deserialize<'de>` is not satisfied
+    --> xraft-core\src\snapshot.rs:19:50
+     |
+  19 | #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+> error[E0369]: binary operation `==` cannot be applied to type `AppSnapshot`
+    --> xraft-core\src\snapshot.rs:31:5
+     |
+  28 | #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+> error[E0277]: the trait bound `AppSnapshot: std::cmp::Eq` is not satisfied
+     --> xraft-core\src\snapshot.rs:31:5
+      |
+   28 | #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+> error[E0004]: non-exhaustive patterns: `&XraftError::StorageError(_)` and `&XraftError::TransportError(_)` not covered
+    --> xraft-core\src\error.rs:4:17
+     |
+   4 | #[derive(Error, Debug)]
+> error: could not compile `xraft-core` (lib) due to 127 previous errors; 5 warnings emitted
+
