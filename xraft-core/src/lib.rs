@@ -2,23 +2,15 @@ pub mod log_entry;
 pub mod membership;
 pub mod node_state;
 pub mod rpc;
-pub mod traits;
-pub mod error;
-pub mod config;
-pub mod consensus_state;
-pub mod error;
-pub mod follower_progress;
-pub mod listener;
-pub mod log_entry;
-pub mod membership;
-pub mod node_state;
-pub mod rpc;
 pub mod types;
 pub mod voter;
 
-pub use consensus_state::{ConsensusState, Role};
-pub use error::{Result, XraftError};
+pub use app_record::AppRecord;
 pub use log_entry::{EntryType, LogEntry};
-pub use traits::{LogStore, StateMachine};
+pub use rpc::{
+    AddVoterRequest, DivergingEpoch, FetchRequest, FetchResponse, FetchSnapshotRequest,
+    FetchSnapshotResponse, MembershipChangeResponse, MembershipError, RemoveVoterRequest,
+    RpcEnvelope, RpcPayload, SnapshotId, UpdateVoterRequest, VoteRequest, VoteResponse,
+};
 pub use types::{ClusterId, NodeId, Offset, Term};
 pub use voter::{VoterInfo, VotersRecord};
