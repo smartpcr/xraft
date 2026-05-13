@@ -1,10 +1,19 @@
+use std::net::SocketAddr;
+
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
-use crate::types::{ClusterId, NodeId, Term};
-use crate::voter::{VoterInfo, VotersRecord};
+use crate::log_entry::LogEntry;
+use crate::types::{ClusterId, NodeId, Offset, Term};
 
-/// Envelope wrapping every RPC message with cluster and leader identity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// ---------------------------------------------------------------------------
+// Envelope
+// ---------------------------------------------------------------------------
+
+/// Every RPC is wrapped in an envelope carrying cluster identity, fencing
+/// epoch, and source node for identity verification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RpcEnvelope {
     pub cluster_id: ClusterId,
     pub leader_epoch: Term,
@@ -12,8 +21,8 @@ pub struct RpcEnvelope {
     pub payload: RpcPayload,
 }
 
-/// Discriminated union of all RPC message types.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Discriminated union of all xraft RPC message types.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RpcPayload {
     VoteRequest(VoteRequest),
     VoteResponse(VoteResponse),
@@ -27,101 +36,146 @@ pub enum RpcPayload {
     MembershipChangeResponse(MembershipChangeResponse),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// ---------------------------------------------------------------------------
+// Vote (Election)
+// ---------------------------------------------------------------------------
+
+/// Sent by a candidate to request votes from peers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoteRequest {
     pub term: Term,
     pub candidate_id: NodeId,
-    pub last_log_offset: u64,
+    pub last_log_offset: Offset,
     pub last_log_term: Term,
+    /// `true` for the Pre-Vote phase (does not increment term).
     pub is_pre_vote: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Response to a `VoteRequest`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoteResponse {
     pub term: Term,
     pub vote_granted: bool,
     pub is_pre_vote: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// ---------------------------------------------------------------------------
+// Fetch (Log Replication)
+// ---------------------------------------------------------------------------
+
+/// Sent by a follower/observer to pull log entries from the leader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchRequest {
     pub replica_id: NodeId,
-    pub fetch_offset: u64,
+    pub fetch_offset: Offset,
     pub last_fetched_epoch: Term,
     pub max_bytes: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Leader's response carrying log entries and metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FetchResponse {
     pub leader_id: NodeId,
     pub leader_epoch: Term,
-    pub high_watermark: u64,
-    pub log_start_offset: u64,
-    pub entries: Vec<crate::log_entry::LogEntry>,
+    /// Exclusive upper bound: entries with offset < HW are committed.
+    pub high_watermark: Offset,
+    /// Leader's log start offset (after compaction).
+    pub log_start_offset: Offset,
+    pub entries: Vec<LogEntry>,
+    /// Set when log divergence is detected.
     pub diverging_epoch: Option<DivergingEpoch>,
+    /// Set when `fetch_offset < log_start_offset` (follower needs snapshot).
     pub snapshot_id: Option<SnapshotId>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// ---------------------------------------------------------------------------
+// Helper structs
+// ---------------------------------------------------------------------------
+
+/// Indicates where the follower's log diverges from the leader's.
+/// The follower should truncate its log to `end_offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DivergingEpoch {
     pub epoch: Term,
-    pub end_offset: u64,
+    pub end_offset: Offset,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Identifies a specific snapshot by its last included offset and epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotId {
-    pub end_offset: u64,
+    pub end_offset: Offset,
     pub epoch: Term,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// ---------------------------------------------------------------------------
+// FetchSnapshot (Snapshot Transfer)
+// ---------------------------------------------------------------------------
+
+/// Sent by a follower to download a snapshot from the leader in chunks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchSnapshotRequest {
     pub snapshot_id: SnapshotId,
+    /// Byte offset into the snapshot file.
     pub position: u64,
     pub max_bytes: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A chunk of a snapshot being transferred.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FetchSnapshotResponse {
-    pub data: bytes::Bytes,
+    pub snapshot_id: SnapshotId,
+    /// Byte offset of this chunk within the snapshot.
     pub position: u64,
+    pub data: Bytes,
     pub is_last_chunk: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// ---------------------------------------------------------------------------
+// Membership Change RPCs
+// ---------------------------------------------------------------------------
+
+/// Request to add a new voter to the cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddVoterRequest {
-    pub voter: VoterInfo,
+    pub node_id: NodeId,
+    pub endpoint: SocketAddr,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Request to remove an existing voter from the cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoveVoterRequest {
     pub node_id: NodeId,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Request to update a voter's endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateVoterRequest {
-    pub voter: VoterInfo,
+    pub node_id: NodeId,
+    pub new_endpoint: SocketAddr,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Response to any membership-change RPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipChangeResponse {
     pub success: bool,
+    /// If the receiving node is not the leader, redirects to the known leader.
+    pub leader_id: Option<NodeId>,
     pub error: Option<MembershipError>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Reasons a membership-change request can be rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MembershipError {
+    /// The receiving node is not the current leader.
     NotLeader { leader_id: Option<NodeId> },
+    /// An uncommitted VotersRecord already exists in the log.
     ChangeInProgress,
+    /// The node is already a voter in the current configuration.
     NodeAlreadyVoter,
+    /// The node was not found in the current configuration.
     NodeNotFound,
+    /// The observer's fetch_offset is behind the leader's current HW.
     NodeNotCaughtUp,
-}
-
-/// Consensus control record for voter set changes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VotersRecordPayload {
-    pub record: VotersRecord,
 }
 
 // ---------------------------------------------------------------------------
