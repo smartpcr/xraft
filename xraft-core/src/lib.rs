@@ -1,7 +1,6 @@
-pub mod consensus_state;
-pub mod error;
-pub mod io_action;
-pub mod io_stage;
+//! xraft-core: Raft consensus protocol engine.
+
+pub mod app_record;
 pub mod log_entry;
 pub mod rpc;
 pub mod traits;
