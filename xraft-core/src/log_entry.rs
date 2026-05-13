@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// The type of a log entry.
@@ -13,13 +12,10 @@ pub enum EntryType {
 }
 
 /// A single entry in the replicated log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogEntry {
-    /// The offset of this entry in the log.
-    pub offset: u64,
-    /// The term when this entry was created.
-    pub term: u64,
-    /// The type of entry.
+    pub offset: Offset,
+    pub term: Term,
     pub entry_type: EntryType,
     /// Serialized payload (bincode-encoded AppRecord, VotersRecord, etc.).
     pub payload: Vec<u8>,

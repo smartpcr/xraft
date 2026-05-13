@@ -3,10 +3,7 @@ use std::io;
 /// Top-level error type for xraft.
 #[derive(Error, Debug)]
 pub enum XraftError {
-    #[error("storage error: {0}")]
-    StorageError(#[from] std::io::Error),
-
-    #[error("transport error: {0}")]
+    StorageError(String),
     TransportError(String),
 
     #[error("not leader")]
