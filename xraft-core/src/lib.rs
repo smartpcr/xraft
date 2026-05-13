@@ -12,9 +12,7 @@ pub mod error;
 pub mod follower_progress;
 pub mod listener;
 pub mod log_entry;
-pub mod quorum_state;
-pub mod snapshot;
-pub mod traits;
+pub mod rpc;
 pub mod types;
 pub mod voter;
 
