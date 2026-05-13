@@ -1,8 +1,4 @@
-use std::net::SocketAddr;
-
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 use crate::log_entry::LogEntry;
 use crate::types::{ClusterId, NodeId, Term};
@@ -29,9 +25,8 @@ pub enum RpcPayload {
 pub struct VoteRequest {
     pub term: Term,
     pub candidate_id: NodeId,
-    pub last_log_offset: Offset,
+    pub last_log_offset: u64,
     pub last_log_term: Term,
-    /// `true` for the Pre-Vote phase (does not increment term).
     pub is_pre_vote: bool,
 }
 
@@ -47,7 +42,7 @@ pub struct VoteResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchRequest {
     pub replica_id: NodeId,
-    pub fetch_offset: Offset,
+    pub fetch_offset: u64,
     pub last_fetched_epoch: Term,
     pub max_bytes: u32,
 }
@@ -60,19 +55,18 @@ pub struct FetchResponse {
     pub log_start_offset: u64,
     pub entries: Vec<LogEntry>,
     pub diverging_epoch: Option<DivergingEpoch>,
-    /// Set when `fetch_offset < log_start_offset` (follower needs snapshot).
     pub snapshot_id: Option<SnapshotId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DivergingEpoch {
     pub epoch: Term,
-    pub end_offset: Offset,
+    pub end_offset: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SnapshotId {
-    pub end_offset: Offset,
+    pub end_offset: u64,
     pub epoch: Term,
 }
 
@@ -81,7 +75,6 @@ pub struct SnapshotId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchSnapshotRequest {
     pub snapshot_id: SnapshotId,
-    /// Byte offset into the snapshot file.
     pub position: u64,
     pub max_bytes: u32,
 }
@@ -90,7 +83,6 @@ pub struct FetchSnapshotRequest {
 pub struct FetchSnapshotResponse {
     pub snapshot_id: SnapshotId,
     pub position: u64,
-    pub data: Bytes,
     pub is_last_chunk: bool,
 }
 
@@ -122,16 +114,17 @@ pub struct MembershipChangeResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MembershipError {
-    /// The receiving node is not the current leader.
     NotLeader { leader_id: Option<NodeId> },
-    /// An uncommitted VotersRecord already exists in the log.
     ChangeInProgress,
-    /// The node is already a voter in the current configuration.
     NodeAlreadyVoter,
-    /// The node was not found in the current configuration.
     NodeNotFound,
-    /// The observer's fetch_offset is behind the leader's current HW.
     NodeNotCaughtUp,
+}
+
+/// Consensus control record for voter set changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VotersRecordPayload {
+    pub record: VotersRecord,
 }
 
 // ---------------------------------------------------------------------------
