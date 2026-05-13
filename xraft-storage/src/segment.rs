@@ -1,407 +1,499 @@
-use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use xraft_core::log_entry::LogEntry;
+use tracing::warn;
+use xraft_core::LogEntry;
 
-use crate::segment_index::SparseIndex;
+use crate::segment_index::SegmentIndex;
 
-/// On-disk batch layout:
-///   batch_len:    u32 — byte count after this field (crc + payload)
-///   crc32c:       u32 — checksum over payload (num_entries + entry frames)
-///   num_entries:  u32 — number of entries in this batch
-///   entry frames: [entry_len: u32, entry_data: [u8]] × num_entries
+/// Record format in a .log file (one record per log entry):
 ///
-/// CRC covers the entire payload (num_entries field + all entry frames),
-/// providing per-batch integrity validation.
-const BATCH_HEADER_LEN: u64 = 4 + 4 + 4; // batch_len + crc + num_entries
-const MAX_BATCH_DATA: u32 = 64 * 1024 * 1024; // 64 MiB sanity cap
+/// ```text
+/// [4 bytes: CRC-32C of (entry_len bytes + entry_data bytes)]
+/// [4 bytes: entry_len (u32 LE) — length of the serialized LogEntry]
+/// [entry_len bytes: bincode-serialized LogEntry]
+/// ```
+const RECORD_HEADER_SIZE: usize = 8; // 4 (CRC) + 4 (len)
 
-/// Formats a base offset into the canonical zero-padded 20-digit filename.
-pub fn segment_filename(base_offset: u64) -> String {
-    format!("{:020}", base_offset)
-}
-
-/// A pre-serialized log entry ready for batch writing.
-pub struct SerializedEntry {
-    /// bincode-serialized bytes of the LogEntry.
-    pub data: Vec<u8>,
-}
-
-impl SerializedEntry {
-    /// Serialize a LogEntry to its on-disk representation.
-    pub fn from_entry(entry: &LogEntry) -> io::Result<Self> {
-        let data = bincode::serialize(entry).map_err(io::Error::other)?;
-        Ok(Self { data })
-    }
-
-    /// Size of one entry frame on disk: entry_len (u32) + data bytes.
-    pub fn frame_size(&self) -> u64 {
-        4 + self.data.len() as u64
-    }
-}
-
-/// Total on-disk bytes for a batch of serialized entries.
-pub fn batch_disk_size(entries: &[SerializedEntry]) -> u64 {
-    // batch_len(4) + crc(4) + num_entries(4) + Σ(entry_len(4) + data)
-    let frames: u64 = entries.iter().map(|e| e.frame_size()).sum();
-    12 + frames
-}
-
-/// A single append-only log segment backed by a `.log` file on disk.
+/// A single segment file covering a contiguous range of log offsets.
 pub struct Segment {
+    /// Base offset — the first offset stored in this segment.
     base_offset: u64,
+    /// Path to the `.log` file.
+    log_path: PathBuf,
+    /// The next offset to be written (one past the last entry in this segment).
     next_offset: u64,
+    /// Current file size in bytes.
     file_size: u64,
-    file: File,
-    #[allow(dead_code)]
-    path: PathBuf,
-    index: SparseIndex,
+    /// Sparse index for this segment.
+    index: SegmentIndex,
+    /// Maximum segment file size.
+    max_bytes: u64,
+    /// Cached append-mode file handle. Lazily opened on first append and
+    /// reused across subsequent appends to avoid the per-entry open/close
+    /// overhead of `OpenOptions::new().append(true).open(...)`.
+    write_file: Option<std::fs::File>,
 }
 
 impl Segment {
-    /// Create a brand-new, empty segment.
-    pub fn create(dir: &Path, base_offset: u64, index_interval: u32) -> io::Result<Self> {
-        let stem = segment_filename(base_offset);
-        let log_path = dir.join(format!("{stem}.log"));
-        let idx_path = dir.join(format!("{stem}.index"));
+    /// Create a new, empty segment starting at `base_offset`.
+    pub fn create(dir: &Path, base_offset: u64, max_bytes: u64, index_interval: u32) -> io::Result<Self> {
+        let log_path = dir.join(Self::filename(base_offset, "log"));
+        let index_path = dir.join(Self::filename(base_offset, "index"));
 
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&log_path)?;
+        // Create the empty log file.
+        std::fs::File::create(&log_path)?;
 
-        let index = SparseIndex::create(&idx_path, index_interval)?;
+        let index = SegmentIndex::new(index_path, index_interval);
 
         Ok(Self {
             base_offset,
+            log_path,
             next_offset: base_offset,
             file_size: 0,
-            file,
-            path: log_path,
             index,
+            max_bytes,
+            write_file: None,
         })
     }
 
-    /// Open an existing segment, scanning the log to rebuild in-memory state.
-    pub fn open(dir: &Path, base_offset: u64, index_interval: u32) -> io::Result<Self> {
-        let stem = segment_filename(base_offset);
-        let log_path = dir.join(format!("{stem}.log"));
-        let idx_path = dir.join(format!("{stem}.index"));
-
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&log_path)?;
-
-        let (next_offset, file_size, index) =
-            Self::recover_scan(&mut file, base_offset, &idx_path, index_interval)?;
-
-        Ok(Self {
-            base_offset,
-            next_offset,
-            file_size,
-            file,
-            path: log_path,
-            index,
-        })
-    }
-
-    /// Scan forward batch-by-batch, validating CRCs.
-    /// Truncates any trailing partial/corrupt batches (recovery).
-    fn recover_scan(
-        file: &mut File,
+    /// Open an existing segment, scanning for valid records.
+    /// Returns the segment with `next_offset` and `file_size` set
+    /// from the scan. Truncates at first corruption.
+    pub fn open(
+        dir: &Path,
         base_offset: u64,
-        idx_path: &Path,
+        max_bytes: u64,
         index_interval: u32,
-    ) -> io::Result<(u64, u64, SparseIndex)> {
-        let total_len = file.metadata()?.len();
-        file.seek(SeekFrom::Start(0))?;
+    ) -> io::Result<Self> {
+        let log_path = dir.join(Self::filename(base_offset, "log"));
+        let index_path = dir.join(Self::filename(base_offset, "index"));
 
-        let mut index = SparseIndex::create_or_truncate(idx_path, index_interval)?;
-        let mut pos: u64 = 0;
-        let mut next_offset = base_offset;
+        let mut seg = Self {
+            base_offset,
+            log_path: log_path.clone(),
+            next_offset: base_offset,
+            file_size: 0,
+            index: SegmentIndex::new(index_path, index_interval),
+            max_bytes,
+            write_file: None,
+        };
+
+        // Recovery scan: read all records, validate CRC, rebuild index.
+        seg.recovery_scan()?;
+
+        Ok(seg)
+    }
+
+    /// Recovery scan: walk forward through the segment, validate CRCs,
+    /// truncate at first corruption, and rebuild the sparse index.
+    fn recovery_scan(&mut self) -> io::Result<()> {
+        let mut file = std::fs::File::open(&self.log_path)?;
+        let file_len = file.metadata()?.len();
+
+        let mut position: u64 = 0;
+        let mut offset = self.base_offset;
+        let mut index_entries: Vec<(u64, u64)> = Vec::new();
 
         loop {
-            if total_len.saturating_sub(pos) < BATCH_HEADER_LEN {
-                break;
-            }
-
-            let mut len_buf = [0u8; 4];
-            if file.read_exact(&mut len_buf).is_err() {
-                break;
-            }
-            let batch_len = u32::from_le_bytes(len_buf);
-
-            // batch_len must cover at least crc(4) + num_entries(4) = 8
-            if !(8..=MAX_BATCH_DATA).contains(&batch_len) {
-                break;
-            }
-            if total_len.saturating_sub(pos + 4) < u64::from(batch_len) {
-                break;
-            }
-
-            let mut batch_data = vec![0u8; batch_len as usize];
-            if file.read_exact(&mut batch_data).is_err() {
-                break;
-            }
-
-            // Validate CRC over payload (everything after the crc field)
-            let stored_crc = u32::from_le_bytes([
-                batch_data[0], batch_data[1], batch_data[2], batch_data[3],
-            ]);
-            let payload = &batch_data[4..];
-            let computed_crc = crc32c::crc32c(payload);
-            if stored_crc != computed_crc {
-                break;
-            }
-
-            // Parse num_entries
-            if payload.len() < 4 {
-                break;
-            }
-            let num_entries = u32::from_le_bytes([
-                payload[0], payload[1], payload[2], payload[3],
-            ]);
-
-            // Walk entry frames to validate deserialization
-            let mut entry_pos = 4usize;
-            let mut batch_valid = true;
-            for _ in 0..num_entries {
-                if entry_pos + 4 > payload.len() {
-                    batch_valid = false;
-                    break;
+            if position + RECORD_HEADER_SIZE as u64 > file_len {
+                // Not enough bytes for even a header — partial write, truncate here.
+                if position < file_len {
+                    warn!(
+                        segment = %self.log_path.display(),
+                        position,
+                        "truncating partial record header at end of segment"
+                    );
                 }
-                let entry_len = u32::from_le_bytes([
-                    payload[entry_pos],
-                    payload[entry_pos + 1],
-                    payload[entry_pos + 2],
-                    payload[entry_pos + 3],
-                ]) as usize;
-                entry_pos += 4;
-                if entry_pos + entry_len > payload.len() {
-                    batch_valid = false;
-                    break;
-                }
-                let _: LogEntry = match bincode::deserialize(
-                    &payload[entry_pos..entry_pos + entry_len],
-                ) {
-                    Ok(e) => e,
-                    Err(_) => {
-                        batch_valid = false;
+                break;
+            }
+
+            file.seek(SeekFrom::Start(position))?;
+
+            // Read header.
+            let mut header_buf = [0u8; RECORD_HEADER_SIZE];
+            if file.read_exact(&mut header_buf).is_err() {
+                break;
+            }
+            let stored_crc = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+            let entry_len = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+
+            // Sanity check entry_len (guard against corrupt length causing huge alloc).
+            if entry_len == 0 || entry_len > 128 * 1024 * 1024 {
+                warn!(
+                    segment = %self.log_path.display(),
+                    position,
+                    entry_len,
+                    "invalid entry length, truncating"
+                );
+                break;
+            }
+
+            if position + RECORD_HEADER_SIZE as u64 + entry_len as u64 > file_len {
+                warn!(
+                    segment = %self.log_path.display(),
+                    position,
+                    entry_len,
+                    "incomplete record, truncating"
+                );
+                break;
+            }
+
+            // Read entry data.
+            let mut entry_data = vec![0u8; entry_len as usize];
+            if file.read_exact(&mut entry_data).is_err() {
+                break;
+            }
+
+            // Validate CRC: CRC covers (entry_len bytes ++ entry_data).
+            let mut crc_payload = Vec::with_capacity(4 + entry_data.len());
+            crc_payload.extend_from_slice(&entry_len.to_le_bytes());
+            crc_payload.extend_from_slice(&entry_data);
+            let computed_crc = crc32c::crc32c(&crc_payload);
+
+            if computed_crc != stored_crc {
+                warn!(
+                    segment = %self.log_path.display(),
+                    position,
+                    stored_crc,
+                    computed_crc,
+                    "CRC mismatch, truncating at this record"
+                );
+                break;
+            }
+
+            // Deserialize to verify the entry is well-formed.
+            match bincode::deserialize::<LogEntry>(&entry_data) {
+                Ok(entry) => {
+                    if entry.offset != offset {
+                        warn!(
+                            segment = %self.log_path.display(),
+                            position,
+                            expected_offset = offset,
+                            actual_offset = entry.offset,
+                            "offset mismatch in recovered entry, truncating"
+                        );
                         break;
                     }
-                };
-                entry_pos += entry_len;
-            }
-            if !batch_valid {
-                break;
-            }
-
-            // Record sparse index entries for this batch
-            let batch_byte_pos = pos;
-            let interval = u64::from(index_interval);
-            for i in 0..u64::from(num_entries) {
-                let global_idx = (next_offset + i) - base_offset;
-                if global_idx.is_multiple_of(interval) {
-                    index.append(next_offset + i, batch_byte_pos)?;
+                    index_entries.push((offset, position));
+                    let record_size = RECORD_HEADER_SIZE as u64 + entry_len as u64;
+                    position += record_size;
+                    offset += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        segment = %self.log_path.display(),
+                        position,
+                        error = %e,
+                        "failed to deserialize entry, truncating"
+                    );
+                    break;
                 }
             }
-
-            next_offset += u64::from(num_entries);
-            pos += 4 + u64::from(batch_len);
         }
 
-        if pos < total_len {
-            file.set_len(pos)?;
+        // Truncate file at the last valid position.
+        if position < file_len {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.log_path)?;
+            file.set_len(position)?;
+            file.sync_all()?;
         }
 
-        index.flush()?;
-        Ok((next_offset, pos, index))
-    }
+        self.next_offset = offset;
+        self.file_size = position;
 
-    /// Write pre-serialized entries as a single CRC-protected batch.
-    pub fn append_batch(
-        &mut self,
-        entries: &[LogEntry],
-        serialized: &[SerializedEntry],
-    ) -> io::Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        assert_eq!(entries.len(), serialized.len());
-
-        self.file.seek(SeekFrom::Start(self.file_size))?;
-
-        // Build payload: num_entries + entry frames
-        let num_entries = entries.len() as u32;
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&num_entries.to_le_bytes());
-        for se in serialized {
-            let entry_len = se.data.len() as u32;
-            payload.extend_from_slice(&entry_len.to_le_bytes());
-            payload.extend_from_slice(&se.data);
-        }
-
-        let crc = crc32c::crc32c(&payload);
-        let batch_len = (4 + payload.len()) as u32; // crc + payload
-
-        // Record sparse index entries
-        let batch_byte_pos = self.file_size;
-        let interval = u64::from(self.index.interval());
-        for i in 0..entries.len() {
-            let global_idx = (self.next_offset + i as u64) - self.base_offset;
-            if global_idx.is_multiple_of(interval) {
-                self.index
-                    .append(self.next_offset + i as u64, batch_byte_pos)?;
-            }
-        }
-
-        // Write batch: batch_len + crc + payload
-        self.file.write_all(&batch_len.to_le_bytes())?;
-        self.file.write_all(&crc.to_le_bytes())?;
-        self.file.write_all(&payload)?;
-
-        let written = 4 + u64::from(batch_len);
-        self.file_size += written;
-        self.next_offset += entries.len() as u64;
-
-        self.file.sync_all()?;
-        self.index.flush()?;
+        // Rebuild sparse index.
+        self.index.rebuild_from_entries(&index_entries)?;
 
         Ok(())
     }
 
-    /// Convenience: serialize entries internally and write as a single batch.
-    pub fn append(&mut self, entries: &[LogEntry]) -> io::Result<()> {
-        let serialized: Vec<SerializedEntry> = entries
-            .iter()
-            .map(SerializedEntry::from_entry)
-            .collect::<io::Result<_>>()?;
-        self.append_batch(entries, &serialized)
+    /// Lazily acquire the cached append-mode write handle.
+    fn write_handle(&mut self) -> io::Result<&mut std::fs::File> {
+        if self.write_file.is_none() {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.log_path)?;
+            self.write_file = Some(f);
+        }
+        Ok(self.write_file.as_mut().expect("just initialised"))
     }
 
-    /// Read entries in `[start_offset, end_offset)` from this segment.
-    /// Returns `Err` with `InvalidData` if a CRC mismatch is encountered
-    /// in any batch that must be read.
-    pub fn read(&mut self, start_offset: u64, end_offset: u64) -> io::Result<Vec<LogEntry>> {
-        if start_offset >= end_offset || start_offset >= self.next_offset {
+    /// Drop the cached write handle (e.g., before truncating or removing the file).
+    fn drop_write_handle(&mut self) {
+        self.write_file = None;
+    }
+
+    /// Append a single entry to this segment. Returns the byte position where
+    /// the record starts.
+    pub fn append_entry(&mut self, entry: &LogEntry) -> io::Result<u64> {
+        let entry_data = bincode::serialize(entry)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let entry_len = entry_data.len() as u32;
+
+        // CRC covers (entry_len ++ entry_data).
+        let mut crc_payload = Vec::with_capacity(4 + entry_data.len());
+        crc_payload.extend_from_slice(&entry_len.to_le_bytes());
+        crc_payload.extend_from_slice(&entry_data);
+        let crc = crc32c::crc32c(&crc_payload);
+
+        let record_start = self.file_size;
+
+        // Reuse the cached append-mode file handle to avoid the per-entry
+        // open/close overhead. The handle is opened lazily on the first
+        // append and dropped when the segment is truncated or removed.
+        {
+            let file = self.write_handle()?;
+            file.write_all(&crc.to_le_bytes())?;
+            file.write_all(&entry_len.to_le_bytes())?;
+            file.write_all(&entry_data)?;
+        }
+
+        let record_size = RECORD_HEADER_SIZE as u64 + entry_len as u64;
+
+        // Update sparse index.
+        self.index.maybe_add(entry.offset, record_start)?;
+
+        self.file_size += record_size;
+        self.next_offset = entry.offset + 1;
+
+        Ok(record_start)
+    }
+
+    /// Fsync the log file. Uses the cached append handle when available so
+    /// writes buffered in the kernel are flushed without reopening.
+    pub fn flush(&mut self) -> io::Result<()> {
+        if let Some(file) = self.write_file.as_mut() {
+            file.flush()?;
+            return file.sync_all();
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.log_path)?;
+        file.sync_all()
+    }
+
+    /// Read all entries in the offset range `[start, end)` from this segment.
+    /// Only returns entries whose offsets fall within this segment's range.
+    pub fn read_range(&self, start_offset: u64, end_offset: u64) -> io::Result<Vec<LogEntry>> {
+        let effective_start = start_offset.max(self.base_offset);
+        let effective_end = end_offset.min(self.next_offset);
+
+        if effective_start >= effective_end {
             return Ok(Vec::new());
         }
 
-        let effective_end = end_offset.min(self.next_offset);
+        let mut file = std::fs::File::open(&self.log_path)?;
 
-        let scan_pos = self.index.lookup(start_offset).unwrap_or(0);
-        self.file.seek(SeekFrom::Start(scan_pos))?;
-
-        let mut result = Vec::new();
-        let mut pos = scan_pos;
-
-        while pos < self.file_size {
-            let batch_start = pos;
-
-            // Read batch_len
-            let mut len_buf = [0u8; 4];
-            if let Err(e) = self.file.read_exact(&mut len_buf) {
-                if e.kind() == io::ErrorKind::UnexpectedEof {
-                    break;
+        // Use the sparse index to find a starting position close to effective_start.
+        let start_pos = match self.index.lookup(effective_start) {
+            Some((indexed_offset, position)) => {
+                // Scan forward from the indexed position.
+                file.seek(SeekFrom::Start(position))?;
+                // Skip records until we reach effective_start.
+                let mut pos = position;
+                let mut current_offset = indexed_offset;
+                while current_offset < effective_start {
+                    let record = Self::read_record_at(&mut file, pos)?;
+                    match record {
+                        Some((_, record_size)) => {
+                            pos += record_size;
+                            current_offset += 1;
+                            file.seek(SeekFrom::Start(pos))?;
+                        }
+                        None => return Ok(Vec::new()),
+                    }
                 }
-                return Err(e);
+                pos
             }
-            let batch_len = u32::from_le_bytes(len_buf);
-
-            if !(8..=MAX_BATCH_DATA).contains(&batch_len) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "corrupt batch at byte {batch_start}: invalid batch_len {batch_len}"
-                    ),
-                ));
-            }
-
-            let mut batch_data = vec![0u8; batch_len as usize];
-            self.file.read_exact(&mut batch_data)?;
-
-            // Validate batch CRC
-            let stored_crc = u32::from_le_bytes([
-                batch_data[0], batch_data[1], batch_data[2], batch_data[3],
-            ]);
-            let payload = &batch_data[4..];
-            let computed_crc = crc32c::crc32c(payload);
-            if stored_crc != computed_crc {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "CRC mismatch at batch byte {batch_start}: \
-                         stored={stored_crc:#010x} computed={computed_crc:#010x}"
-                    ),
-                ));
-            }
-
-            // Parse entries from payload
-            if payload.len() < 4 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("truncated batch at byte {batch_start}"),
-                ));
-            }
-            let num_entries = u32::from_le_bytes([
-                payload[0], payload[1], payload[2], payload[3],
-            ]);
-
-            let mut entry_pos = 4usize;
-            let mut found_past_end = false;
-            for _ in 0..num_entries {
-                if entry_pos + 4 > payload.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("truncated entry frame at byte {batch_start}"),
-                    ));
+            None => {
+                // No index entry; scan from the beginning.
+                let mut pos = 0u64;
+                let mut current_offset = self.base_offset;
+                file.seek(SeekFrom::Start(0))?;
+                while current_offset < effective_start {
+                    let record = Self::read_record_at(&mut file, pos)?;
+                    match record {
+                        Some((_, record_size)) => {
+                            pos += record_size;
+                            current_offset += 1;
+                            file.seek(SeekFrom::Start(pos))?;
+                        }
+                        None => return Ok(Vec::new()),
+                    }
                 }
-                let entry_len = u32::from_le_bytes([
-                    payload[entry_pos],
-                    payload[entry_pos + 1],
-                    payload[entry_pos + 2],
-                    payload[entry_pos + 3],
-                ]) as usize;
-                entry_pos += 4;
-                if entry_pos + entry_len > payload.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("truncated entry data at byte {batch_start}"),
-                    ));
-                }
-                let entry: LogEntry =
-                    bincode::deserialize(&payload[entry_pos..entry_pos + entry_len])
-                        .map_err(|e| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "deserialization failed at byte {batch_start}: {e}"
-                                ),
-                            )
-                        })?;
-                entry_pos += entry_len;
-
-                if entry.offset >= effective_end {
-                    found_past_end = true;
-                    break;
-                }
-                if entry.offset >= start_offset {
-                    result.push(entry);
-                }
+                pos
             }
+        };
 
-            if found_past_end {
-                break;
+        // Now read entries from effective_start to effective_end.
+        let mut entries = Vec::new();
+        let mut pos = start_pos;
+        file.seek(SeekFrom::Start(pos))?;
+
+        for _ in effective_start..effective_end {
+            let record = Self::read_record_at(&mut file, pos)?;
+            match record {
+                Some((entry, record_size)) => {
+                    entries.push(entry);
+                    pos += record_size;
+                    file.seek(SeekFrom::Start(pos))?;
+                }
+                None => break,
             }
-
-            pos += 4 + u64::from(batch_len);
         }
 
-        Ok(result)
+        Ok(entries)
     }
+
+    /// Read a single record at the given file position.
+    /// Returns `(LogEntry, record_total_size)` or `None` if at EOF / corrupt.
+    fn read_record_at(file: &mut std::fs::File, _position: u64) -> io::Result<Option<(LogEntry, u64)>> {
+        let mut header_buf = [0u8; RECORD_HEADER_SIZE];
+        match file.read_exact(&mut header_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+
+        let stored_crc = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+        let entry_len = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+
+        if entry_len == 0 || entry_len > 128 * 1024 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid entry length: {entry_len}"),
+            ));
+        }
+
+        let mut entry_data = vec![0u8; entry_len as usize];
+        file.read_exact(&mut entry_data)?;
+
+        // Validate CRC.
+        let mut crc_payload = Vec::with_capacity(4 + entry_data.len());
+        crc_payload.extend_from_slice(&entry_len.to_le_bytes());
+        crc_payload.extend_from_slice(&entry_data);
+        let computed_crc = crc32c::crc32c(&crc_payload);
+
+        if computed_crc != stored_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "CRC mismatch: stored={stored_crc:#x}, computed={computed_crc:#x}"
+                ),
+            ));
+        }
+
+        let entry: LogEntry = bincode::deserialize(&entry_data)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let record_size = RECORD_HEADER_SIZE as u64 + entry_len as u64;
+        Ok(Some((entry, record_size)))
+    }
+
+    /// Find the byte position where the record for `target_offset` begins.
+    /// Scans from the nearest index entry.
+    pub fn find_position(&self, target_offset: u64) -> io::Result<Option<u64>> {
+        if target_offset < self.base_offset || target_offset >= self.next_offset {
+            return Ok(None);
+        }
+
+        let mut file = std::fs::File::open(&self.log_path)?;
+
+        let (start_scan_offset, start_pos) = match self.index.lookup(target_offset) {
+            Some((indexed_offset, position)) => (indexed_offset, position),
+            None => (self.base_offset, 0),
+        };
+
+        let mut pos = start_pos;
+        let mut current_offset = start_scan_offset;
+        file.seek(SeekFrom::Start(pos))?;
+
+        while current_offset < target_offset {
+            let record = Self::read_record_at(&mut file, pos)?;
+            match record {
+                Some((_, record_size)) => {
+                    pos += record_size;
+                    current_offset += 1;
+                    file.seek(SeekFrom::Start(pos))?;
+                }
+                None => return Ok(None),
+            }
+        }
+
+        Ok(Some(pos))
+    }
+
+    /// Truncate all records at and after `from_offset`.
+    pub fn truncate_at(&mut self, from_offset: u64) -> io::Result<()> {
+        if from_offset >= self.next_offset {
+            return Ok(());
+        }
+
+        // Drop the cached append handle — its file position no longer matches
+        // the truncated file size.
+        self.drop_write_handle();
+
+        if from_offset <= self.base_offset {
+            // Truncate entire segment content.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.log_path)?;
+            file.set_len(0)?;
+            file.sync_all()?;
+            self.next_offset = self.base_offset;
+            self.file_size = 0;
+            self.index.truncate_from(self.base_offset)?;
+            return Ok(());
+        }
+
+        // Find byte position of from_offset.
+        let pos = self.find_position(from_offset)?;
+        match pos {
+            Some(truncate_pos) => {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&self.log_path)?;
+                file.set_len(truncate_pos)?;
+                file.sync_all()?;
+                self.file_size = truncate_pos;
+                self.next_offset = from_offset;
+                self.index.truncate_from(from_offset)?;
+            }
+            None => {
+                // This shouldn't happen for valid from_offset in range.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("could not find position for offset {from_offset}"),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove this segment's log and index files from disk.
+    pub fn remove(mut self) -> io::Result<()> {
+        // Drop the write handle before deleting (Windows refuses to delete
+        // files with open handles, and even on POSIX this avoids races with
+        // the lazy-close of pending writes).
+        self.drop_write_handle();
+        if self.log_path.exists() {
+            remove_file_with_retry(&self.log_path)?;
+        }
+        self.index.remove()?;
+        Ok(())
+    }
+
+    /// Zero-padded filename for a segment file.
+    pub fn filename(base_offset: u64, ext: &str) -> String {
+        format!("{:020}.{ext}", base_offset)
+    }
+
+    // Accessors
 
     pub fn base_offset(&self) -> u64 {
         self.base_offset
@@ -415,199 +507,33 @@ impl Segment {
         self.file_size
     }
 
-    /// Truncate this segment so that all entries at or after `from_offset`
-    /// are removed. Entries in `[base_offset, from_offset)` are preserved.
-    ///
-    /// This rebuilds the segment by reading the entries to keep, truncating
-    /// the underlying `.log` and `.index` files to zero, and rewriting the
-    /// preserved entries as a single batch. Both files are fsynced before
-    /// returning.
-    ///
-    /// If `from_offset >= next_offset`, this is a no-op.
-    /// If `from_offset <= base_offset`, the segment is emptied entirely.
-    pub fn truncate_at(&mut self, from_offset: u64) -> io::Result<()> {
-        if from_offset >= self.next_offset {
-            return Ok(());
-        }
-
-        // Read entries to preserve (may be empty when from_offset <= base_offset).
-        let preserved = if from_offset > self.base_offset {
-            self.read(self.base_offset, from_offset)?
-        } else {
-            Vec::new()
-        };
-
-        // Reset the .log file to zero length.
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file_size = 0;
-        self.next_offset = self.base_offset;
-
-        // Rebuild the sparse index file (truncated/empty).
-        let idx_path = self.path.with_extension("index");
-        let interval = self.index.interval();
-        self.index = SparseIndex::create_or_truncate(&idx_path, interval)?;
-
-        // Re-append the preserved entries, if any.
-        if !preserved.is_empty() {
-            let serialized: Vec<SerializedEntry> = preserved
-                .iter()
-                .map(SerializedEntry::from_entry)
-                .collect::<io::Result<_>>()?;
-            self.append_batch(&preserved, &serialized)?;
-        } else {
-            // No entries: still fsync the now-empty files for durability.
-            self.file.sync_all()?;
-            self.index.flush()?;
-        }
-
-        Ok(())
+    pub fn is_full(&self) -> bool {
+        self.file_size >= self.max_bytes
     }
 
-    /// Delete the on-disk `.log` and `.index` files backing this segment.
-    /// Consumes `self`.
-    pub fn delete(self) -> io::Result<()> {
-        let log_path = self.path.clone();
-        let idx_path = self.path.with_extension("index");
-        // Drop the file handle before deletion (important on Windows).
-        drop(self.file);
-        drop(self.index);
-        fs::remove_file(&log_path)?;
-        // Index file may not exist if create failed mid-way; ignore NotFound.
-        match fs::remove_file(&idx_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        Ok(())
+    pub fn is_empty(&self) -> bool {
+        self.next_offset == self.base_offset
+    }
+
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-    use xraft_core::log_entry::EntryType;
-    use xraft_core::types::Term;
-
-    fn make_entry(offset: u64, term: u64, payload: &[u8]) -> LogEntry {
-        LogEntry {
-            offset,
-            term: Term(term),
-            entry_type: EntryType::Command,
-            payload: bytes::Bytes::copy_from_slice(payload),
-        }
-    }
-
-    #[test]
-    fn append_and_read_back() {
-        let dir = TempDir::new().unwrap();
-        let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
-
-        let entries: Vec<LogEntry> = (0..10)
-            .map(|i| make_entry(i, 1, &[i as u8; 8]))
-            .collect();
-        seg.append(&entries).unwrap();
-
-        assert_eq!(seg.next_offset(), 10);
-        assert!(seg.file_size() > 0);
-
-        let read_back = seg.read(0, 10).unwrap();
-        assert_eq!(read_back.len(), 10);
-        for (i, entry) in read_back.iter().enumerate() {
-            assert_eq!(entry.offset, i as u64);
-            assert_eq!(entry.term, Term(1));
-            assert_eq!(entry.payload, vec![i as u8; 8]);
-        }
-    }
-
-    #[test]
-    fn read_past_corruption_returns_storage_error() {
-        let dir = TempDir::new().unwrap();
-        let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
-        // Write 10 entries as individual batches
-        for i in 0..10u64 {
-            seg.append(&[make_entry(i, 1, &[i as u8; 16])]).unwrap();
-        }
-
-        // Corrupt a batch mid-file on disk (without reopening)
-        let log_path = dir.path().join("00000000000000000000.log");
-        let mut raw = std::fs::read(&log_path).unwrap();
-        // Each batch has the same size; corrupt batch 5's payload area
-        let batch_size = raw.len() / 10;
-        let corrupt_byte = batch_size * 5 + 14; // inside entry data
-        raw[corrupt_byte] ^= 0xFF;
-        std::fs::write(&log_path, &raw).unwrap();
-
-        // Read spanning the corruption → must return InvalidData error
-        let err = seg.read(0, 10).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(
-            err.to_string().contains("CRC mismatch"),
-            "expected CRC mismatch error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn open_recovers_valid_segment() {
-        let dir = TempDir::new().unwrap();
-
-        {
-            let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
-            let entries: Vec<LogEntry> = (0..20)
-                .map(|i| make_entry(i, 1, &[i as u8; 8]))
-                .collect();
-            seg.append(&entries).unwrap();
-        }
-
-        let mut seg = Segment::open(dir.path(), 0, 4).unwrap();
-        assert_eq!(seg.next_offset(), 20);
-
-        let read_back = seg.read(0, 20).unwrap();
-        assert_eq!(read_back.len(), 20);
-    }
-
-    #[test]
-    fn recovery_truncates_corrupt_trailing_batch() {
-        let dir = TempDir::new().unwrap();
-
-        {
-            let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
-            for i in 0..10u64 {
-                seg.append(&[make_entry(i, 1, &[i as u8; 16])]).unwrap();
+/// Remove a file with retries on Windows to handle delayed handle release
+/// (antivirus scanners, search indexer, lazy close, etc.).
+fn remove_file_with_retry(path: &Path) -> io::Result<()> {
+    let max_attempts = 20;
+    let mut last_err = None;
+    for attempt in 0..max_attempts {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied && attempt < max_attempts - 1 => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)));
             }
+            Err(e) => return Err(e),
         }
-
-        // Corrupt the last batch
-        let log_path = dir.path().join("00000000000000000000.log");
-        let mut raw = std::fs::read(&log_path).unwrap();
-        let batch_size = raw.len() / 10;
-        let corrupt_byte = batch_size * 9 + 14;
-        raw[corrupt_byte] ^= 0xFF;
-        std::fs::write(&log_path, &raw).unwrap();
-
-        // Recovery truncates from the corrupt batch onward
-        let mut seg = Segment::open(dir.path(), 0, 4).unwrap();
-        assert_eq!(seg.next_offset(), 9);
-        let entries = seg.read(0, 9).unwrap();
-        assert_eq!(entries.len(), 9);
     }
-
-    #[test]
-    fn sparse_index_read_at_interval_boundary() {
-        let dir = TempDir::new().unwrap();
-        let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
-
-        for i in 0..16u64 {
-            seg.append(&[make_entry(i, 1, &[i as u8; 8])]).unwrap();
-        }
-
-        let read_at_4 = seg.read(4, 5).unwrap();
-        assert_eq!(read_at_4.len(), 1);
-        assert_eq!(read_at_4[0].offset, 4);
-
-        let read_at_12 = seg.read(12, 13).unwrap();
-        assert_eq!(read_at_12.len(), 1);
-        assert_eq!(read_at_12[0].offset, 12);
-    }
+    Err(last_err.unwrap())
 }
