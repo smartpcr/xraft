@@ -1,24 +1,11 @@
 use std::io;
 
-use crate::types::NodeId;
-
-/// Public error type for all xraft operations.
-#[derive(Debug, thiserror::Error)]
+/// Errors produced by xraft operations.
+#[derive(Debug)]
 pub enum XraftError {
-    /// Log, snapshot, or quorum-state I/O failure.
-    #[error("storage error: {0}")]
-    StorageError(#[from] io::Error),
-
-    /// Network send/recv failure.
-    #[error("transport error: {reason}")]
-    TransportError { reason: String },
-
-    /// propose() called on a non-leader node.
-    #[error("not leader, current leader: {leader_id:?}")]
-    NotLeader { leader_id: Option<NodeId> },
-
-    /// BatchAccumulator back-pressure limit reached.
-    #[error("proposal queue full")]
+    StorageError(String),
+    TransportError(String),
+    NotLeader,
     ProposalQueueFull,
 
     /// RPC cluster_id mismatch.
@@ -29,23 +16,19 @@ pub enum XraftError {
     #[error("node is shutting down")]
     Shutdown,
 
-    /// Bootstrap rejected: node already initialised.
-    #[error("already bootstrapped: {reason}")]
-    AlreadyBootstrapped { reason: String },
-
-    /// Bootstrap input validation failure.
-    #[error("invalid bootstrap configuration: {reason}")]
-    InvalidBootstrapConfig { reason: String },
-
-    /// Configuration validation failure.
-    #[error("invalid configuration: {reason}")]
-    InvalidConfig { reason: String },
-
-    /// Recovery not yet implemented (placeholder for Stage 6.1).
-    #[error("crash recovery required but not yet implemented")]
-    RecoveryRequired,
-
-    /// Election attempted from an invalid role.
-    #[error("invalid election state: {reason}")]
-    InvalidElectionState { reason: String },
+impl fmt::Display for XraftError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            XraftError::StorageError(msg) => write!(f, "storage error: {msg}"),
+            XraftError::TransportError(msg) => write!(f, "transport error: {msg}"),
+            XraftError::NotLeader => write!(f, "not leader"),
+            XraftError::ProposalQueueFull => write!(f, "proposal queue full"),
+            XraftError::InvalidClusterId => write!(f, "invalid cluster id"),
+            XraftError::Shutdown => write!(f, "node shut down"),
+        }
+    }
 }
+
+impl std::error::Error for XraftError {}
+
+pub type Result<T> = std::result::Result<T, XraftError>;
