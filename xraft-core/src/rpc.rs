@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::log_entry::LogEntry;
-use crate::snapshot::SnapshotId;
+pub use crate::snapshot::SnapshotId;
 use crate::types::{ClusterId, NodeId, Term};
 use crate::voter::{VoterInfo, VotersRecord};
 
