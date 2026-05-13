@@ -9,37 +9,51 @@ use crate::voter::{VoterInfo, VotersRecord};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcEnvelope {
     pub cluster_id: ClusterId,
-    pub leader_epoch: u64,
+    pub leader_epoch: Term,
     pub source: NodeId,
     pub payload: RpcPayload,
 }
 
-/// Discriminated union of all RPC message types.
+/// Discriminated union of all RPC message types exchanged between nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RpcPayload {
     VoteRequest(VoteRequest),
     VoteResponse(VoteResponse),
+    FetchRequest(FetchRequest),
+    FetchResponse(FetchResponse),
+    FetchSnapshotRequest(FetchSnapshotRequest),
+    FetchSnapshotResponse(FetchSnapshotResponse),
+    AddVoter(AddVoterRequest),
+    RemoveVoter(RemoveVoterRequest),
+    UpdateVoter(UpdateVoterRequest),
+    MembershipChangeResponse(MembershipChangeResponse),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateVoterRequest {
-    pub voter: VoterInfo,
+// ---------------------------------------------------------------------------
+// Election RPCs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoteRequest {
+    pub term: Term,
+    pub candidate_id: NodeId,
+    pub last_log_offset: u64,
+    pub last_log_term: Term,
+    /// `true` for a pre-vote (disruption-prevention) probe; `false` for a real
+    /// vote that advances persisted state.
+    pub is_pre_vote: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MembershipChangeResponse {
-    pub success: bool,
-    pub error: Option<MembershipError>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoteResponse {
+    pub term: Term,
+    pub vote_granted: bool,
+    pub is_pre_vote: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum MembershipError {
-    NotLeader { leader_id: Option<NodeId> },
-    ChangeInProgress,
-    NodeAlreadyVoter,
-    NodeNotFound,
-    NodeNotCaughtUp,
-}
+// ---------------------------------------------------------------------------
+// Replication (Fetch) RPCs
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchRequest {
@@ -66,6 +80,10 @@ pub struct DivergingEpoch {
     pub end_offset: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Snapshot transfer RPCs
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchSnapshotRequest {
     pub snapshot_id: SnapshotId,
@@ -80,6 +98,10 @@ pub struct FetchSnapshotResponse {
     pub data: bytes::Bytes,
     pub is_last_chunk: bool,
 }
+
+// ---------------------------------------------------------------------------
+// Membership-change RPCs
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddVoterRequest {
@@ -105,7 +127,7 @@ pub struct MembershipChangeResponse {
 /// Errors returned by membership-change RPCs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MembershipError {
-    NotLeader,
+    NotLeader { leader_id: Option<NodeId> },
     ChangeInProgress,
     NodeAlreadyVoter,
     NodeNotFound,
