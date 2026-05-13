@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use xraft_core::error::XraftError;
 use xraft_core::log_entry::LogEntry;
 use xraft_core::traits::LogStore;
 use xraft_core::types::ClusterId;
@@ -219,7 +218,7 @@ impl SegmentLog {
 
 #[async_trait]
 impl LogStore for SegmentLog {
-    async fn append(&self, entries: &[LogEntry]) -> Result<(), XraftError> {
+    async fn append(&self, entries: &[LogEntry]) -> io::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -229,23 +228,23 @@ impl LogStore for SegmentLog {
         // Validate offset continuity
         let current_end = self.end_offset.load(Ordering::Acquire);
         if entries[0].offset != current_end {
-            return Err(XraftError::StorageError(io::Error::new(
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "offset discontinuity: expected {}, got {}",
                     current_end, entries[0].offset
                 ),
-            )));
+            ));
         }
         for window in entries.windows(2) {
             if window[1].offset != window[0].offset + 1 {
-                return Err(XraftError::StorageError(io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
                         "non-contiguous offsets: {} followed by {}",
                         window[0].offset, window[1].offset
                     ),
-                )));
+                ));
             }
         }
 
@@ -253,8 +252,7 @@ impl LogStore for SegmentLog {
         let serialized: Vec<SerializedEntry> = entries
             .iter()
             .map(SerializedEntry::from_entry)
-            .collect::<Result<_, _>>()
-            .map_err(XraftError::StorageError)?;
+            .collect::<Result<_, _>>()?;
 
         // Write entries in sub-batches, rolling segments as needed.
         // Each sub-batch is written as a single CRC-protected batch.
@@ -311,8 +309,7 @@ impl LogStore for SegmentLog {
                 .last_mut()
                 .expect("at least one segment exists");
             active
-                .append_batch(&entries[pos..end], &serialized[pos..end])
-                .map_err(XraftError::StorageError)?;
+                .append_batch(&entries[pos..end], &serialized[pos..end])?;
 
             // Update end_offset immediately after each successful sub-batch
             // so the live state is consistent with what's durably on disk.
@@ -329,7 +326,7 @@ impl LogStore for SegmentLog {
         &self,
         start_offset: u64,
         end_offset: u64,
-    ) -> Result<Vec<LogEntry>, XraftError> {
+    ) -> io::Result<Vec<LogEntry>> {
         if start_offset >= end_offset {
             return Ok(Vec::new());
         }
@@ -348,27 +345,127 @@ impl LogStore for SegmentLog {
         let mut result = Vec::new();
         for i in seg_start..=seg_end {
             let seg = &mut inner.segments[i];
-            let entries = seg
-                .read(start_offset, end_offset)
-                .map_err(XraftError::StorageError)?;
+            let entries = seg.read(start_offset, end_offset)?;
             result.extend(entries);
         }
 
         Ok(result)
     }
 
-    async fn truncate_suffix(&self, _from_offset: u64) -> Result<(), XraftError> {
-        Err(XraftError::StorageError(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "truncate_suffix not yet implemented (Stage 2.2)",
-        )))
+    async fn truncate_suffix(&self, from_offset: u64) -> io::Result<()> {
+        let mut inner = self.inner.lock().await;
+
+        let log_end = self.end_offset.load(Ordering::Acquire);
+        if from_offset >= log_end {
+            return Ok(());
+        }
+
+        let log_start = self.start_offset.load(Ordering::Acquire);
+        let effective_from = from_offset.max(log_start);
+
+        // If truncating below or at the current start, wipe everything and
+        // create a fresh empty segment at log_start.
+        if effective_from <= log_start {
+            for seg in inner.segments.drain(..) {
+                seg.delete()?;
+            }
+            let seg = Segment::create(&self.log_dir, log_start, self.config.index_interval)?;
+            inner.segments.push(seg);
+            self.end_offset.store(log_start, Ordering::Release);
+            return Ok(());
+        }
+
+        // Find the segment that contains `effective_from`. It must exist since
+        // log_start <= effective_from < log_end.
+        let seg_idx = Self::find_segment(&inner.segments, effective_from)
+            .expect("offset within [log_start, log_end) must map to a segment");
+
+        // Delete all segments after `seg_idx`.
+        while inner.segments.len() > seg_idx + 1 {
+            let seg = inner.segments.pop().expect("segments non-empty");
+            seg.delete()?;
+        }
+
+        // Truncate the segment at `seg_idx` to drop entries >= effective_from.
+        let seg = &mut inner.segments[seg_idx];
+        seg.truncate_at(effective_from)?;
+
+        // Sync the parent directory so the metadata changes (deletions) are durable.
+        #[cfg(unix)]
+        {
+            let dir_file = fs::File::open(&self.log_dir)?;
+            dir_file.sync_all()?;
+        }
+
+        let new_end = inner
+            .segments
+            .last()
+            .map(|s| s.next_offset())
+            .unwrap_or(log_start);
+        self.end_offset.store(new_end, Ordering::Release);
+
+        Ok(())
     }
 
-    async fn truncate_prefix(&self, _up_to_offset: u64) -> Result<(), XraftError> {
-        Err(XraftError::StorageError(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "truncate_prefix not yet implemented (Stage 2.2)",
-        )))
+    async fn truncate_prefix(&self, up_to_offset: u64) -> io::Result<()> {
+        let mut inner = self.inner.lock().await;
+
+        let log_start = self.start_offset.load(Ordering::Acquire);
+        if up_to_offset <= log_start {
+            return Ok(());
+        }
+
+        let log_end = self.end_offset.load(Ordering::Acquire);
+        let effective_up_to = up_to_offset.min(log_end);
+
+        // Identify how many leading segments are entirely before `effective_up_to`
+        // (a segment is fully before iff its next_offset <= effective_up_to).
+        let remove_count = inner
+            .segments
+            .iter()
+            .take_while(|s| s.next_offset() <= effective_up_to)
+            .count();
+
+        // Drain those segments and delete their on-disk files.
+        for seg in inner.segments.drain(..remove_count) {
+            tracing::debug!(
+                base_offset = seg.base_offset(),
+                next_offset = seg.next_offset(),
+                "deleting prefix segment"
+            );
+            seg.delete()?;
+        }
+
+        // If all segments were removed, create a fresh empty segment at the
+        // new logical start so that subsequent appends have a target.
+        if inner.segments.is_empty() {
+            let seg =
+                Segment::create(&self.log_dir, effective_up_to, self.config.index_interval)?;
+            inner.segments.push(seg);
+        }
+
+        // Sync the parent directory so segment-file deletions are durable.
+        #[cfg(unix)]
+        {
+            let dir_file = fs::File::open(&self.log_dir)?;
+            dir_file.sync_all()?;
+        }
+
+        // Update atomics. The new end must remain >= new start.
+        let new_end = inner
+            .segments
+            .last()
+            .map(|s| s.next_offset())
+            .unwrap_or(effective_up_to)
+            .max(effective_up_to);
+
+        // Update end_offset BEFORE start_offset to avoid a transient window
+        // where start > end as observed by readers.
+        self.end_offset.store(new_end, Ordering::Release);
+        self.start_offset
+            .store(effective_up_to, Ordering::Release);
+
+        Ok(())
     }
 
     fn log_start_offset(&self) -> u64 {
@@ -379,7 +476,7 @@ impl LogStore for SegmentLog {
         self.end_offset.load(Ordering::Acquire)
     }
 
-    async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>, XraftError> {
+    async fn entry_at(&self, offset: u64) -> io::Result<Option<LogEntry>> {
         let current_start = self.log_start_offset();
         let current_end = self.log_end_offset();
 
@@ -405,7 +502,7 @@ mod tests {
             offset,
             term: Term(term),
             entry_type: EntryType::Command,
-            payload: payload.to_vec(),
+            payload: bytes::Bytes::copy_from_slice(payload),
         }
     }
 
@@ -466,18 +563,17 @@ mod tests {
             f.sync_all().unwrap();
         }
 
-        // Reading through the same SegmentLog handle must return StorageError
+        // Reading through the same SegmentLog handle must return an IO error
         let result = log.read(0, 10).await;
         match result {
-            Err(XraftError::StorageError(ref e)) => {
+            Err(ref e) => {
                 assert_eq!(e.kind(), io::ErrorKind::InvalidData);
                 assert!(
                     e.to_string().contains("CRC"),
                     "expected CRC error, got: {e}"
                 );
             }
-            Ok(_) => panic!("expected StorageError from CRC mismatch, got Ok"),
-            Err(other) => panic!("expected StorageError, got: {other}"),
+            Ok(_) => panic!("expected error from CRC mismatch, got Ok"),
         }
     }
 
@@ -612,7 +708,7 @@ mod tests {
     #[tokio::test]
     async fn directory_layout_via_open_for_cluster() {
         let dir = TempDir::new().unwrap();
-        let cluster_id = ClusterId::random();
+        let cluster_id = ClusterId::new();
         let log = SegmentLog::open_for_cluster(
             dir.path(),
             &cluster_id,

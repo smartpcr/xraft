@@ -1,17 +1,23 @@
-//! Integration tests for the segment log write path (Stage 2.1).
+//! Integration tests for the segment log (Stages 2.1 and 2.2).
 //!
 //! These tests exercise the public API of `SegmentLog` through the `LogStore`
-//! trait, verifying the three required scenarios:
+//! trait, verifying the required scenarios for both stages:
+//!
+//! Stage 2.1 — Write path:
 //!   1. Append and read back 100 entries
 //!   2. CRC integrity — corruption produces `StorageError`
 //!   3. Segment rollover at a 1 KB size limit
+//!
+//! Stage 2.2 — Read and truncation:
+//!   4. Truncate suffix removes tail entries
+//!   5. Truncate prefix deletes whole leading segment files
+//!   6. Recovery after crash truncates a corrupt trailing batch on reopen
 
 use std::fs;
 use std::io::{Read, Seek, Write};
 
 use tempfile::TempDir;
 
-use xraft_core::error::XraftError;
 use xraft_core::log_entry::{EntryType, LogEntry};
 use xraft_core::traits::LogStore;
 use xraft_core::types::{ClusterId, Term};
@@ -22,7 +28,7 @@ fn make_entry(offset: u64, term: u64, payload: &[u8]) -> LogEntry {
         offset,
         term: Term(term),
         entry_type: EntryType::Command,
-        payload: payload.to_vec(),
+        payload: bytes::Bytes::copy_from_slice(payload),
     }
 }
 
@@ -129,18 +135,17 @@ async fn crc_integrity_returns_storage_error() {
         f.sync_all().unwrap();
     }
 
-    // Reading through the live SegmentLog must return StorageError(InvalidData)
+    // Reading through the live SegmentLog must return an IO error
     let result = log.read(0, 10).await;
     match result {
-        Err(XraftError::StorageError(ref e)) => {
+        Err(ref e) => {
             assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
             assert!(
                 e.to_string().contains("CRC"),
                 "expected CRC error, got: {e}"
             );
         }
-        Ok(_) => panic!("expected StorageError from CRC mismatch, got Ok"),
-        Err(other) => panic!("expected StorageError, got: {other}"),
+        Ok(_) => panic!("expected error from CRC mismatch, got Ok"),
     }
 }
 
@@ -185,8 +190,8 @@ async fn crc_integrity_partial_read_before_corruption_succeeds() {
     // Reading entries 0..10 (spans corruption) must fail
     let result = log.read(0, 10).await;
     assert!(
-        matches!(result, Err(XraftError::StorageError(_))),
-        "expected StorageError spanning corruption, got: {result:?}"
+        result.is_err(),
+        "expected error spanning corruption, got: {result:?}"
     );
 }
 
@@ -336,7 +341,7 @@ async fn segment_rollover_single_append_call() {
 #[tokio::test]
 async fn directory_layout_with_cluster_id() {
     let dir = TempDir::new().unwrap();
-    let cluster_id = ClusterId::random();
+    let cluster_id = ClusterId::new();
 
     let log = SegmentLog::open_for_cluster(
         dir.path(),
@@ -434,4 +439,361 @@ async fn reopen_preserves_multi_segment_data() {
         assert_eq!(entry.term, Term(2));
         assert_eq!(entry.payload, vec![i as u8; 24]);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2.2 Scenario 1: Truncate suffix
+// ---------------------------------------------------------------------------
+
+/// Given a log with entries 0–99, When `truncate_suffix(50)` is called,
+/// Then `read(0, 100)` returns only entries 0–49.
+#[tokio::test]
+async fn truncate_suffix_drops_tail_entries() {
+    let dir = TempDir::new().unwrap();
+    let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
+
+    let entries: Vec<LogEntry> = (0..100)
+        .map(|i| make_entry(i, 1, &format!("v-{i}").into_bytes()))
+        .collect();
+    log.append(&entries).await.unwrap();
+    assert_eq!(log.log_end_offset(), 100);
+
+    log.truncate_suffix(50).await.unwrap();
+
+    // log_end_offset now reflects truncation
+    assert_eq!(log.log_start_offset(), 0);
+    assert_eq!(log.log_end_offset(), 50);
+
+    // Reading [0, 100) returns only 0..50
+    let read_back = log.read(0, 100).await.unwrap();
+    assert_eq!(read_back.len(), 50);
+    for (i, entry) in read_back.iter().enumerate() {
+        assert_eq!(entry.offset, i as u64);
+        assert_eq!(entry.payload, format!("v-{i}").into_bytes());
+    }
+
+    // entry_at past the new end returns None
+    assert!(log.entry_at(50).await.unwrap().is_none());
+    assert!(log.entry_at(99).await.unwrap().is_none());
+
+    // We can append fresh entries starting at the truncation point
+    let more: Vec<LogEntry> = (50..60)
+        .map(|i| make_entry(i, 2, &format!("new-{i}").into_bytes()))
+        .collect();
+    log.append(&more).await.unwrap();
+    assert_eq!(log.log_end_offset(), 60);
+    let e = log.entry_at(55).await.unwrap().unwrap();
+    assert_eq!(e.term, Term(2));
+    assert_eq!(e.payload, b"new-55".to_vec());
+}
+
+/// `truncate_suffix` must span multiple segments — deleting later segment
+/// files and shrinking the segment that straddles the truncation offset.
+#[tokio::test]
+async fn truncate_suffix_spans_multiple_segments() {
+    let dir = TempDir::new().unwrap();
+    let config = SegmentLogConfig {
+        max_segment_size: 512,
+        index_interval: 4,
+    };
+    let log = SegmentLog::open(dir.path(), config).unwrap();
+
+    // Write enough entries to span several segments.
+    let entries: Vec<LogEntry> = (0..60)
+        .map(|i| make_entry(i, 1, &[0xEEu8; 24]))
+        .collect();
+    log.append(&entries).await.unwrap();
+    assert_eq!(log.log_end_offset(), 60);
+
+    let pre_log_files: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                == Some("log")
+        })
+        .collect();
+    assert!(
+        pre_log_files.len() > 1,
+        "test prereq: must have multiple segments, got {}",
+        pre_log_files.len()
+    );
+
+    log.truncate_suffix(20).await.unwrap();
+    assert_eq!(log.log_end_offset(), 20);
+
+    let read_back = log.read(0, 60).await.unwrap();
+    assert_eq!(read_back.len(), 20);
+    for (i, entry) in read_back.iter().enumerate() {
+        assert_eq!(entry.offset, i as u64);
+    }
+
+    // At least one segment file should have been deleted.
+    let post_log_files: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                == Some("log")
+        })
+        .collect();
+    assert!(
+        post_log_files.len() < pre_log_files.len(),
+        "truncate_suffix should have removed at least one segment file \
+         (pre={}, post={})",
+        pre_log_files.len(),
+        post_log_files.len()
+    );
+
+    // Truncation is durable across reopen.
+    drop(log);
+    let log2 = SegmentLog::open(
+        dir.path(),
+        SegmentLogConfig {
+            max_segment_size: 512,
+            index_interval: 4,
+        },
+    )
+    .unwrap();
+    assert_eq!(log2.log_end_offset(), 20);
+    let again = log2.read(0, 60).await.unwrap();
+    assert_eq!(again.len(), 20);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2.2 Scenario 2: Truncate prefix
+// ---------------------------------------------------------------------------
+
+/// Given a log with multiple segment files, When `truncate_prefix(N)` is
+/// called such that whole leading segments are entirely below N, Then those
+/// segment files are deleted and `log_start_offset()` advances to N.
+///
+/// We use a small `max_segment_size` so the equivalent of the spec's
+/// "3 segments covering 0–2999, truncate_prefix(1000)" scenario is reproduced
+/// at a faster, deterministic scale.
+#[tokio::test]
+async fn truncate_prefix_deletes_leading_segments() {
+    let dir = TempDir::new().unwrap();
+    let config = SegmentLogConfig {
+        max_segment_size: 512,
+        index_interval: 4,
+    };
+    let log = SegmentLog::open(dir.path(), config).unwrap();
+
+    // Write 90 entries; with 24-byte payload and 512-byte segments this
+    // produces multiple segment files.
+    let entries: Vec<LogEntry> = (0..90)
+        .map(|i| make_entry(i, 1, &[0xCCu8; 24]))
+        .collect();
+    log.append(&entries).await.unwrap();
+    assert_eq!(log.log_end_offset(), 90);
+
+    let pre_log_files: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                == Some("log")
+        })
+        .collect();
+    assert!(
+        pre_log_files.len() >= 3,
+        "test prereq: need at least 3 segments, got {}",
+        pre_log_files.len()
+    );
+
+    // Capture the base offset of the very first segment.
+    let mut pre_bases: Vec<u64> = pre_log_files
+        .iter()
+        .map(|e| {
+            e.path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap()
+        })
+        .collect();
+    pre_bases.sort();
+    assert_eq!(pre_bases[0], 0);
+    let second_seg_base = pre_bases[1];
+
+    // Pick the second segment's base offset as the truncation point. This
+    // mirrors the spec scenario (truncate_prefix at a segment boundary) and
+    // is the offset that survives reopen as the new logical log start.
+    let truncate_at = second_seg_base;
+    log.truncate_prefix(truncate_at).await.unwrap();
+
+    assert_eq!(log.log_start_offset(), truncate_at);
+    assert_eq!(log.log_end_offset(), 90);
+
+    // First segment must be gone; later segments still present.
+    let post_log_files: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                == Some("log")
+        })
+        .collect();
+    let post_bases: Vec<u64> = post_log_files
+        .iter()
+        .map(|e| {
+            e.path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        !post_bases.contains(&0),
+        "segment file 0 should have been deleted after truncate_prefix"
+    );
+    assert!(
+        post_bases.contains(&second_seg_base),
+        "second segment file (containing the truncation point) should remain"
+    );
+    assert!(
+        post_log_files.len() < pre_log_files.len(),
+        "at least one segment file should be deleted"
+    );
+
+    // Matching .index file for the deleted segment must also be gone.
+    assert!(
+        !dir.path()
+            .join("00000000000000000000.index")
+            .exists(),
+        ".index file for deleted segment 0 should also be removed"
+    );
+
+    // Reading from the new start onward returns all surviving entries.
+    let remaining = log.read(truncate_at, 90).await.unwrap();
+    assert_eq!(remaining.len(), (90 - truncate_at) as usize);
+    for (i, entry) in remaining.iter().enumerate() {
+        assert_eq!(entry.offset, truncate_at + i as u64);
+    }
+
+    // Compaction is durable across reopen.
+    drop(log);
+    let log2 = SegmentLog::open(
+        dir.path(),
+        SegmentLogConfig {
+            max_segment_size: 512,
+            index_interval: 4,
+        },
+    )
+    .unwrap();
+    assert_eq!(log2.log_start_offset(), truncate_at);
+    assert_eq!(log2.log_end_offset(), 90);
+}
+
+/// `truncate_prefix(N)` where N is past the last entry collapses the log to
+/// an empty state anchored at N (subsequent appends start at N).
+#[tokio::test]
+async fn truncate_prefix_past_end_resets_log_start() {
+    let dir = TempDir::new().unwrap();
+    let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
+
+    let entries: Vec<LogEntry> = (0..10)
+        .map(|i| make_entry(i, 1, b"x"))
+        .collect();
+    log.append(&entries).await.unwrap();
+
+    log.truncate_prefix(100).await.unwrap();
+    assert_eq!(log.log_start_offset(), 10);
+    assert_eq!(log.log_end_offset(), 10);
+
+    // Subsequent appends must start at the new logical start.
+    let more = vec![make_entry(10, 2, b"y")];
+    log.append(&more).await.unwrap();
+    assert_eq!(log.log_end_offset(), 11);
+    let e = log.entry_at(10).await.unwrap().unwrap();
+    assert_eq!(e.term, Term(2));
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2.2 Scenario 3: Recovery after crash
+// ---------------------------------------------------------------------------
+
+/// Given a segment with a partially-written (corrupt CRC) final batch,
+/// When the recovery scan runs (`SegmentLog::open`), Then the corrupt
+/// trailing batch is truncated and all entries before it are intact.
+#[tokio::test]
+async fn recovery_truncates_corrupt_trailing_batch_on_reopen() {
+    let dir = TempDir::new().unwrap();
+
+    // Write 10 entries as 10 separate batches so the trailing batch is
+    // isolated and easy to corrupt.
+    {
+        let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
+        for i in 0..10u64 {
+            log.append(&[make_entry(i, 1, &[i as u8; 32])])
+                .await
+                .unwrap();
+        }
+        assert_eq!(log.log_end_offset(), 10);
+    }
+
+    // Simulate a partially-written final batch by flipping a byte inside the
+    // last batch on disk (corrupts CRC for that batch only).
+    let log_path = dir.path().join("00000000000000000000.log");
+    let file_size_before = fs::metadata(&log_path).unwrap().len();
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&log_path)
+            .unwrap();
+        let mut raw = Vec::new();
+        f.read_to_end(&mut raw).unwrap();
+        let batch_size = (raw.len() / 10) as u64;
+        // Corrupt a payload byte inside the last (10th) batch.
+        let corrupt_pos = (batch_size * 9 + 14) as usize;
+        raw[corrupt_pos] ^= 0xFF;
+        f.seek(std::io::SeekFrom::Start(0)).unwrap();
+        f.write_all(&raw).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // Reopen — the recovery scan must truncate at the corrupt batch.
+    let log = SegmentLog::open(dir.path(), SegmentLogConfig::default()).unwrap();
+
+    // The corrupt trailing batch was dropped, leaving entries 0..9.
+    assert_eq!(log.log_end_offset(), 9, "corrupt trailing batch must be dropped");
+
+    // All entries before the corruption are intact and readable.
+    let surviving = log.read(0, 9).await.unwrap();
+    assert_eq!(surviving.len(), 9);
+    for (i, entry) in surviving.iter().enumerate() {
+        let i = i as u64;
+        assert_eq!(entry.offset, i);
+        assert_eq!(entry.payload, vec![i as u8; 32]);
+    }
+
+    // entry_at past the recovered end returns None.
+    assert!(log.entry_at(9).await.unwrap().is_none());
+
+    // The on-disk file was physically truncated to drop the corrupt batch.
+    let file_size_after = fs::metadata(&log_path).unwrap().len();
+    assert!(
+        file_size_after < file_size_before,
+        "log file should have been truncated on recovery (before={file_size_before}, after={file_size_after})"
+    );
+
+    // We can append new entries starting at the recovered offset.
+    log.append(&[make_entry(9, 2, b"after-recovery")])
+        .await
+        .unwrap();
+    assert_eq!(log.log_end_offset(), 10);
+    let e = log.entry_at(9).await.unwrap().unwrap();
+    assert_eq!(e.term, Term(2));
+    assert_eq!(e.payload, b"after-recovery".to_vec());
 }

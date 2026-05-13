@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -414,6 +414,73 @@ impl Segment {
     pub fn file_size(&self) -> u64 {
         self.file_size
     }
+
+    /// Truncate this segment so that all entries at or after `from_offset`
+    /// are removed. Entries in `[base_offset, from_offset)` are preserved.
+    ///
+    /// This rebuilds the segment by reading the entries to keep, truncating
+    /// the underlying `.log` and `.index` files to zero, and rewriting the
+    /// preserved entries as a single batch. Both files are fsynced before
+    /// returning.
+    ///
+    /// If `from_offset >= next_offset`, this is a no-op.
+    /// If `from_offset <= base_offset`, the segment is emptied entirely.
+    pub fn truncate_at(&mut self, from_offset: u64) -> io::Result<()> {
+        if from_offset >= self.next_offset {
+            return Ok(());
+        }
+
+        // Read entries to preserve (may be empty when from_offset <= base_offset).
+        let preserved = if from_offset > self.base_offset {
+            self.read(self.base_offset, from_offset)?
+        } else {
+            Vec::new()
+        };
+
+        // Reset the .log file to zero length.
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file_size = 0;
+        self.next_offset = self.base_offset;
+
+        // Rebuild the sparse index file (truncated/empty).
+        let idx_path = self.path.with_extension("index");
+        let interval = self.index.interval();
+        self.index = SparseIndex::create_or_truncate(&idx_path, interval)?;
+
+        // Re-append the preserved entries, if any.
+        if !preserved.is_empty() {
+            let serialized: Vec<SerializedEntry> = preserved
+                .iter()
+                .map(SerializedEntry::from_entry)
+                .collect::<io::Result<_>>()?;
+            self.append_batch(&preserved, &serialized)?;
+        } else {
+            // No entries: still fsync the now-empty files for durability.
+            self.file.sync_all()?;
+            self.index.flush()?;
+        }
+
+        Ok(())
+    }
+
+    /// Delete the on-disk `.log` and `.index` files backing this segment.
+    /// Consumes `self`.
+    pub fn delete(self) -> io::Result<()> {
+        let log_path = self.path.clone();
+        let idx_path = self.path.with_extension("index");
+        // Drop the file handle before deletion (important on Windows).
+        drop(self.file);
+        drop(self.index);
+        fs::remove_file(&log_path)?;
+        // Index file may not exist if create failed mid-way; ignore NotFound.
+        match fs::remove_file(&idx_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -428,7 +495,7 @@ mod tests {
             offset,
             term: Term(term),
             entry_type: EntryType::Command,
-            payload: payload.to_vec(),
+            payload: bytes::Bytes::copy_from_slice(payload),
         }
     }
 
