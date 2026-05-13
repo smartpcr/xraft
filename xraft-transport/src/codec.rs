@@ -111,7 +111,7 @@ mod tests {
     fn sample_envelope(cluster_id: ClusterId) -> RpcEnvelope {
         RpcEnvelope {
             cluster_id,
-            leader_epoch: 1,
+            leader_epoch: Term(1),
             source: NodeId(1),
             payload: RpcPayload::VoteRequest(VoteRequest {
                 term: Term(2),
