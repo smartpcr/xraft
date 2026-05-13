@@ -1,24 +1,11 @@
 use std::io;
 
-use thiserror::Error;
-
-use crate::types::NodeId;
-
-/// Unified error type for all xraft public APIs.
-#[derive(Debug, Error)]
+/// Errors produced by xraft operations.
+#[derive(Debug)]
 pub enum XraftError {
-    #[error("storage error: {0}")]
-    StorageError(#[from] std::io::Error),
-
-    #[error("transport error: {0}")]
+    StorageError(String),
     TransportError(String),
-
-    /// `propose()` called on a non-leader node.
-    #[error("not leader; current leader is {leader_id:?}")]
-    NotLeader { leader_id: Option<NodeId> },
-
-    /// BatchAccumulator back-pressure limit reached.
-    #[error("proposal queue full")]
+    NotLeader,
     ProposalQueueFull,
 
     /// RPC cluster_id mismatch.
@@ -29,28 +16,19 @@ pub enum XraftError {
     #[error("node is shutting down")]
     Shutdown,
 
-    /// Bootstrap input validation failure.
-    #[error("invalid bootstrap configuration: {reason}")]
-    InvalidBootstrapConfig { reason: String },
-
-    /// Generic configuration validation failure (non-bootstrap path).
-    #[error("invalid configuration: {reason}")]
-    InvalidConfig { reason: String },
-
-    /// Existing persisted data was found but is inconsistent and cannot be
-    /// recovered automatically. Operator intervention is required.
-    #[error("recovery required; persisted state is inconsistent")]
-    RecoveryRequired,
-
-    /// `bootstrap()` was called on a node that has already been bootstrapped
-    /// or recovered.
-    #[error("already bootstrapped: {reason}")]
-    AlreadyBootstrapped { reason: String },
-
-    /// Election-related operation invoked from an invalid role/state.
-    #[error("invalid election state: {reason}")]
-    InvalidElectionState { reason: String },
+impl fmt::Display for XraftError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            XraftError::StorageError(msg) => write!(f, "storage error: {msg}"),
+            XraftError::TransportError(msg) => write!(f, "transport error: {msg}"),
+            XraftError::NotLeader => write!(f, "not leader"),
+            XraftError::ProposalQueueFull => write!(f, "proposal queue full"),
+            XraftError::InvalidClusterId => write!(f, "invalid cluster id"),
+            XraftError::Shutdown => write!(f, "node shut down"),
+        }
+    }
 }
 
-/// Convenience alias used throughout xraft.
+impl std::error::Error for XraftError {}
+
 pub type Result<T> = std::result::Result<T, XraftError>;
