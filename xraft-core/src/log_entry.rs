@@ -13,6 +13,17 @@ pub enum EntryType {
     VotersRecord,
 }
 
+/// Discriminator for log entry types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntryType {
+    /// Application-level state machine command.
+    Command,
+    /// Leader no-op appended at the start of a new term.
+    LeaderChangeMessage,
+    /// Membership change — contains a complete `VotersRecord`.
+    VotersRecord,
+}
+
 /// A single entry in the replicated log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
