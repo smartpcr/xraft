@@ -435,7 +435,7 @@ mod tests {
     fn make_envelope(source: NodeId) -> RpcEnvelope {
         RpcEnvelope {
             cluster_id: ClusterId(uuid::Uuid::nil()),
-            leader_epoch: 1,
+            leader_epoch: Term(1),
             source,
             payload: RpcPayload::VoteRequest(VoteRequest {
                 term: Term(1),
@@ -655,7 +655,7 @@ mod tests {
         // Send 10 messages — they should be buffered
         for i in 0..10 {
             let mut env = make_envelope(n1);
-            env.leader_epoch = i;
+            env.leader_epoch = Term(i);
             s1.send(n2, env).await.unwrap();
         }
 
@@ -672,7 +672,7 @@ mod tests {
                 .await
                 .expect("should receive flushed message")
                 .unwrap();
-            received_epochs.push(msg.leader_epoch);
+            received_epochs.push(msg.leader_epoch.0);
         }
 
         assert_eq!(received_epochs.len(), 10);
