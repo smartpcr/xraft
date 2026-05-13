@@ -5,7 +5,7 @@ use crate::types::{Offset, Term};
 use crate::voter::VotersRecord;
 
 /// A single entry in the replicated log.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
     pub offset: Offset,
     pub term: Term,
