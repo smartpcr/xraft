@@ -101,7 +101,7 @@ pub struct FetchSnapshotResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddVoterRequest {
     pub node_id: NodeId,
-    pub endpoint: SocketAddr,
+    pub endpoint: Endpoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,7 +112,7 @@ pub struct RemoveVoterRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateVoterRequest {
     pub node_id: NodeId,
-    pub new_endpoint: SocketAddr,
+    pub new_endpoint: Endpoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
