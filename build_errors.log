@@ -1,0 +1,4 @@
+error: failed to parse lock file at: E:\forge\xraft\.worktree\ws-ws-raft-raft-protocol-phase-election-and-leader-lifecycle-xraft-core-stage-election-manager-vote-request-response\Cargo.lock
+
+Caused by:
+  package `foldhash` is specified twice in the lockfile
