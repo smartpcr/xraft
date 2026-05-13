@@ -1,12 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::app_record::AppSnapshot;
+use crate::types::Term;
 use crate::voter::VoterInfo;
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
-use std::io;
-use std::path::PathBuf;
-use tokio::sync::Mutex;
 
 /// Consensus metadata included in a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,8 +13,8 @@ pub struct SnapshotMetadata {
     pub leader_epoch: Term,
 }
 
-/// A complete snapshot: consensus metadata + application payload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Composite snapshot: consensus metadata + application payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub metadata: SnapshotMetadata,
     pub app_snapshot: AppSnapshot,

@@ -5,3 +5,9 @@ use serde::{Deserialize, Serialize};
 pub struct AppSnapshot {
     pub data: Vec<u8>,
 }
+
+/// Opaque application snapshot payload. xraft never interprets its contents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSnapshot {
+    pub data: Vec<u8>,
+}
