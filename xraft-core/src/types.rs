@@ -1,5 +1,4 @@
-use std::fmt;
-use std::net::SocketAddr;
+use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a node in the Raft cluster.
 #[derive(
@@ -7,16 +6,16 @@ use std::net::SocketAddr;
 )]
 pub struct NodeId(pub u64);
 
-/// Raft term number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+/// Raft term (also called epoch/leader-epoch in KRaft terminology).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Term(pub u64);
 
-/// Cluster identifier.
+/// Cluster identity — every RPC carries this for fencing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClusterId(pub uuid::Uuid);
 
-/// Log offset (position of an entry in the replicated log).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Logical log offset (0-based, exclusive upper bound convention).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Offset(pub u64);
 
 impl fmt::Display for NodeId {
