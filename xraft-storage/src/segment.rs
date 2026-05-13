@@ -1,293 +1,546 @@
-use std::io::{self, SeekFrom};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex;
-use xraft_core::{LogEntry, XraftError};
+use xraft_core::log_entry::LogEntry;
 
-/// Magic bytes written at the start of each batch.
-const BATCH_MAGIC: [u8; 4] = [0x58, 0x52, 0x41, 0x46]; // "XRAF"
+use crate::segment_index::SparseIndex;
 
-/// A single log segment file covering a contiguous range of offsets.
+/// On-disk batch layout:
+///   batch_len:    u32 — byte count after this field (crc + payload)
+///   crc32c:       u32 — checksum over payload (num_entries + entry frames)
+///   num_entries:  u32 — number of entries in this batch
+///   entry frames: [entry_len: u32, entry_data: [u8]] × num_entries
 ///
-/// On-disk format per batch:
-///   [4 bytes magic] [4 bytes CRC32C of payload] [4 bytes payload length] [payload bytes]
-///
-/// Payload is `bincode`-encoded `Vec<LogEntry>`.
+/// CRC covers the entire payload (num_entries field + all entry frames),
+/// providing per-batch integrity validation.
+const BATCH_HEADER_LEN: u64 = 4 + 4 + 4; // batch_len + crc + num_entries
+const MAX_BATCH_DATA: u32 = 64 * 1024 * 1024; // 64 MiB sanity cap
+
+/// Formats a base offset into the canonical zero-padded 20-digit filename.
+pub fn segment_filename(base_offset: u64) -> String {
+    format!("{:020}", base_offset)
+}
+
+/// A pre-serialized log entry ready for batch writing.
+pub struct SerializedEntry {
+    /// bincode-serialized bytes of the LogEntry.
+    pub data: Vec<u8>,
+}
+
+impl SerializedEntry {
+    /// Serialize a LogEntry to its on-disk representation.
+    pub fn from_entry(entry: &LogEntry) -> io::Result<Self> {
+        let data = bincode::serialize(entry).map_err(io::Error::other)?;
+        Ok(Self { data })
+    }
+
+    /// Size of one entry frame on disk: entry_len (u32) + data bytes.
+    pub fn frame_size(&self) -> u64 {
+        4 + self.data.len() as u64
+    }
+}
+
+/// Total on-disk bytes for a batch of serialized entries.
+pub fn batch_disk_size(entries: &[SerializedEntry]) -> u64 {
+    // batch_len(4) + crc(4) + num_entries(4) + Σ(entry_len(4) + data)
+    let frames: u64 = entries.iter().map(|e| e.frame_size()).sum();
+    12 + frames
+}
+
+/// A single append-only log segment backed by a `.log` file on disk.
 pub struct Segment {
-    path: PathBuf,
     base_offset: u64,
-    file: Mutex<File>,
-    /// File size (bytes written so far).
-    size: Mutex<u64>,
-    /// Number of entries in this segment.
-    entry_count: Mutex<u64>,
-    /// Next offset to be written (base_offset + entry_count).
-    next_offset: Mutex<u64>,
+    next_offset: u64,
+    file_size: u64,
+    file: File,
+    #[allow(dead_code)]
+    path: PathBuf,
+    index: SparseIndex,
 }
 
 impl Segment {
-    /// Open or create a segment at the given path with the given base offset.
-    pub async fn open(path: &Path, base_offset: u64) -> io::Result<Self> {
+    /// Create a brand-new, empty segment.
+    pub fn create(dir: &Path, base_offset: u64, index_interval: u32) -> io::Result<Self> {
+        let stem = segment_filename(base_offset);
+        let log_path = dir.join(format!("{stem}.log"));
+        let idx_path = dir.join(format!("{stem}.index"));
+
         let file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .read(true)
             .write(true)
-            .open(path)
-            .await?;
+            .open(&log_path)?;
 
-        let metadata = file.metadata().await?;
-        let file_size = metadata.len();
+        let index = SparseIndex::create(&idx_path, index_interval)?;
 
-        let seg = Self {
-            path: path.to_path_buf(),
+        Ok(Self {
             base_offset,
-            file: Mutex::new(file),
-            size: Mutex::new(file_size),
-            entry_count: Mutex::new(0),
-            next_offset: Mutex::new(base_offset),
-        };
-
-        // Recovery: scan existing batches to count entries
-        if file_size > 0 {
-            seg.recover().await?;
-        }
-
-        Ok(seg)
+            next_offset: base_offset,
+            file_size: 0,
+            file,
+            path: log_path,
+            index,
+        })
     }
 
-    /// Recover segment state by scanning all batches.
-    /// Truncates at first corruption.
-    async fn recover(&self) -> io::Result<()> {
-        let mut file = self.file.lock().await;
-        file.seek(SeekFrom::Start(0)).await?;
+    /// Open an existing segment, scanning the log to rebuild in-memory state.
+    pub fn open(dir: &Path, base_offset: u64, index_interval: u32) -> io::Result<Self> {
+        let stem = segment_filename(base_offset);
+        let log_path = dir.join(format!("{stem}.log"));
+        let idx_path = dir.join(format!("{stem}.index"));
 
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&log_path)?;
+
+        let (next_offset, file_size, index) =
+            Self::recover_scan(&mut file, base_offset, &idx_path, index_interval)?;
+
+        Ok(Self {
+            base_offset,
+            next_offset,
+            file_size,
+            file,
+            path: log_path,
+            index,
+        })
+    }
+
+    /// Scan forward batch-by-batch, validating CRCs.
+    /// Truncates any trailing partial/corrupt batches (recovery).
+    fn recover_scan(
+        file: &mut File,
+        base_offset: u64,
+        idx_path: &Path,
+        index_interval: u32,
+    ) -> io::Result<(u64, u64, SparseIndex)> {
+        let total_len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(0))?;
+
+        let mut index = SparseIndex::create_or_truncate(idx_path, index_interval)?;
         let mut pos: u64 = 0;
-        let file_size = *self.size.lock().await;
-        let mut total_entries: u64 = 0;
-        let mut last_good_pos: u64 = 0;
+        let mut next_offset = base_offset;
 
-        while pos + 12 <= file_size {
-            // Read batch header
-            let mut header = [0u8; 12];
-            if file.read_exact(&mut header).await.is_err() {
+        loop {
+            if total_len.saturating_sub(pos) < BATCH_HEADER_LEN {
                 break;
             }
 
-            // Validate magic
-            if header[0..4] != BATCH_MAGIC {
+            let mut len_buf = [0u8; 4];
+            if file.read_exact(&mut len_buf).is_err() {
+                break;
+            }
+            let batch_len = u32::from_le_bytes(len_buf);
+
+            // batch_len must cover at least crc(4) + num_entries(4) = 8
+            if !(8..=MAX_BATCH_DATA).contains(&batch_len) {
+                break;
+            }
+            if total_len.saturating_sub(pos + 4) < u64::from(batch_len) {
                 break;
             }
 
-            let stored_crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-            let payload_len =
-                u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
-
-            if pos + 12 + payload_len as u64 > file_size {
+            let mut batch_data = vec![0u8; batch_len as usize];
+            if file.read_exact(&mut batch_data).is_err() {
                 break;
             }
 
-            let mut payload = vec![0u8; payload_len];
-            if file.read_exact(&mut payload).await.is_err() {
+            // Validate CRC over payload (everything after the crc field)
+            let stored_crc = u32::from_le_bytes([
+                batch_data[0], batch_data[1], batch_data[2], batch_data[3],
+            ]);
+            let payload = &batch_data[4..];
+            let computed_crc = crc32c::crc32c(payload);
+            if stored_crc != computed_crc {
                 break;
             }
 
-            let computed_crc = crc32c::crc32c(&payload);
-            if computed_crc != stored_crc {
+            // Parse num_entries
+            if payload.len() < 4 {
+                break;
+            }
+            let num_entries = u32::from_le_bytes([
+                payload[0], payload[1], payload[2], payload[3],
+            ]);
+
+            // Walk entry frames to validate deserialization
+            let mut entry_pos = 4usize;
+            let mut batch_valid = true;
+            for _ in 0..num_entries {
+                if entry_pos + 4 > payload.len() {
+                    batch_valid = false;
+                    break;
+                }
+                let entry_len = u32::from_le_bytes([
+                    payload[entry_pos],
+                    payload[entry_pos + 1],
+                    payload[entry_pos + 2],
+                    payload[entry_pos + 3],
+                ]) as usize;
+                entry_pos += 4;
+                if entry_pos + entry_len > payload.len() {
+                    batch_valid = false;
+                    break;
+                }
+                let _: LogEntry = match bincode::deserialize(
+                    &payload[entry_pos..entry_pos + entry_len],
+                ) {
+                    Ok(e) => e,
+                    Err(_) => {
+                        batch_valid = false;
+                        break;
+                    }
+                };
+                entry_pos += entry_len;
+            }
+            if !batch_valid {
                 break;
             }
 
-            let entries: Vec<LogEntry> = match bincode::deserialize(&payload) {
-                Ok(e) => e,
-                Err(_) => break,
-            };
+            // Record sparse index entries for this batch
+            let batch_byte_pos = pos;
+            let interval = u64::from(index_interval);
+            for i in 0..u64::from(num_entries) {
+                let global_idx = (next_offset + i) - base_offset;
+                if global_idx.is_multiple_of(interval) {
+                    index.append(next_offset + i, batch_byte_pos)?;
+                }
+            }
 
-            total_entries += entries.len() as u64;
-            pos += 12 + payload_len as u64;
-            last_good_pos = pos;
+            next_offset += u64::from(num_entries);
+            pos += 4 + u64::from(batch_len);
         }
 
-        // Truncate at last good position if file is corrupted
-        if last_good_pos < file_size {
-            file.set_len(last_good_pos).await?;
-            *self.size.lock().await = last_good_pos;
+        if pos < total_len {
+            file.set_len(pos)?;
         }
 
-        *self.entry_count.lock().await = total_entries;
-        *self.next_offset.lock().await = self.base_offset + total_entries;
-
-        Ok(())
+        index.flush()?;
+        Ok((next_offset, pos, index))
     }
 
-    /// Append a batch of entries. Entries must have sequential offsets
-    /// starting at `self.next_offset`.
-    pub async fn append(&self, entries: &[LogEntry]) -> io::Result<()> {
+    /// Write pre-serialized entries as a single CRC-protected batch.
+    pub fn append_batch(
+        &mut self,
+        entries: &[LogEntry],
+        serialized: &[SerializedEntry],
+    ) -> io::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
+        assert_eq!(entries.len(), serialized.len());
 
-        let payload =
-            bincode::serialize(&entries.to_vec()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        self.file.seek(SeekFrom::Start(self.file_size))?;
+
+        // Build payload: num_entries + entry frames
+        let num_entries = entries.len() as u32;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&num_entries.to_le_bytes());
+        for se in serialized {
+            let entry_len = se.data.len() as u32;
+            payload.extend_from_slice(&entry_len.to_le_bytes());
+            payload.extend_from_slice(&se.data);
+        }
+
         let crc = crc32c::crc32c(&payload);
+        let batch_len = (4 + payload.len()) as u32; // crc + payload
 
-        let mut buf = Vec::with_capacity(12 + payload.len());
-        buf.extend_from_slice(&BATCH_MAGIC);
-        buf.extend_from_slice(&crc.to_le_bytes());
-        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&payload);
+        // Record sparse index entries
+        let batch_byte_pos = self.file_size;
+        let interval = u64::from(self.index.interval());
+        for i in 0..entries.len() {
+            let global_idx = (self.next_offset + i as u64) - self.base_offset;
+            if global_idx.is_multiple_of(interval) {
+                self.index
+                    .append(self.next_offset + i as u64, batch_byte_pos)?;
+            }
+        }
 
-        let mut file = self.file.lock().await;
-        file.seek(SeekFrom::End(0)).await?;
-        file.write_all(&buf).await?;
-        file.flush().await?;
-        file.sync_all().await?;
+        // Write batch: batch_len + crc + payload
+        self.file.write_all(&batch_len.to_le_bytes())?;
+        self.file.write_all(&crc.to_le_bytes())?;
+        self.file.write_all(&payload)?;
 
-        *self.size.lock().await += buf.len() as u64;
-        *self.entry_count.lock().await += entries.len() as u64;
-        *self.next_offset.lock().await += entries.len() as u64;
+        let written = 4 + u64::from(batch_len);
+        self.file_size += written;
+        self.next_offset += entries.len() as u64;
+
+        self.file.sync_all()?;
+        self.index.flush()?;
 
         Ok(())
     }
 
-    /// Read all entries from this segment in [start_offset, end_offset).
-    pub async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>, XraftError> {
-        let mut file = self.file.lock().await;
-        file.seek(SeekFrom::Start(0)).await?;
+    /// Convenience: serialize entries internally and write as a single batch.
+    pub fn append(&mut self, entries: &[LogEntry]) -> io::Result<()> {
+        let serialized: Vec<SerializedEntry> = entries
+            .iter()
+            .map(SerializedEntry::from_entry)
+            .collect::<io::Result<_>>()?;
+        self.append_batch(entries, &serialized)
+    }
 
-        let file_size = *self.size.lock().await;
+    /// Read entries in `[start_offset, end_offset)` from this segment.
+    /// Returns `Err` with `InvalidData` if a CRC mismatch is encountered
+    /// in any batch that must be read.
+    pub fn read(&mut self, start_offset: u64, end_offset: u64) -> io::Result<Vec<LogEntry>> {
+        if start_offset >= end_offset || start_offset >= self.next_offset {
+            return Ok(Vec::new());
+        }
+
+        let effective_end = end_offset.min(self.next_offset);
+
+        let scan_pos = self.index.lookup(start_offset).unwrap_or(0);
+        self.file.seek(SeekFrom::Start(scan_pos))?;
+
         let mut result = Vec::new();
-        let mut pos: u64 = 0;
+        let mut pos = scan_pos;
 
-        while pos + 12 <= file_size {
-            let mut header = [0u8; 12];
-            file.read_exact(&mut header).await?;
+        while pos < self.file_size {
+            let batch_start = pos;
 
-            if header[0..4] != BATCH_MAGIC {
-                return Err(XraftError::Corruption("invalid batch magic".into()));
+            // Read batch_len
+            let mut len_buf = [0u8; 4];
+            if let Err(e) = self.file.read_exact(&mut len_buf) {
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(e);
+            }
+            let batch_len = u32::from_le_bytes(len_buf);
+
+            if !(8..=MAX_BATCH_DATA).contains(&batch_len) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "corrupt batch at byte {batch_start}: invalid batch_len {batch_len}"
+                    ),
+                ));
             }
 
-            let stored_crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-            let payload_len =
-                u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+            let mut batch_data = vec![0u8; batch_len as usize];
+            self.file.read_exact(&mut batch_data)?;
 
-            let mut payload = vec![0u8; payload_len];
-            file.read_exact(&mut payload).await?;
-
-            let computed_crc = crc32c::crc32c(&payload);
-            if computed_crc != stored_crc {
-                return Err(XraftError::Corruption("CRC mismatch".into()));
+            // Validate batch CRC
+            let stored_crc = u32::from_le_bytes([
+                batch_data[0], batch_data[1], batch_data[2], batch_data[3],
+            ]);
+            let payload = &batch_data[4..];
+            let computed_crc = crc32c::crc32c(payload);
+            if stored_crc != computed_crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "CRC mismatch at batch byte {batch_start}: \
+                         stored={stored_crc:#010x} computed={computed_crc:#010x}"
+                    ),
+                ));
             }
 
-            let entries: Vec<LogEntry> = bincode::deserialize(&payload)
-                .map_err(|e| XraftError::Corruption(format!("deserialize error: {e}")))?;
+            // Parse entries from payload
+            if payload.len() < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("truncated batch at byte {batch_start}"),
+                ));
+            }
+            let num_entries = u32::from_le_bytes([
+                payload[0], payload[1], payload[2], payload[3],
+            ]);
 
-            for entry in entries {
-                if entry.offset >= start_offset && entry.offset < end_offset {
+            let mut entry_pos = 4usize;
+            let mut found_past_end = false;
+            for _ in 0..num_entries {
+                if entry_pos + 4 > payload.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("truncated entry frame at byte {batch_start}"),
+                    ));
+                }
+                let entry_len = u32::from_le_bytes([
+                    payload[entry_pos],
+                    payload[entry_pos + 1],
+                    payload[entry_pos + 2],
+                    payload[entry_pos + 3],
+                ]) as usize;
+                entry_pos += 4;
+                if entry_pos + entry_len > payload.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("truncated entry data at byte {batch_start}"),
+                    ));
+                }
+                let entry: LogEntry =
+                    bincode::deserialize(&payload[entry_pos..entry_pos + entry_len])
+                        .map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "deserialization failed at byte {batch_start}: {e}"
+                                ),
+                            )
+                        })?;
+                entry_pos += entry_len;
+
+                if entry.offset >= effective_end {
+                    found_past_end = true;
+                    break;
+                }
+                if entry.offset >= start_offset {
                     result.push(entry);
                 }
             }
 
-            pos += 12 + payload_len as u64;
+            if found_past_end {
+                break;
+            }
+
+            pos += 4 + u64::from(batch_len);
         }
 
         Ok(result)
-    }
-
-    /// Read all entries in this segment.
-    pub async fn read_all(&self) -> Result<Vec<LogEntry>, XraftError> {
-        self.read(0, u64::MAX).await
-    }
-
-    /// Truncate all entries at and after `from_offset`.
-    pub async fn truncate_suffix(&self, from_offset: u64) -> io::Result<bool> {
-        let mut file = self.file.lock().await;
-        file.seek(SeekFrom::Start(0)).await?;
-
-        let file_size = *self.size.lock().await;
-        let mut pos: u64 = 0;
-        let mut truncate_pos: Option<u64> = None;
-        let mut remaining_entries: u64 = 0;
-
-        while pos + 12 <= file_size {
-            let batch_start = pos;
-            let mut header = [0u8; 12];
-            file.read_exact(&mut header).await?;
-
-            if header[0..4] != BATCH_MAGIC {
-                break;
-            }
-
-            let payload_len =
-                u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
-
-            let mut payload = vec![0u8; payload_len];
-            file.read_exact(&mut payload).await?;
-
-            let entries: Vec<LogEntry> = match bincode::deserialize(&payload) {
-                Ok(e) => e,
-                Err(_) => break,
-            };
-
-            // If any entry in this batch is at or after from_offset, truncate here
-            let batch_has_target = entries.iter().any(|e| e.offset >= from_offset);
-            if batch_has_target {
-                // We need to check if partial batch truncation is needed
-                let entries_before: Vec<LogEntry> =
-                    entries.into_iter().filter(|e| e.offset < from_offset).collect();
-                if entries_before.is_empty() {
-                    truncate_pos = Some(batch_start);
-                } else {
-                    // Rewrite this batch with only the entries before from_offset
-                    remaining_entries += entries_before.len() as u64;
-                    let new_payload = bincode::serialize(&entries_before)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                    let new_crc = crc32c::crc32c(&new_payload);
-
-                    file.seek(SeekFrom::Start(batch_start)).await?;
-                    file.write_all(&BATCH_MAGIC).await?;
-                    file.write_all(&new_crc.to_le_bytes()).await?;
-                    file.write_all(&(new_payload.len() as u32).to_le_bytes()).await?;
-                    file.write_all(&new_payload).await?;
-
-                    truncate_pos = Some(batch_start + 12 + new_payload.len() as u64);
-                }
-                break;
-            }
-
-            remaining_entries += entries.len() as u64;
-            pos += 12 + payload_len as u64;
-        }
-
-        if let Some(trunc_pos) = truncate_pos {
-            file.set_len(trunc_pos).await?;
-            file.sync_all().await?;
-            *self.size.lock().await = trunc_pos;
-            *self.entry_count.lock().await = remaining_entries;
-            *self.next_offset.lock().await = self.base_offset + remaining_entries;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 
     pub fn base_offset(&self) -> u64 {
         self.base_offset
     }
 
-    pub async fn next_offset(&self) -> u64 {
-        *self.next_offset.lock().await
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
     }
 
-    pub async fn entry_count(&self) -> u64 {
-        *self.entry_count.lock().await
+    pub fn file_size(&self) -> u64 {
+        self.file_size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use xraft_core::log_entry::EntryType;
+    use xraft_core::types::Term;
+
+    fn make_entry(offset: u64, term: u64, payload: &[u8]) -> LogEntry {
+        LogEntry {
+            offset,
+            term: Term(term),
+            entry_type: EntryType::Command,
+            payload: payload.to_vec(),
+        }
     }
 
-    pub async fn file_size(&self) -> u64 {
-        *self.size.lock().await
+    #[test]
+    fn append_and_read_back() {
+        let dir = TempDir::new().unwrap();
+        let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
+
+        let entries: Vec<LogEntry> = (0..10)
+            .map(|i| make_entry(i, 1, &[i as u8; 8]))
+            .collect();
+        seg.append(&entries).unwrap();
+
+        assert_eq!(seg.next_offset(), 10);
+        assert!(seg.file_size() > 0);
+
+        let read_back = seg.read(0, 10).unwrap();
+        assert_eq!(read_back.len(), 10);
+        for (i, entry) in read_back.iter().enumerate() {
+            assert_eq!(entry.offset, i as u64);
+            assert_eq!(entry.term, Term(1));
+            assert_eq!(entry.payload, vec![i as u8; 8]);
+        }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    #[test]
+    fn read_past_corruption_returns_storage_error() {
+        let dir = TempDir::new().unwrap();
+        let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
+        // Write 10 entries as individual batches
+        for i in 0..10u64 {
+            seg.append(&[make_entry(i, 1, &[i as u8; 16])]).unwrap();
+        }
+
+        // Corrupt a batch mid-file on disk (without reopening)
+        let log_path = dir.path().join("00000000000000000000.log");
+        let mut raw = std::fs::read(&log_path).unwrap();
+        // Each batch has the same size; corrupt batch 5's payload area
+        let batch_size = raw.len() / 10;
+        let corrupt_byte = batch_size * 5 + 14; // inside entry data
+        raw[corrupt_byte] ^= 0xFF;
+        std::fs::write(&log_path, &raw).unwrap();
+
+        // Read spanning the corruption → must return InvalidData error
+        let err = seg.read(0, 10).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("CRC mismatch"),
+            "expected CRC mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn open_recovers_valid_segment() {
+        let dir = TempDir::new().unwrap();
+
+        {
+            let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
+            let entries: Vec<LogEntry> = (0..20)
+                .map(|i| make_entry(i, 1, &[i as u8; 8]))
+                .collect();
+            seg.append(&entries).unwrap();
+        }
+
+        let mut seg = Segment::open(dir.path(), 0, 4).unwrap();
+        assert_eq!(seg.next_offset(), 20);
+
+        let read_back = seg.read(0, 20).unwrap();
+        assert_eq!(read_back.len(), 20);
+    }
+
+    #[test]
+    fn recovery_truncates_corrupt_trailing_batch() {
+        let dir = TempDir::new().unwrap();
+
+        {
+            let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
+            for i in 0..10u64 {
+                seg.append(&[make_entry(i, 1, &[i as u8; 16])]).unwrap();
+            }
+        }
+
+        // Corrupt the last batch
+        let log_path = dir.path().join("00000000000000000000.log");
+        let mut raw = std::fs::read(&log_path).unwrap();
+        let batch_size = raw.len() / 10;
+        let corrupt_byte = batch_size * 9 + 14;
+        raw[corrupt_byte] ^= 0xFF;
+        std::fs::write(&log_path, &raw).unwrap();
+
+        // Recovery truncates from the corrupt batch onward
+        let mut seg = Segment::open(dir.path(), 0, 4).unwrap();
+        assert_eq!(seg.next_offset(), 9);
+        let entries = seg.read(0, 9).unwrap();
+        assert_eq!(entries.len(), 9);
+    }
+
+    #[test]
+    fn sparse_index_read_at_interval_boundary() {
+        let dir = TempDir::new().unwrap();
+        let mut seg = Segment::create(dir.path(), 0, 4).unwrap();
+
+        for i in 0..16u64 {
+            seg.append(&[make_entry(i, 1, &[i as u8; 8])]).unwrap();
+        }
+
+        let read_at_4 = seg.read(4, 5).unwrap();
+        assert_eq!(read_at_4.len(), 1);
+        assert_eq!(read_at_4[0].offset, 4);
+
+        let read_at_12 = seg.read(12, 13).unwrap();
+        assert_eq!(read_at_12.len(), 1);
+        assert_eq!(read_at_12[0].offset, 12);
     }
 }
